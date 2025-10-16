@@ -148,7 +148,9 @@ class ManiskillEnv(BaseManiskillEnv, EnvOffloadMixin):
         self._generator.set_state(state["generator_state"])
         self.is_start = state["is_start"]
 
-        task_metric_states = recursive_to_device(state["user_defined_task_metric_states"], self.device)
+        task_metric_states = recursive_to_device(
+            state["user_defined_task_metric_states"], self.device
+        )
         for key, value in task_metric_states.items():
             setattr(self.env, key, value)
 
