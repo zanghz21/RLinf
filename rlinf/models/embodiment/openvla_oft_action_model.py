@@ -30,6 +30,7 @@ from prismatic.vla.constants import (
 )
 from transformers.generation import TopKLogitsWarper
 
+from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
@@ -37,7 +38,7 @@ from rlinf.utils.utils import (
 )
 
 
-class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction):
+class OpenVLAOFTForRLActionPrediction(BasePolicy, OpenVLAOFTForActionPrediction):
     def __init__(
         self, config: OpenVLAOFTConfig, action_dim, num_action_chunks, add_value_head
     ) -> None:
