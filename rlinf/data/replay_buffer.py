@@ -23,7 +23,7 @@ import torch
 
 from rlinf.scheduler import Channel
 from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor, get_mask_batch
-
+import torch.nn.functional as F
 
 def process_nested_dict_for_replay_buffer(nested_dict, rm_extra_done=True):
     ret_dict = {}
@@ -90,7 +90,15 @@ def sample_nested_batch(nested_dict, sample_ids):
     sample_dict = {}
     for key, value in nested_dict.items():
         if isinstance(value, torch.Tensor):
-            sample_dict[key] = value[sample_ids]
+            v = value[sample_ids].clone()
+            if key == "main_images":
+                v = random_crop_torch_batch(v)
+            if key == "extra_view_images":
+                B, N, C, H, W = v.shape
+                v = v.reshape(B*N, C, H, W)
+                v = random_crop_torch_batch(v)
+                v = v.reshape(B, N, C, H, W)
+            sample_dict[key] = v
         elif isinstance(value, dict):
             sample_dict[key] = sample_nested_batch(value, sample_ids)
         else:
@@ -168,6 +176,41 @@ def fix_image_data(data):
         elif isinstance(value, dict):
             fixed_data[key] = fix_image_data(value)
     return fixed_data
+
+def random_crop_torch_batch(imgs, padding: int = 4):
+    """
+    imgs: Tensor [B, C, H, W]
+    """
+    B, C, H, W = imgs.shape
+    
+    imgs_padded = F.pad(
+        imgs,
+        pad=(padding, padding, padding, padding),
+        mode="replicate",
+    )
+    
+    max_offset = 2 * padding
+    top = torch.randint(0, max_offset + 1, (B, 1, 1, 1), device=imgs.device)
+    left = torch.randint(0, max_offset + 1, (B, 1, 1, 1), device=imgs.device)
+
+    h_indices = torch.arange(H, device=imgs.device).view(1, 1, H, 1)  # [1, 1, H, 1]
+    w_indices = torch.arange(W, device=imgs.device).view(1, 1, 1, W)  # [1, 1, 1, W]
+    
+    h_idx = h_indices + top  # [B, 1, H, 1]
+    w_idx = w_indices + left  # [B, 1, 1, W]
+    
+    h_idx = h_idx.expand(B, C, H, 1)
+    w_idx = w_idx.expand(B, C, 1, W)
+    
+    out = imgs_padded[
+        torch.arange(B, device=imgs.device).view(B, 1, 1, 1),
+        torch.arange(C, device=imgs.device).view(1, C, 1, 1),
+        h_idx,
+        w_idx
+    ]
+    
+    return out
+
 
 
 class SACReplayBuffer:
