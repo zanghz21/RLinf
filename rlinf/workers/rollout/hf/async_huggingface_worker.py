@@ -76,7 +76,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
                     actions, result = self.predict(extracted_obs)
 
-                    if not is_first_step:
+                    if rewards is not None:
                         await self.buffer_list[stage_id].add(
                             "truncations",
                             env_output["truncations"].bool().cpu().contiguous(),
@@ -86,10 +86,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                             env_output["terminations"].bool().cpu().contiguous(),
                         )
                         await self.buffer_list[stage_id].add("dones", dones)
-                    else:
-                        is_first_step = False
-
-                    if rewards is not None:
                         await self.buffer_list[stage_id].add("rewards", rewards)
                     if env_output["grasp_penalty"] is not None:
                         await self.buffer_list[stage_id].add(
@@ -125,14 +121,15 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs
                 )
-                await self.buffer_list[i].add(
-                    "truncations", env_output["truncations"].bool().cpu().contiguous()
-                )
-                await self.buffer_list[i].add(
-                    "terminations", env_output["terminations"].bool().cpu().contiguous()
-                )
-                await self.buffer_list[i].add("dones", dones)
+                
                 if rewards is not None:
+                    await self.buffer_list[i].add(
+                        "truncations", env_output["truncations"].bool().cpu().contiguous()
+                    )
+                    await self.buffer_list[i].add(
+                        "terminations", env_output["terminations"].bool().cpu().contiguous()
+                    )
+                    await self.buffer_list[i].add("dones", dones)
                     await self.buffer_list[i].add("rewards", rewards)
                 if env_output["grasp_penalty"] is not None:
                     await self.buffer_list[i].add("grasp_penalty", env_output["grasp_penalty"])
