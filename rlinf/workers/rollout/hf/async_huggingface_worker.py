@@ -53,7 +53,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             disable=(self._rank != 0),
         )
 
-        is_first_step = True
+        total_steps = 0
         while not self.should_stop:
             last_extracted_obs = [None for i in range(self.num_pipeline_stages)]
             last_results = [None for i in range(self.num_pipeline_stages)]
@@ -75,6 +75,11 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     )
 
                     actions, result = self.predict(extracted_obs)
+                    total_steps += 1
+                    if total_steps < 200:
+                        actions = np.random.uniform(-1, 1, size=actions.shape).astype(np.float32)
+                        result["forward_inputs"]["action"] = torch.from_numpy(actions).float()
+
 
                     if rewards is not None:
                         await self.buffer_list[stage_id].add(
