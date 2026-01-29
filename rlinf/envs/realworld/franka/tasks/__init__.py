@@ -20,6 +20,7 @@ from rlinf.envs.realworld.franka.tasks.franka_bin_relocation import (
 from rlinf.envs.realworld.franka.tasks.peg_insertion_env import (
     PegInsertionEnv as PegInsertionEnv,
 )
+from rlinf.envs.realworld.franka.tasks.draw import DrawEnv
 
 register(
     id="PegInsertionEnv-v1",
@@ -29,4 +30,9 @@ register(
 register(
     id="FrankaBinRelocationEnv-v1",
     entry_point="rlinf.envs.realworld.franka.tasks:FrankaBinRelocationEnv",
+)
+
+register(
+    id="DrawEnv-v1", 
+    entry_point="rlinf.envs.realworld.franka.tasks:DrawEnv"
 )
