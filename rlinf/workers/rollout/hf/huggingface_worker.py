@@ -265,7 +265,12 @@ class MultiStepRolloutWorker(Worker):
                     dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                         env_output, extracted_obs
                     )
+                    t0 = time.time()
                     actions, result = self.predict(extracted_obs)
+                    t1 = time.time()
+                    with open(f"/mnt/RLinf/predict_step.txt", "a") as f:
+                        f.write(f"{t1}, {t1-t0}\n")
+
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
                         prev_values=result["prev_values"],

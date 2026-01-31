@@ -176,9 +176,14 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
+        t0 = time.time()
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        t1 = time.time()
+        with open(f"/mnt/RLinf/env_chunk_step.txt", "a") as f:
+            f.write(f"{t1}, {t1-t0}\n")
+
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
