@@ -417,7 +417,7 @@ class MultiStepRolloutWorker(Worker):
         while queue.empty():
             await asyncio.sleep(0.001)
         batch = queue.get_nowait()
-        recv_time = time.perf_counter()
+        recv_time = time.time()
         send_time = batch.pop("send_time")
         with open(f"/mnt/RLinf/recv_env_output_1.txt", "a") as f:
             f.write(f"{recv_time}, {recv_time-send_time}\n")
@@ -431,7 +431,7 @@ class MultiStepRolloutWorker(Worker):
         
     def send_chunk_actions_0(self, output_channel: Channel, chunk_actions, mode="train"):
         assert mode in ["train", "eval"], f"{mode=} is not supported"
-        t = time.perf_counter()
+        t = time.time()
         output_channel.put(
             item=(t, chunk_actions), key=f"{self._rank}_{mode}", async_op=True
         )
@@ -440,7 +440,7 @@ class MultiStepRolloutWorker(Worker):
     def send_chunk_actions_1(self, output_channel: Channel, chunk_actions, mode="train"):
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         dst_rank_in_env = self._rank // self.gather_num
-        t = time.perf_counter()
+        t = time.time()
         return self.send(
             (mode, t, chunk_actions),
             self.cfg.env.group_name,

@@ -285,7 +285,7 @@ class EnvWorker(Worker):
             )
             chunk_action.append(a)
 
-            t = time.perf_counter()
+            t = time.time()
             with open(f"/mnt/RLinf/recv_chunk_actions_0.txt", "a") as f:
                 f.write(f"{t}, {t - send_time}\n")
         chunk_action = np.concatenate(chunk_action, axis=0)
@@ -302,7 +302,7 @@ class EnvWorker(Worker):
 
             def _callback():
                 rollout_mode, send_t, recv_action = work.wait()
-                recv_t = time.perf_counter()
+                recv_t = time.time()
                 if rollout_mode == "train":
                     self.train_queue.put(recv_action)
                 elif rollout_mode == "eval":
@@ -389,7 +389,7 @@ class EnvWorker(Worker):
         for gather_id in range(self.gather_num):
             env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
             dst_rank_in_rollout = gather_id + self._rank * self.gather_num
-            t = time.perf_counter()
+            t = time.time()
             env_batch_i["send_time"] = t
             self.send(
                 (mode, env_batch_i),
