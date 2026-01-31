@@ -20,6 +20,7 @@ cluster:
     rollout: 0-0
 
 runner:
+  enable_dist_channel: False
   task_type: embodied
   logger:
     log_path: "../results"

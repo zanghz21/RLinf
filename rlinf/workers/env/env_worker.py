@@ -265,6 +265,28 @@ class EnvWorker(Worker):
         return env_output, env_info
 
     def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
+
+        if self.cfg.runner.get("enable_dist_channel", True):
+            return self.recv_chunk_actions_1(input_channel, mode)
+        else:
+            return self.recv_chunk_actions_0(input_channel, mode)
+
+    def recv_chunk_actions_0(self, input_channel: Channel, mode="train") -> np.ndarray:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        chunk_action = []
+        for gather_id in range(self.gather_num):
+            send_time, a = input_channel.get(
+                f"{gather_id+self._rank*self.gather_num}_{mode}", 
+            )
+            chunk_action.append(a)
+
+            t = time.perf_counter()
+            with open(f"/mnt/RLinf/recv_chunk_actions_0.txt", "a") as f:
+                f.write(f"{t}, {t - send_time}\n")
+        chunk_action = np.concatenate(chunk_action, axis=0)
+        return chunk_action
+
+    def recv_chunk_actions_1(self, input_channel: Channel, mode="train") -> np.ndarray:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         chunk_action = []
         for gather_id in range(self.gather_num):
@@ -274,11 +296,14 @@ class EnvWorker(Worker):
             )
 
             def _callback():
-                rollout_mode, recv_action = work.wait()
+                rollout_mode, send_t, recv_action = work.wait()
+                recv_t = time.perf_counter()
                 if rollout_mode == "train":
                     self.train_queue.put(recv_action)
                 elif rollout_mode == "eval":
                     self.eval_queue.put(recv_action)
+                with open("/mnt/RLinf/recv_chunk_actions_1.txt", "a") as f:
+                    f.write(f"{recv_t}, {recv_t-send_t}\n")
 
             work.then(_callback)
 
@@ -337,11 +362,30 @@ class EnvWorker(Worker):
         return env_batch_i
 
     def send_env_batch(self, output_channel: Channel, env_batch, mode="train"):
+        if self.cfg.runner.get("enable_dist_channel", True):
+            return self.send_env_batch_1(output_channel, env_batch, mode)
+        else:
+            return self.send_env_batch_0(output_channel, env_batch, mode)
+
+    def send_env_batch_0(self, output_channel: Channel, env_batch, mode="train"):
+        # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+
+        for gather_id in range(self.gather_num):
+            env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
+            output_channel.put(
+                item=env_batch_i,
+                key=f"{gather_id + self._rank * self.gather_num}_{mode}",
+            )
+
+    def send_env_batch_1(self, output_channel: Channel, env_batch, mode="train"):
         # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         for gather_id in range(self.gather_num):
             env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
             dst_rank_in_rollout = gather_id + self._rank * self.gather_num
+            t = time.perf_counter()
+            env_batch_i["send_time"] = t
             self.send(
                 (mode, env_batch_i),
                 self.cfg.rollout.group_name,
@@ -406,6 +450,7 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 env_output: EnvOutput = env_output_list[stage_id]
                 self.send_env_batch(output_channel, env_output.to_dict())
+            # raise NotImplementedError
 
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):

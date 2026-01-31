@@ -20,6 +20,7 @@ from typing import Any
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
+import time
 
 from rlinf.config import SupportedModel
 from rlinf.data.io_struct import ChunkStepResult, EmbodiedRolloutResult
@@ -362,7 +363,32 @@ class MultiStepRolloutWorker(Worker):
     async def recv_env_output(
         self, input_channel: Channel, mode="train"
     ) -> dict[str, torch.Tensor]:
+
+        if self.cfg.runner.get("enable_dist_channel", True):
+            return await self.recv_env_output_1(input_channel, mode)
+        else:
+            return await self.recv_env_output_0(input_channel, mode)
+
+    async def recv_env_output_0(
+        self, input_channel: Channel, mode="train"
+    ) -> dict[str, torch.Tensor]:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
+        # Use asyncio so that it can run alongside async weight syncing
+        handle = input_channel.get(
+            key=f"{self._rank}_{mode}", async_op=True
+        )
+
+        env_output = await handle.async_wait()
+        t = time.time()
+        with open(f"/mnt/RLinf/recv_env_output_0.txt", "a") as f:
+            f.write(f"{t}, {handle.latency}\n")
+        return env_output
+    
+    async def recv_env_output_1(
+        self, input_channel: Channel, mode="train"
+    ) -> dict[str, torch.Tensor]:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+
         # Use asyncio so that it can run alongside async weight syncing
         src_rank_in_env = self._rank // self.gather_num
         work = self.recv(
@@ -386,13 +412,32 @@ class MultiStepRolloutWorker(Worker):
         while queue.empty():
             await asyncio.sleep(0.001)
         batch = queue.get_nowait()
+        recv_time = time.perf_counter()
+        send_time = batch.pop("send_time")
+        with open(f"/mnt/RLinf/recv_env_output_1.txt", "a") as f:
+            f.write(f"{recv_time}, {recv_time-send_time}\n")
         return batch
 
     def send_chunk_actions(self, output_channel: Channel, chunk_actions, mode="train"):
+        if self.cfg.runner.get("enable_dist_channel", True):
+            return self.send_chunk_actions_1(output_channel, chunk_actions, mode)
+        else:
+            return self.send_chunk_actions_0(output_channel, chunk_actions, mode)
+        
+    def send_chunk_actions_0(self, output_channel: Channel, chunk_actions, mode="train"):
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        t = time.perf_counter()
+        output_channel.put(
+            item=(t, chunk_actions), key=f"{self._rank}_{mode}", async_op=True
+        )
+
+    
+    def send_chunk_actions_1(self, output_channel: Channel, chunk_actions, mode="train"):
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         dst_rank_in_env = self._rank // self.gather_num
+        t = time.perf_counter()
         return self.send(
-            (mode, chunk_actions),
+            (mode, t, chunk_actions),
             self.cfg.env.group_name,
             dst_rank=dst_rank_in_env,
             async_op=True,

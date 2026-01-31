@@ -389,11 +389,15 @@ class AsyncChannelCommWork(AsyncWork):
             if query_id not in AsyncChannelCommWork.channel_data_store:
                 AsyncChannelCommWork.channel_data_store[query_id] = Future()
             self._data_future = AsyncChannelCommWork.channel_data_store[query_id]
+        self.latency = -1
+        self.start_time = time.perf_counter()
         self._async_comm_work.then(self._store_channel_data)
 
     def _store_channel_data(self):
         """Store channel data in the channel data store."""
         query_id, data = self._async_comm_work.wait()
+        end_time = time.perf_counter()
+        self.latency = end_time - self.start_time
         with AsyncChannelCommWork.store_lock:
             if query_id not in AsyncChannelCommWork.channel_data_store:
                 AsyncChannelCommWork.channel_data_store[query_id] = Future()
