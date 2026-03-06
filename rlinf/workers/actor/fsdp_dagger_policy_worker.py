@@ -18,6 +18,7 @@ import os
 import jax
 import numpy as np
 import openpi.models.model as _model
+from rlinf.config import get_supported_model, SupportedModel
 import torch
 from omegaconf import DictConfig
 
@@ -228,102 +229,111 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
         if len(intervene_traj_list) > 0:
             self.replay_buffer.add_trajectories(intervene_traj_list)
 
+    def preprocess_batch(self, batch):
+        model_type = get_supported_model(self.cfg.actor.model.model_type)
+        if model_type == SupportedModel.MLP_POLICY:
+            return {
+                "states": batch["states"],
+                "action": batch["model_action"],
+            }
+        elif model_type == SupportedModel.OPENPI:
+            obs_dict = {}
+            obs_prefix_keys = [k for k in batch.keys() if k.startswith("observation/")]
+            for key in obs_prefix_keys:
+                obs_dict[key] = batch[key]
+            # Also extract tokenized prompt fields if present
+            if "tokenized_prompt" in batch:
+                obs_dict["tokenized_prompt"] = batch["tokenized_prompt"]
+            if "tokenized_prompt_mask" in batch:
+                obs_dict["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+
+            bsz = batch["action"].shape[0]
+
+            if "model_action" in batch:
+                # Expert-model path: model_action is already in model/normalized space
+                # [B, action_horizon * action_dim].  Use it directly as the imitation target
+                # without re-applying input_transform on the action (which would double-normalize).
+                # We still run input_transform on the obs to get correctly normalized observations;
+                # a zero placeholder is used for the "actions" slot so the transform pipeline
+                # does not see env-space data.
+                actions = (
+                    batch["model_action"]
+                    .reshape(
+                        bsz, self.model.config.action_horizon, self.model.config.action_dim
+                    )
+                    .clone()
+                )
+                processed_obs = self.model.input_transform(obs_dict, transpose=False)
+                processed_obs = self.model.precision_processor(
+                    processed_obs
+                )  # obs precision processor
+                observation = _model.Observation.from_dict(processed_obs)
+            else:
+                # Human-intervene path: action is in env space [B, action_chunk * action_env_dim].
+                # Reshape, pad to model dims, then apply input_transform to normalize into model space.
+                obs_dict["actions"] = batch["action"].reshape(
+                    bsz, self.model.config.action_chunk, -1
+                )
+                if obs_dict["actions"].shape[2] < self.model.config.action_dim:
+                    padding_action_dim = torch.zeros(
+                        bsz,
+                        obs_dict["actions"].shape[1],
+                        self.model.config.action_dim - obs_dict["actions"].shape[2],
+                        device=obs_dict["actions"].device,
+                    )
+                    obs_dict["actions"] = torch.cat(
+                        [obs_dict["actions"], padding_action_dim], dim=2
+                    )
+                if obs_dict["actions"].shape[1] < self.model.config.action_horizon:
+                    padding_action_chunk = torch.zeros(
+                        bsz,
+                        self.model.config.action_horizon - obs_dict["actions"].shape[1],
+                        self.model.config.action_dim,
+                        device=obs_dict["actions"].device,
+                    )
+                    obs_dict["actions"] = torch.cat(
+                        [obs_dict["actions"], padding_action_chunk], dim=1
+                    )
+                obs_dict["prompt"] = ["empty" for _ in range(bsz)]
+                processed_obs = self.model.input_transform(obs_dict, transpose=False)
+                processed_obs["tokenized_prompt"] = batch["tokenized_prompt"]
+                processed_obs["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+                processed_obs = self.model.precision_processor(
+                    processed_obs
+                )  # obs precision processor
+                observation = _model.Observation.from_dict(processed_obs)
+                actions = processed_obs["actions"].clone()
+                processed_obs.pop("actions")
+
+            observation = jax.tree.map(
+                lambda x: torch.as_tensor(x, device=self.device).contiguous().clone(),
+                observation,
+            )
+            actions = actions.to(torch.float32)
+            actions = actions.to(self.device)
+            data={"observation": observation, "actions": actions}
+            return data
+        else:
+            raise NotImplementedError
+
+    def postprocess_loss(self, loss):
+        model_type = get_supported_model(self.cfg.actor.model.model_type)
+        if model_type == SupportedModel.MLP_POLICY:
+            return loss.mean()
+        elif model_type == SupportedModel.OPENPI:
+            action_chunk = self.model.config.action_chunk
+            action_dim = self.model.config.action_env_dim
+            loss = loss[:, :action_chunk, :action_dim]
+            return loss.mean()
+        else:
+            raise NotImplementedError
+
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
-        # use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
-        # if "actor_agg_q" in self.cfg.algorithm:
-        #     agg_q = self.cfg.algorithm["actor_agg_q"]
-        # else:
-        #     agg_q = self.cfg.algorithm.get("agg_q", "min")
-
-        # kwargs = {}
-        # if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
-        #     kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
-        obs_dict = {}
-        obs_prefix_keys = [k for k in batch.keys() if k.startswith("observation/")]
-        for key in obs_prefix_keys:
-            obs_dict[key] = batch[key]
-        # Also extract tokenized prompt fields if present
-        if "tokenized_prompt" in batch:
-            obs_dict["tokenized_prompt"] = batch["tokenized_prompt"]
-        if "tokenized_prompt_mask" in batch:
-            obs_dict["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
-
-        bsz = batch["action"].shape[0]
-
-        if "model_action" in batch:
-            # Expert-model path: model_action is already in model/normalized space
-            # [B, action_horizon * action_dim].  Use it directly as the imitation target
-            # without re-applying input_transform on the action (which would double-normalize).
-            # We still run input_transform on the obs to get correctly normalized observations;
-            # a zero placeholder is used for the "actions" slot so the transform pipeline
-            # does not see env-space data.
-            actions = (
-                batch["model_action"]
-                .reshape(
-                    bsz, self.model.config.action_horizon, self.model.config.action_dim
-                )
-                .clone()
-            )
-            processed_obs = self.model.input_transform(obs_dict, transpose=False)
-            processed_obs = self.model.precision_processor(
-                processed_obs
-            )  # obs precision processor
-            observation = _model.Observation.from_dict(processed_obs)
-        else:
-            # Human-intervene path: action is in env space [B, action_chunk * action_env_dim].
-            # Reshape, pad to model dims, then apply input_transform to normalize into model space.
-            obs_dict["actions"] = batch["action"].reshape(
-                bsz, self.model.config.action_chunk, -1
-            )
-            if obs_dict["actions"].shape[2] < self.model.config.action_dim:
-                padding_action_dim = torch.zeros(
-                    bsz,
-                    obs_dict["actions"].shape[1],
-                    self.model.config.action_dim - obs_dict["actions"].shape[2],
-                    device=obs_dict["actions"].device,
-                )
-                obs_dict["actions"] = torch.cat(
-                    [obs_dict["actions"], padding_action_dim], dim=2
-                )
-            if obs_dict["actions"].shape[1] < self.model.config.action_horizon:
-                padding_action_chunk = torch.zeros(
-                    bsz,
-                    self.model.config.action_horizon - obs_dict["actions"].shape[1],
-                    self.model.config.action_dim,
-                    device=obs_dict["actions"].device,
-                )
-                obs_dict["actions"] = torch.cat(
-                    [obs_dict["actions"], padding_action_chunk], dim=1
-                )
-            obs_dict["prompt"] = ["empty" for _ in range(bsz)]
-            processed_obs = self.model.input_transform(obs_dict, transpose=False)
-            processed_obs["tokenized_prompt"] = batch["tokenized_prompt"]
-            processed_obs["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
-            processed_obs = self.model.precision_processor(
-                processed_obs
-            )  # obs precision processor
-            observation = _model.Observation.from_dict(processed_obs)
-            actions = processed_obs["actions"].clone()
-            processed_obs.pop("actions")
-
-        observation = jax.tree.map(
-            lambda x: torch.as_tensor(x, device=self.device).contiguous().clone(),
-            observation,
-        )
-        actions = actions.to(torch.float32)
-        actions = actions.to(self.device)
-
-        actor_loss = self.model(
-            forward_type=ForwardType.SFT,
-            data={"observation": observation, "actions": actions},
-        )
-
-        action_chunk = self.model.config.action_chunk
-        action_dim = self.model.config.action_env_dim
-        actor_loss = actor_loss[:, :action_chunk, :action_dim]
-
-        return actor_loss.mean()
+        data = self.preprocess_batch(batch)
+        loss = self.model(forward_type=ForwardType.SFT, data=data)
+        loss = self.postprocess_loss(loss)
+        return loss
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self):
