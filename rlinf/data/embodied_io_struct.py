@@ -369,6 +369,7 @@ class Trajectory:
     trajectory contains multiple episodes.
     """
 
+    rank: int = -1
     max_episode_length: int = 0  # max episode length
     model_weights_id: str = ""  # str(uuid(versions))
     actions: torch.Tensor = None

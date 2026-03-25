@@ -317,7 +317,9 @@ class TrajectoryReplayBuffer:
 
         # Buffer state
         self.size = 0  # Current number of trajectories
+        self.rank_size_dict = {}
         self._total_samples = 0  # Total number of samples across all trajectories
+        self.rank_samples_dict = {}
 
         # Random seed
         self.seed = seed
@@ -494,7 +496,9 @@ class TrajectoryReplayBuffer:
                 # Update counters
                 self._trajectory_counter += 1
                 self.size += 1
+                self.rank_size_dict[trajectory.rank] = self.rank_size_dict.get(trajectory.rank, 0) + 1
                 self._total_samples += num_samples
+                self.rank_samples_dict[trajectory.rank] = self.rank_samples_dict.get(trajectory.rank, 0) + num_samples
                 self._index_version += 1
 
             if self._flat_trajectory_cache is not None:
@@ -921,6 +925,8 @@ class TrajectoryReplayBuffer:
             if self._flat_trajectory_cache
             else 0,
         }
+        stats.update({f"num_trajectories/rank_{rank}": size for rank, size in self.rank_size_dict.items()})
+        stats.update({f"total_samples/rank_{rank}": samples for rank, samples in self.rank_samples_dict.items()})
         return stats
 
     def save_checkpoint(self, save_path: str):
