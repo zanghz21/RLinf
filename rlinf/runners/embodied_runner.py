@@ -64,9 +64,9 @@ class EmbodiedRunner:
         self.reward = reward
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         # Data channels
-        self.env_channel = Channel.create("Env")
-        self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        self.env_channel = Channel.create("Env", distributed=True)
+        self.rollout_channel = Channel.create("Rollout", distributed=True)
+        self.actor_channel = Channel.create("Actor", distributed=True)
 
         # this timer checks if we should stop training
         self.run_timer = run_timer

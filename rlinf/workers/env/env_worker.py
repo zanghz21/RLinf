@@ -552,6 +552,7 @@ class EnvWorker(Worker):
 
         return splitted_env_batches
 
+    @Worker.timer("send_env_batch")
     def send_env_batch(
         self,
         output_channel: Channel,
@@ -648,6 +649,7 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
+    @Worker.timer("send_rollout_trajectories")
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
     ):
@@ -658,6 +660,7 @@ class EnvWorker(Worker):
             trajectory.rank = self._rank
             channel.put(trajectory, async_op=True)
 
+    @Worker.timer("run_interact_once")
     async def _run_interact_once(
         self,
         input_channel: Channel,

@@ -618,6 +618,7 @@ class MultiStepRolloutWorker(Worker):
             for idx in range(len(sizes))
         ]
 
+    @Worker.timer("send_rollout_result")
     def send_rollout_result(
         self,
         output_channel: Channel,

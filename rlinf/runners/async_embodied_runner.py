@@ -164,7 +164,8 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 if not skip_step:
                     self.global_step += 1
                     if self.global_step % self.weight_sync_interval == 0:
-                        self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+                        with self.timer("update_rollout_weights"):
+                            self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
                     training_metrics = {
                         f"train/{k}": v
