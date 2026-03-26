@@ -125,7 +125,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         )
 
     def _apply_synced_model_weights(self, param_state_dict):
-        self.hf_model.load_state_dict(param_state_dict)
+        self.hf_model.load_state_dict(param_state_dict, strict=False)
 
         del param_state_dict
         gc.collect()
