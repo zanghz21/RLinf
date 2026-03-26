@@ -360,7 +360,11 @@ class FSDPStrategyBase(ABC):
         torch.distributed.barrier()
 
     def get_model_state_dict(
-        self, model: FSDPModule, cpu_offload: bool, full_state_dict: bool
+        self,
+        model: FSDPModule,
+        cpu_offload: bool,
+        full_state_dict: bool,
+        requires_grad_only: bool = False,
     ) -> dict:
         """
         Get the full model state dict of FSDP2 from all ranks.
@@ -370,6 +374,7 @@ class FSDPStrategyBase(ABC):
             - cpu_offload (bool): Whether returned state_dict's value will be offloaded to CPU. If true, will
                 be copied to CPU memory, or just keep a reference to the original GPU tensor.
             - full_state_dict (bool): Whether to get the full state dict.
+            - requires_grad_only (bool): Whether to only include parameters with requires_grad=True.
 
         Returns:
             - dict: The state dict of the FSDP/FSDP2 wrapped model according to the specified options.
@@ -378,6 +383,34 @@ class FSDPStrategyBase(ABC):
             cpu_offload=cpu_offload, full_state_dict=full_state_dict
         )
         state_dict = get_model_state_dict(model=model, options=opts)
+
+        if requires_grad_only:
+            requires_grad_names = set()
+            
+            for name, param in model.named_parameters():
+                param_requires_grad = False
+                
+                if isinstance(param, DTensor):
+                    param_requires_grad = param._local_tensor.requires_grad
+                elif hasattr(param, "_handle") and param._handle is not None:
+                    flat_param = param._handle.flat_param
+                    if hasattr(flat_param, "_params") and flat_param._params:
+                        param_requires_grad = any(p.requires_grad for p in flat_param._params)
+                    else:
+                        param_requires_grad = flat_param.requires_grad
+                elif hasattr(param, "requires_grad"):
+                    param_requires_grad = param.requires_grad
+                
+                if param_requires_grad:
+                    clean_name = name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+                    requires_grad_names.add(clean_name)
+            
+            state_dict = {
+                name: tensor
+                for name, tensor in state_dict.items()
+                if name in requires_grad_names
+            }
+
         return state_dict
 
     def load_model_with_state_dict(

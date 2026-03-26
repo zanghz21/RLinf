@@ -130,7 +130,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             return
 
         rollout_handle: Handle = self.rollout.request_actor_sync_model()
-        actor_handle: Handle = self.actor.sync_model_to_rollout()
+        actor_handle: Handle = self.actor.sync_model_to_rollout(requires_grad_only=True)
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
     def run(self):

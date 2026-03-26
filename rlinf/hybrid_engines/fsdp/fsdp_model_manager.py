@@ -22,7 +22,7 @@ from omegaconf import DictConfig
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+# from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 
 from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
 from rlinf.data.tokenizers import hf_tokenizer
@@ -279,7 +279,7 @@ class FSDPModelManager:
             self._cfg.fsdp_config.grad_scaler.get("enabled", False), **kwargs
         )
 
-    def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool) -> dict:
+    def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool, requires_grad_only: bool = False) -> dict:
         """
         Get the model state dict according to the specified options.
 
@@ -292,7 +292,7 @@ class FSDPModelManager:
             - dict: The state dict of the FSDP wrapped model according to the specified options
         """
         state_dict = self._strategy.get_model_state_dict(
-            self.model, cpu_offload, full_state_dict
+            self.model, cpu_offload, full_state_dict, requires_grad_only
         )
         return state_dict
 
