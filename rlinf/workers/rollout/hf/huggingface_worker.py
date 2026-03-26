@@ -445,6 +445,7 @@ class MultiStepRolloutWorker(Worker):
                 eval_batch_size=self.eval_batch_size,
             )
 
+    @Worker.timer("recv_env_output")
     async def recv_env_output(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
     ) -> dict[str, Any]:

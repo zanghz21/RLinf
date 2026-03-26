@@ -362,6 +362,7 @@ class EnvWorker(Worker):
         )
         return env_output, env_info
 
+    @Worker.timer("recv_chunk_actions")
     def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
         """Receive and merge chunked actions for the current env worker.
 
@@ -401,6 +402,7 @@ class EnvWorker(Worker):
         )
         return chunk_action
 
+    @Worker.timer("recv_rollout_results")
     def recv_rollout_results(
         self, input_channel: Channel, mode="train"
     ) -> RolloutResult:

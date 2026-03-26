@@ -18,7 +18,7 @@ import gc
 import torch
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.scheduler import Channel
+from rlinf.scheduler import Channel, Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -131,6 +131,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
+    @Worker.timer("poll_background_weight_sync")
     async def _poll_background_weight_sync(self):
         self._start_background_weight_sync_if_needed()
         if self._weight_sync_work is None:
