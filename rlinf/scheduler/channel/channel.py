@@ -303,6 +303,7 @@ class Channel:
                 .ensure_key_replica(key=key, src_node_rank=src_node_rank)
                 .wait()[0]
             )
+            print(f"Using channel on node rank {src_node_rank}for key {key}", flush=True)
             self._key_to_channel_rank_cache[key] = target_rank
         return self._key_to_channel_rank_cache[key]
 
