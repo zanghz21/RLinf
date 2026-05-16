@@ -108,22 +108,66 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             self._generate_task.cancel()
 
     async def _recv_and_apply_actor_sync(self) -> int:
-        async def recv_func():
-            return await self.recv(
-                self.actor_group_name,
-                src_rank=self.actor_weight_src_rank,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
+        if not self._use_broadcast_sync:
 
-        async def send_func(data):
-            await self.send(
-                data,
-                dst_group_name=self.actor_group_name,
-                dst_rank=self.actor_weight_src_rank,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
+            async def recv_func():
+                return await self.recv(
+                    self.actor_group_name,
+                    src_rank=self.actor_weight_src_rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                ).async_wait()
+
+            async def send_func(data):
+                await self.send(
+                    data,
+                    dst_group_name=self.actor_group_name,
+                    dst_rank=self.actor_weight_src_rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                ).async_wait()
+        elif self._is_root_rollout:
+
+            async def recv_func():
+                data = await self.recv(
+                    self.actor_group_name,
+                    src_rank=self.actor_weight_src_rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                ).async_wait()
+
+                await asyncio.gather(
+                    *[
+                        self.send(
+                            data,
+                            dst_group_name=self._rollout_group_name_self,
+                            dst_rank=r,
+                            async_op=True,
+                        ).async_wait()
+                        for r in self._non_root_sibling_ranks
+                    ]
+                )
+                return data
+
+            async def send_func(data):
+                await self.send(
+                    data,
+                    dst_group_name=self.actor_group_name,
+                    dst_rank=self.actor_weight_src_rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                ).async_wait()
+        else:
+
+            async def recv_func():
+                return await self.recv(
+                    self._rollout_group_name_self,
+                    src_rank=self._root_rollout_rank,
+                    async_op=True,
+                ).async_wait()
+
+            async def send_func(_data):
+                pass
 
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(

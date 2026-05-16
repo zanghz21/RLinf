@@ -1010,15 +1010,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         will send weights to most ceil(N/M) rollout ranks according to the modulo rule.
         """
         rollout_world_size = self._component_placement.get_world_size("rollout")
-        actor_world_size = self._world_size
-        rank = self._rank
-        self._weight_dst_rank_in_rollout = []
-        rollout_ranks_per_actor = (
-            rollout_world_size + actor_world_size - 1
-        ) // actor_world_size
-        for i in range(rollout_ranks_per_actor):
-            if i * actor_world_size + rank < rollout_world_size:
-                self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
+        use_broadcast = self.cfg.rollout.get("sync_weight_broadcast", False)
+        if use_broadcast:
+            self._weight_dst_rank_in_rollout = [0] if self._rank == 0 else []
+            return
+        else:
+            actor_world_size = self._world_size
+            rank = self._rank
+            self._weight_dst_rank_in_rollout = []
+            rollout_ranks_per_actor = (
+                rollout_world_size + actor_world_size - 1
+            ) // actor_world_size
+            for i in range(rollout_ranks_per_actor):
+                if i * actor_world_size + rank < rollout_world_size:
+                    self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
 
     def init_worker(self) -> None:
         """
