@@ -41,6 +41,7 @@ algorithm:
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 1
   rollout_epoch: 1
+  rollout_store_size_per_rank: 1
   update_epoch: 1
   staleness_threshold: 1
   behave_weight_threshold: 2
@@ -107,7 +108,7 @@ rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
   recompute_logprobs: False
-  enable_offload: True
+  enable_offload: False
   pipeline_stage_num: 1
 
   model:

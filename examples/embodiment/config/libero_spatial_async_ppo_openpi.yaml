@@ -16,7 +16,8 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-7
+    actor,rollout: 0-7
+    env: 0-7:0-15
 
 runner:
   task_type: embodied
@@ -31,7 +32,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: -1
+  save_interval: 40
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -118,7 +119,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     precision: ${actor.model.precision}
 
 actor:
@@ -131,7 +132,7 @@ actor:
 
   # Override the default values in model/pi0
   model:
-    model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     num_action_chunks: 5 # interface for the env
     add_value_head: True
     noise_level: 0.1

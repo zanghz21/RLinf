@@ -45,6 +45,7 @@ algorithm:
   behave_weight_threshold: 2.0
 
   rollout_epoch: 1
+  rollout_store_size_per_rank: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
