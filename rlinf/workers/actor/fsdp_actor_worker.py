@@ -14,7 +14,6 @@
 
 import time
 from functools import partial
-from typing import Optional
 
 import numpy as np
 import torch
@@ -60,7 +59,6 @@ from rlinf.utils.distributed import (
 )
 from rlinf.utils.metric_utils import (
     append_to_dict,
-    compute_loss_mask,
     compute_rollout_metrics,
     compute_split_num,
 )
@@ -159,12 +157,43 @@ def compute_rollout_train_kl(
     return masked_mean(kl, loss_mask)
 
 
+# Fields that carry a trailing bootstrap step, i.e. they have shape
+# ``[T + 1, B, ...]`` whereas every other field has shape ``[T, B, ...]``.
+# ``process_nested_dict_for_train`` drops the trailing row via ``[:-1]``.
+_N1_STEP_FIELDS = ("dones", "terminations", "truncations", "prev_values")
+
+
+def reconstruct_structured_rollout_batch(flat: dict) -> dict:
+    """Inverse of the flatten produced by :func:`process_nested_dict_for_train`.
+
+    Turns a flat per-sample dict (tensors shaped ``[N, ...]``) back into the
+    structured ``[N, 1, ...]`` layout expected by the training loop. The trailing
+    bootstrap row dropped during flattening is re-appended as zeros for the
+    ``_N1_STEP_FIELDS`` so the downstream ``[:-1]`` slice still yields ``N`` rows.
+    """
+    ret = {}
+    for key, value in flat.items():
+        if value is None:
+            ret[key] = None
+        elif isinstance(value, torch.Tensor):
+            structured = value.unsqueeze(1)  # [N, 1, ...]
+            if key in _N1_STEP_FIELDS:
+                pad = torch.zeros((1, *structured.shape[1:]), dtype=structured.dtype)
+                structured = torch.cat([structured, pad], dim=0)  # [N + 1, 1, ...]
+            ret[key] = structured
+        elif isinstance(value, dict):
+            ret[key] = reconstruct_structured_rollout_batch(value)
+        else:
+            ret[key] = value
+    return ret
+
+
 class FSDPActor(FSDPModelManager, Worker):
     def __init__(
         self,
         cfg: DictConfig,
         placement: ModelParallelComponentPlacement,
-        cfg_fsdp: Optional[DictConfig] = None,
+        cfg_fsdp: DictConfig | None = None,
     ) -> None:
         """
         FSDPActor worker used to train the model with data from rollout workers.
@@ -458,7 +487,7 @@ class FSDPActor(FSDPModelManager, Worker):
         batch,
         enable_dynamic_batch_size: bool,
         *,
-        max_tokens_per_mbs: Optional[int] = None,
+        max_tokens_per_mbs: int | None = None,
         split_num,
     ):
         if enable_dynamic_batch_size:
@@ -506,7 +535,7 @@ class FSDPActor(FSDPModelManager, Worker):
         position_ids = m_batch["position_ids"]
 
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in m_batch.keys():
+        if "multi_modal_inputs" in m_batch:
             for key in m_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat(
                     [inputs[key] for inputs in m_batch["multi_modal_inputs"]],
@@ -1004,7 +1033,7 @@ class FSDPActor(FSDPModelManager, Worker):
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
         with self.worker_timer():
-            if batch.get("advantages", None) is None:
+            if batch.get("advantages") is None:
                 mask = batch["response_mask"][:, -self.response_len :]
                 logprob = batch.get("recomputed_logprobs")
                 if logprob is None:
@@ -1044,6 +1073,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.stage_num = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
+
+        # Equalize the per-rank rollout sample count before training. Episodic
+        # (variable-length) rollouts give each rank a different number of samples,
+        # which makes the synchronized FSDP/DDP update loop run an unequal number
+        # of optimizer steps per rank -> NCCL collective desync / hang. When
+        # enabled, every rank is padded up to the global-max sample count by
+        # locally re-sampling its own data (no cross-rank data movement, no dropped
+        # samples, memory bounded by the largest rank's existing footprint).
+        self.rebalance_rollout_across_ranks = self.cfg.actor.get(
+            "rebalance_rollout_across_ranks", True
+        )
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -1171,7 +1211,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.full_rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.full_rollout_batch = self._process_received_rollout_batch(self.full_rollout_batch)
-        print(f"{self.full_rollout_batch['prev_logprobs'].shape=}")
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1297,6 +1336,78 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
+    @torch.no_grad()
+    def _rebalance_full_rollout_batch_across_ranks(self) -> None:
+        """Equalize ``self.full_rollout_batch``'s per-rank sample count by padding
+        every rank up to the global-max count.
+
+        Episodic rollouts hand each rank a different number of completed-episode
+        samples. Because the FSDP/DDP update loop derives its optimizer-step count
+        from the local sample count, unequal counts make ranks issue an unequal
+        number of NCCL collectives and the run deadlocks on a watchdog timeout.
+
+        Rather than pooling every rank's data onto every rank (which replicates the
+        multi-GB image / denoising-chain payload world_size times in host memory and
+        OOMs the node), each rank keeps all of its own samples and appends a few
+        locally re-sampled duplicates until it reaches the global-max count. This
+        moves no data across ranks (only a single scalar all-reduce), drops nothing,
+        and bounds each rank's memory by the largest rank's existing footprint.
+
+        Must be called *after* advantages/returns are computed (each sample is then
+        independent) and on every rank in lock-step.
+        """
+        if not self.rebalance_rollout_across_ranks:
+            return
+        if not torch.distributed.is_initialized():
+            return
+        world_size = torch.distributed.get_world_size()
+        if world_size <= 1:
+            return
+
+        # Per-sample count is prev_logprobs.shape[0] * shape[1] (== T * B); this is
+        # the loop's own notion of sample count. Using shape[0] alone would drop
+        # T * (B - 1) samples when B > 1.
+        prev_logprobs = self.full_rollout_batch["prev_logprobs"]
+        n_local = int(prev_logprobs.shape[0] * prev_logprobs.shape[1])
+
+        # One tiny collective to find the global-max count (kept on the accelerator
+        # so it rides the existing NCCL default group).
+        device = torch.device(f"{Worker.torch_device_type}:{self._local_rank}")
+        count_t = torch.tensor([n_local], dtype=torch.long, device=device)
+        torch.distributed.all_reduce(count_t, op=torch.distributed.ReduceOp.MAX)
+        n_max = int(count_t.item())
+
+        if n_max == 0 or n_local == 0:
+            # Pathological: some rank has no samples. We cannot pad from an empty
+            # pool; leave the batch untouched and warn (this would still desync, but
+            # it indicates a rollout-collection problem upstream).
+            if n_local == 0 and n_max > 0:
+                self.log_warning(
+                    "rebalance: rank has 0 rollout samples while peers have "
+                    f"{n_max}; cannot pad and the update loop may desync."
+                )
+            return
+        if n_max == n_local:
+            return  # already balanced; nothing to do
+
+        # Append (n_max - n_local) duplicates drawn (with replacement) from this
+        # rank's own samples, after keeping all originals. One indexing pass builds
+        # the padded per-sample flat batch directly.
+        seed = int(self.cfg.actor.seed) + self._rank + int(getattr(self, "version", 0) or 0)
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        extra = torch.randint(0, n_local, (n_max - n_local,), generator=generator)
+        idx = torch.cat([torch.arange(n_local), extra])
+
+        flat_padded = process_nested_dict_for_train(self.full_rollout_batch, idx)
+        self.full_rollout_batch = reconstruct_structured_rollout_batch(flat_padded)
+
+        self.log_info(
+            f"rebalanced rollout batch: padded {n_local} -> {n_max} samples "
+            f"(+{n_max - n_local} duplicated) to match global max across "
+            f"{world_size} ranks"
+        )
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1307,6 +1418,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        self._rebalance_full_rollout_batch_across_ranks()
+
         self.model.train()
         rollout_size = (
             self.full_rollout_batch["prev_logprobs"].shape[0]
@@ -1315,7 +1428,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
 
-        
+
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1336,7 +1449,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             shuffle_id = torch.randperm(rollout_size, generator=g)[:real_rollout_size]
             assert real_rollout_size % batch_size_per_rank == 0, (
                 f"{rollout_size} is not divisible by {batch_size_per_rank}"
-            )    
+            )
 
             with torch.no_grad():
                 self.rollout_batch = process_nested_dict_for_train(

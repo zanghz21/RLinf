@@ -30,9 +30,7 @@ from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
-from rlinf.data.embodied_io_struct import convert_trajectories_to_batch
-from rlinf.workers.actor.fsdp_actor_worker import process_nested_dict_for_train
+from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor, process_nested_dict_for_train
 
 
 class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
@@ -144,7 +142,6 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.full_rollout_batch = convert_trajectories_to_batch(rollout_batch)
         self.full_rollout_batch = self._process_received_rollout_batch(self.full_rollout_batch)
         self.log_info(f"staleness metrics={staleness_metrics}")
-        print(f"{self.full_rollout_batch['prev_logprobs'].shape=}")
         return staleness_metrics
 
     @torch.inference_mode()
@@ -259,16 +256,16 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        self._rebalance_full_rollout_batch_across_ranks()
+
         rollout_size = (
             self.full_rollout_batch["prev_logprobs"].shape[0]
             * self.full_rollout_batch["prev_logprobs"].shape[1]
         )
 
-        print(f"rollout_size={self.full_rollout_batch['prev_logprobs'].shape[0]} * {self.full_rollout_batch['prev_logprobs'].shape[1]}; {self.full_rollout_batch['prev_logprobs'].shape} = {rollout_size}")
-
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(self.cfg.actor.seed) + int(self._rank))
-        
+
 
         if self.cfg.algorithm.normalize_advantages:
             self.full_rollout_batch["advantages"] = masked_normalization(
@@ -291,20 +288,18 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         micro_per_rank = batch_size_per_rank // micro_batch_size
         self.gradient_accumulation = micro_per_rank
 
-        
+
         metrics: dict[str, list] = {}
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
 
         for _ in range(update_epoch):
             batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
             real_rollout_size = rollout_size - rollout_size % batch_size_per_rank
-            print(f"rollout_size={rollout_size} batch_size_per_rank={batch_size_per_rank} real_rollout_size={real_rollout_size}")
             shuffle_id = torch.randperm(rollout_size, generator=generator)[:real_rollout_size]
             assert real_rollout_size % batch_size_per_rank == 0, (
                 f"Flattened rollout size {real_rollout_size} must be divisible by "
                 f"per-rank batch size {batch_size_per_rank}"
             )
-            print(f"real_rollout_size={real_rollout_size} batch_size_per_rank={batch_size_per_rank}")
 
             with torch.no_grad():
                 self.rollout_batch = process_nested_dict_for_train(
