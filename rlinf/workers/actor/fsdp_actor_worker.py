@@ -14,6 +14,7 @@
 
 import time
 from functools import partial
+from typing import Optional
 
 import numpy as np
 import torch

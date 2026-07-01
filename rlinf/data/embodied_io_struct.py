@@ -819,62 +819,9 @@ class EmbodiedRolloutResult:
                     for key, value in stacked.items()
                 },
             )
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
-
-    def to_trajectory(self) -> Trajectory:
-        # return [trajectory_length, B, ...]
-        trajectory = Trajectory(
-            max_episode_length=self.max_episode_length,
-        )
-        if len(self.actions) > 0:
-            trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
-        if len(self.intervene_flags) > 0:
-            trajectory.intervene_flags = (
-                torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
-            )
-        if len(self.rewards) > 0:
-            trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
-        if len(self.terminations) > 0:
-            trajectory.terminations = (
-                torch.stack(self.terminations, dim=0).cpu().contiguous()
-            )
-        if len(self.truncations) > 0:
-            trajectory.truncations = (
-                torch.stack(self.truncations, dim=0).cpu().contiguous()
-            )
-        if len(self.dones) > 0:
-            trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
-        if len(self.prev_logprobs) > 0:
-            trajectory.prev_logprobs = (
-                torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()
-            )
-        if len(self.prev_values) > 0:
-            trajectory.prev_values = (
-                torch.stack(self.prev_values, dim=0).cpu().contiguous()
-            )
-        if len(self.versions) > 0:
-            trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
-        if len(self.forward_inputs) > 0:
-            trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
-            for key in trajectory.forward_inputs.keys():
-                trajectory.forward_inputs[key] = (
-                    trajectory.forward_inputs[key].cpu().contiguous()
-                )
-
-        if len(self.curr_obs) > 0:
-            trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
-            for key in trajectory.curr_obs.keys():
-                trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
-        if len(self.next_obs) > 0:
-            trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
-            for key in trajectory.next_obs.keys():
-                trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
-
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions
-            if trajectory.versions is not None
-            else torch.zeros(1, dtype=torch.float32)
+            if trajectory.versions is not None else torch.zeros(1, dtype=torch.float32)
         )
         return trajectory
 

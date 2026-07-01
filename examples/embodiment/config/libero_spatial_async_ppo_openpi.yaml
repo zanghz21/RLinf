@@ -42,7 +42,7 @@ algorithm:
   group_size: 1
   reward_coef: 1.0
   staleness_threshold: 2
-  rollout_store_size_per_rank: 2 # the number of trajectories to store for each actor
+  rollout_store_size_per_rank: 64 # the number of trajectories to store for each actor
   behave_weight_threshold: 5
 
   reward_type: chunk_level
@@ -73,6 +73,8 @@ env:
 
   # Override the default values in env/libero_spatial
   train:
+    ignore_terminations: False
+    auto_reset: True
     rollout_epoch: 2
     total_num_envs: 128
     max_episode_steps: 240 # max episode steps for truncation
@@ -101,7 +103,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path:  /mnt/public2/hongzhi/models/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT/ # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     precision: ${actor.model.precision}
 
 actor:
@@ -114,7 +116,7 @@ actor:
 
   # Override the default values in model/pi0
   model:
-    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path:  /mnt/public2/hongzhi/models/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT/ # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     num_action_chunks: 5 # interface for the env
     add_value_head: True
     noise_level: 0.1

@@ -165,7 +165,7 @@ class EnvWorker(Worker):
             for _ in range(self.stage_num)
         ]
 
-    def init_worker(self, enable_barrier: bool = False):
+    def init_worker(self, enable_barrier: bool = True):
         # check env mode
         env_mode = self.cfg.env.train.get("env_mode", None)
         assert env_mode in ["decoupled", None], f"{env_mode} is not supported"
@@ -181,13 +181,13 @@ class EnvWorker(Worker):
                 "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
             )
 
-    def init_worker(self):
-        # This is a barrier to ensure all envs' initial setup upon import is done
-        # Essential for RealWorld env to ensure initial ROS node setup is done
-        self.broadcast(
-            True,
-            groups=[(self._group_name, list(range(self._world_size)))],
-        )
+        if enable_barrier:
+            # This is a barrier to ensure all envs' initial setup upon import is done
+            # Essential for RealWorld env to ensure initial ROS node setup is done
+            self.broadcast(
+                True,
+                groups=[(self._group_name, list(range(self._world_size)))],
+            )
 
         self.update_env_cfg()
 
@@ -224,6 +224,7 @@ class EnvWorker(Worker):
                 self.history_lengths = [{} for _ in range(self.stage_num)]
 
         self._init_env()
+        self._has_initialized = True
 
     def update_env_cfg(self):
         if self.enable_train:
@@ -1023,8 +1024,7 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
-                    self.record_env_metrics(env_metrics, env_info, epoch)
-                    # self.record_episode_finish(env_info, env_output.dones)
+                    self.record_env_metrics(env_metrics, env_info)
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
@@ -1097,7 +1097,6 @@ class EnvWorker(Worker):
                     self.rollout_results[stage_id], actor_channel
                 )
             # reduce memory peak
-            self.rollout_results = []
             gc.collect()
 
         for key, value in env_metrics.items():
