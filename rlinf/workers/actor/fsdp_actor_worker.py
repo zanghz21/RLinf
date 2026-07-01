@@ -105,6 +105,22 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
             ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
     return ret_dict
 
+def process_nested_dict_for_adv_version2(nested_dict):
+    """
+    original shape: [1, n_chunk_steps, num_action_chunks, ...]
+    target shape: [n_chunk_steps, 1, num_action_chunks, ...]
+    """
+    ret_dict = {}
+    for key, value in nested_dict.items():
+        if isinstance(value, torch.Tensor):
+            new_value = value.transpose(
+                0, 1
+            )  # [n_chunk_step, 1, num_action_chunks, ...]
+            ret_dict[key] = new_value
+        elif isinstance(value, dict):
+            ret_dict[key] = process_nested_dict_for_adv_version2(value)
+    return ret_dict
+
 
 def process_nested_dict_for_train(nested_dict, shuffle_id):
     ret_dict = {}
@@ -1150,86 +1166,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         recv_list = []
         for _ in range(split_num):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
+            recv_list.extend(trajectory)
 
-        self.rollout_batch = convert_trajectories_to_batch(recv_list)
+        self.full_rollout_batch = convert_trajectories_to_batch(recv_list)
 
-        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        self.full_rollout_batch = self._process_received_rollout_batch(self.full_rollout_batch)
+        print(f"{self.full_rollout_batch['prev_logprobs'].shape=}")
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """
-        original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
-        target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
+        original shape: [1, n_chunk_steps, num_action_chunks, ...]
+        target shape: [n_chunk_steps, 1, num_action_chunks, ...]
         """
-        rollout_epoch = self.cfg.env.train.rollout_epoch
-        rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
+        rollout_batch = process_nested_dict_for_adv_version2(rollout_batch)
 
         if (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
         ):
-            dones = rollout_batch[
-                "dones"
-            ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
-            loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-            if self.cfg.algorithm.reward_type == "chunk_level":
-                loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
-
-            rollout_batch["loss_mask"] = loss_mask
-            rollout_batch["loss_mask_sum"] = loss_mask_sum
-
+            raise NotImplementedError("auto_reset and ignore_terminations are not supported yet")
         # filter data by rewards
         if self.cfg.algorithm.get("filter_rewards", False):
-            rewards = rollout_batch[
-                "rewards"
-            ]  # [n_chunk_step, batch, num_action_chunks]
-            if rollout_batch.get("loss_mask", None) is not None:
-                rewards = rewards * rollout_batch["loss_mask"]
-            n_chunk_step, batch_size, num_action_chunks = rewards.shape
-
-            group_size = self.cfg.algorithm.group_size
-            assert batch_size % group_size == 0, (
-                f"batch {batch_size} not divisible by group_size {group_size}"
-            )
-            n_prompts = batch_size // group_size
-
-            # calculate rewards by prompt
-            rewards = rewards.transpose(
-                0, 1
-            )  # [batch, n_chunk_step, num_action_chunks]
-            rewards = rewards.reshape(rewards.shape[0], -1)  # [batch, n_step]
-            reward_matrix = rewards.reshape(
-                n_prompts, group_size, rewards.shape[-1]
-            )  # [n_prompts, group_size, n_step]
-            reward_matrix = reward_matrix.sum(dim=-1)  # [n_prompts, group_size]
-            mean_reward_in_group = reward_matrix.mean(dim=1)  # [n_prompts]
-
-            # mask
-            reward_filter_mask = (
-                mean_reward_in_group >= self.cfg.algorithm.rewards_lower_bound
-            ) & (
-                mean_reward_in_group <= self.cfg.algorithm.rewards_upper_bound
-            )  # [n_prompts]
-
-            # extend mask dimension
-            reward_filter_mask = reward_filter_mask.repeat_interleave(
-                group_size
-            )  # [batch]
-            reward_filter_mask = (
-                reward_filter_mask.unsqueeze(0).expand(n_chunk_step, -1).unsqueeze(-1)
-            )  # [n_chunk_step, batch, 1]
-
-            # update loss_mask
-            if rollout_batch.get("loss_mask", None) is not None:
-                rollout_batch["loss_mask"] = (
-                    reward_filter_mask & rollout_batch["loss_mask"]
-                )
-            else:
-                rollout_batch["loss_mask"] = reward_filter_mask
+            raise NotImplementedError("filter_rewards is not supported yet")
 
         return rollout_batch
 
@@ -1241,26 +1201,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
-            "rewards": self.rollout_batch["rewards"],
-            "dones": self.rollout_batch["dones"],
-            "values": self.rollout_batch.get("prev_values", None),
+            "rewards": self.full_rollout_batch["rewards"],
+            "dones": self.full_rollout_batch["dones"],
+            "values": self.full_rollout_batch.get("prev_values", None),
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
             "reward_type": self.cfg.algorithm.reward_type,
-            "loss_mask": self.rollout_batch.get("loss_mask", None),
-            "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "loss_mask": self.full_rollout_batch.get("loss_mask", None),
+            "loss_mask_sum": self.full_rollout_batch.get("loss_mask_sum", None),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
-        self.rollout_batch.update(advantages_and_returns)
+        self.full_rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
-            self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
+            self.full_rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
-            self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+            self.full_rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
-        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics = compute_rollout_metrics(self.full_rollout_batch)
         return rollout_metrics
 
     def _build_sft_data_loader(self):
@@ -1349,28 +1309,40 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.model.train()
         rollout_size = (
-            self.rollout_batch["prev_logprobs"].shape[0]
-            * self.rollout_batch["prev_logprobs"].shape[1]
+            self.full_rollout_batch["prev_logprobs"].shape[0]
+            * self.full_rollout_batch["prev_logprobs"].shape[1]
         )
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
 
-        with torch.no_grad():
-            self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
-            )
+        
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
-        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
-        assert rollout_size % batch_size_per_rank == 0, (
-            f"{rollout_size} is not divisible by {batch_size_per_rank}"
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        ), "global_batch_size is not divisible by micro_batch_size * world_size"
+
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
+            batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+            real_rollout_size = rollout_size - rollout_size % batch_size_per_rank
+            shuffle_id = torch.randperm(rollout_size, generator=g)[:real_rollout_size]
+            assert real_rollout_size % batch_size_per_rank == 0, (
+                f"{rollout_size} is not divisible by {batch_size_per_rank}"
+            )    
+
+            with torch.no_grad():
+                self.rollout_batch = process_nested_dict_for_train(
+                    self.full_rollout_batch, shuffle_id
+                )
+
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,

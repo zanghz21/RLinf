@@ -31,36 +31,8 @@ from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
-
-
-def flatten_rollout_batch_for_train(
-    nested_dict: dict, shuffle_id: Optional[torch.Tensor]
-) -> dict:
-    """Flatten [T, B, ...] rollout tensors to [T*B, ...] for actor training."""
-    ret_dict = {}
-    for key, value in nested_dict.items():
-        if key in ["dones", "terminations", "truncations", "prev_values"]:
-            if isinstance(value, torch.Tensor):
-                value = value[:-1]
-
-        if "env_info" in key:
-            raise NotImplementedError("env_info nested dict is not supported here")
-
-        if value is None:
-            ret_dict[key] = None
-            continue
-
-        if isinstance(value, torch.Tensor):
-            flat = value.reshape(-1, *value.shape[2:])
-            ret_dict[key] = flat[shuffle_id] if shuffle_id is not None else flat
-        elif isinstance(value, dict):
-            ret_dict[key] = flatten_rollout_batch_for_train(value, shuffle_id)
-        else:
-            raise NotImplementedError(
-                f"Unsupported value type in rollout batch: key={key}, type={type(value)}"
-            )
-
-    return ret_dict
+from rlinf.data.embodied_io_struct import convert_trajectories_to_batch
+from rlinf.workers.actor.fsdp_actor_worker import process_nested_dict_for_train
 
 
 class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
@@ -92,16 +64,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
-            trajectory: Trajectory = input_channel.get()
-            self.log_info(
-                f"recv trajectory versions.shape={trajectory.versions.shape} "
-                f"input_channel.qsize={input_channel.qsize()}"
-            )
-            if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
-                "staleness_threshold", None
-            ):
-                continue
-            self._recv_queue.put(trajectory)
+            trajectories: list[Trajectory] = input_channel.get()
+            for trajectory in trajectories:
+                self.log_info(
+                    f"recv trajectory versions.shape={trajectory.versions.shape} "
+                    f"input_channel.qsize={input_channel.qsize()}"
+                )
+                if trajectory.versions.min() < self.version - self.cfg.algorithm.get("staleness_threshold", None):
+                    continue
+                self._recv_queue.put(trajectory)
 
     @Worker.timer("drain_received_trajectories")
     def _drain_received_trajectories(self):
@@ -170,40 +141,57 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             diff = int(self.version) - int(version_val)
             staleness_metrics[f"data_staleness_{diff}/ratio"] = stats["ratio"]
 
-        self.rollout_batch = convert_trajectories_to_batch(rollout_batch)
-        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        self.full_rollout_batch = convert_trajectories_to_batch(rollout_batch)
+        self.full_rollout_batch = self._process_received_rollout_batch(self.full_rollout_batch)
         self.log_info(f"staleness metrics={staleness_metrics}")
+        print(f"{self.full_rollout_batch['prev_logprobs'].shape=}")
         return staleness_metrics
 
     @torch.inference_mode()
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
-        proximal_values = self.rollout_batch.get("proximal_values", None)
-        prev_values = self.rollout_batch.get("prev_values", None)
+        proximal_values = self.full_rollout_batch.get("proximal_values", None)
+        prev_values = self.full_rollout_batch.get("prev_values", None)
 
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
-            "rewards": self.rollout_batch["rewards"],
-            "dones": self.rollout_batch["dones"],
+            "rewards": self.full_rollout_batch["rewards"],
+            "dones": self.full_rollout_batch["dones"],
             "values": proximal_values if proximal_values is not None else prev_values,
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
             "reward_type": self.cfg.algorithm.reward_type,
-            "loss_mask": self.rollout_batch.get("loss_mask", None),
-            "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "loss_mask": self.full_rollout_batch.get("loss_mask", None),
+            "loss_mask_sum": self.full_rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": self.cfg.algorithm.normalize_advantages,
         }
 
         adv_and_ret = calculate_adv_and_returns(**kwargs)
-        self.rollout_batch.update(adv_and_ret)
+        self.full_rollout_batch.update(adv_and_ret)
 
         if kwargs["loss_mask"] is not None:
-            self.rollout_batch["loss_mask"] = kwargs["loss_mask"]
+            self.full_rollout_batch["loss_mask"] = kwargs["loss_mask"]
         if kwargs["loss_mask_sum"] is not None:
-            self.rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
+            self.full_rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
 
-        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        # self._debug_save_rollout_batch()
+
+        rollout_metrics = compute_rollout_metrics(self.full_rollout_batch)
         return rollout_metrics
+
+    def _debug_save_rollout_batch(self) -> None:
+        import os
+
+        save_dir = self.cfg.runner.logger.log_path
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(
+            save_dir,
+            f"rollout_batch_step{int(self.version)}_rank{int(self._rank)}.pt",
+        )
+
+        torch.save(self.full_rollout_batch, path)
+        self.log_info(f"[debug] saved rollout_batch → {path}")
 
     @torch.inference_mode()
     def compute_proximal_logprobs(self) -> None:
@@ -211,10 +199,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "Weight offloading is not supported when recomputing proximal logprobs."
         )
 
-        t_dim = self.rollout_batch["prev_logprobs"].shape[0]
-        b_dim = self.rollout_batch["prev_logprobs"].shape[1]
+        t_dim = self.full_rollout_batch["prev_logprobs"].shape[0]
+        b_dim = self.full_rollout_batch["prev_logprobs"].shape[1]
 
-        flat = flatten_rollout_batch_for_train(self.rollout_batch, shuffle_id=None)
+        flat = process_nested_dict_for_train(self.full_rollout_batch, shuffle_id=None)
         total = flat["prev_logprobs"].shape[0]
         micro_batch_size = self.cfg.actor.micro_batch_size
         num_splits = (total + micro_batch_size - 1) // micro_batch_size
@@ -261,9 +249,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         proximal_logprobs = torch.cat(proximal_logprobs_list, dim=0).view(
             t_dim,
             b_dim,
-            *self.rollout_batch["prev_logprobs"].shape[2:],
+            *self.full_rollout_batch["prev_logprobs"].shape[2:],
         )
-        self.rollout_batch["proximal_logprobs"] = proximal_logprobs
+        self.full_rollout_batch["proximal_logprobs"] = proximal_logprobs
 
     def run_training(self) -> dict[str, Any]:
         if self.is_weight_offloaded:
@@ -271,23 +259,21 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
-        t_dim = int(self.rollout_batch["prev_logprobs"].shape[0])
-        b_dim = int(self.rollout_batch["prev_logprobs"].shape[1])
-        total_samples = t_dim * b_dim
+        rollout_size = (
+            self.full_rollout_batch["prev_logprobs"].shape[0]
+            * self.full_rollout_batch["prev_logprobs"].shape[1]
+        )
+
+        print(f"rollout_size={self.full_rollout_batch['prev_logprobs'].shape[0]} * {self.full_rollout_batch['prev_logprobs'].shape[1]}; {self.full_rollout_batch['prev_logprobs'].shape} = {rollout_size}")
 
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(self.cfg.actor.seed) + int(self._rank))
-        shuffle_id = torch.randperm(total_samples, generator=generator)
-
-        with torch.no_grad():
-            self.rollout_batch = flatten_rollout_batch_for_train(
-                self.rollout_batch, shuffle_id
-            )
+        
 
         if self.cfg.algorithm.normalize_advantages:
-            self.rollout_batch["advantages"] = masked_normalization(
-                self.rollout_batch["advantages"],
-                self.rollout_batch.get("loss_mask", None),
+            self.full_rollout_batch["advantages"] = masked_normalization(
+                self.full_rollout_batch["advantages"],
+                self.full_rollout_batch.get("loss_mask", None),
             )
 
         self.model.train()
@@ -301,32 +287,41 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             f"micro_batch_size {micro_batch_size} * world_size {world_size}"
         )
 
-        per_rank_batch_size = global_batch_size // world_size
-        micro_per_rank = per_rank_batch_size // micro_batch_size
+        batch_size_per_rank = global_batch_size // world_size
+        micro_per_rank = batch_size_per_rank // micro_batch_size
         self.gradient_accumulation = micro_per_rank
 
-        flattened_rollout_size = int(self.rollout_batch["prev_logprobs"].shape[0])
-        assert flattened_rollout_size % per_rank_batch_size == 0, (
-            f"Flattened rollout size {flattened_rollout_size} must be divisible by "
-            f"per-rank batch size {per_rank_batch_size}"
-        )
-        num_global_batches = flattened_rollout_size // per_rank_batch_size
-
+        
         metrics: dict[str, list] = {}
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
 
         for _ in range(update_epoch):
+            batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+            real_rollout_size = rollout_size - rollout_size % batch_size_per_rank
+            print(f"rollout_size={rollout_size} batch_size_per_rank={batch_size_per_rank} real_rollout_size={real_rollout_size}")
+            shuffle_id = torch.randperm(rollout_size, generator=generator)[:real_rollout_size]
+            assert real_rollout_size % batch_size_per_rank == 0, (
+                f"Flattened rollout size {real_rollout_size} must be divisible by "
+                f"per-rank batch size {batch_size_per_rank}"
+            )
+            print(f"real_rollout_size={real_rollout_size} batch_size_per_rank={batch_size_per_rank}")
+
+            with torch.no_grad():
+                self.rollout_batch = process_nested_dict_for_train(
+                    self.full_rollout_batch, shuffle_id
+                )
+
             global_batch_iter = split_dict_to_chunk(
                 self.rollout_batch,
-                num_global_batches,
+                real_rollout_size // batch_size_per_rank,
             )
 
             for train_global_batch in global_batch_iter:
                 train_global_batch_size = int(
                     train_global_batch["prev_logprobs"].shape[0]
                 )
-                assert train_global_batch_size == per_rank_batch_size, (
-                    f"Expected per-rank global batch size {per_rank_batch_size}, "
+                assert train_global_batch_size == batch_size_per_rank, (
+                    f"Expected per-rank global batch size {batch_size_per_rank}, "
                     f"got {train_global_batch_size}"
                 )
                 assert train_global_batch_size % micro_batch_size == 0

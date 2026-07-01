@@ -16,6 +16,7 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
+from rlinf.data.embodied_io_struct import EmbodiedRolloutResult
 from rlinf.scheduler import Channel, Worker
 from rlinf.workers.env.env_worker import EnvWorker
 
@@ -37,6 +38,15 @@ class AsyncEnvWorker(EnvWorker):
         actor_channel: Channel | None,
         metric_channel: Channel,
     ):
+        self.rollout_results: list[EmbodiedRolloutResult] = [
+            EmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+            )
+            for _ in range(self.stage_num)
+        ]
+        self.log_info(f"{self._has_initialized=}")
+        if not self._has_initialized:
+            self.init_worker(enable_barrier=False)
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
         )

@@ -505,63 +505,148 @@ class Trajectory:
         return filtered_trajectories if filtered_trajectories else None
 
 
+def _find_batch_size(data: dict[str, Any]) -> int:
+    """Infer the batch size (dim-0) from the first tensor found in a (possibly
+    nested) dict whose values are batch-major tensors."""
+    for value in data.values():
+        if isinstance(value, torch.Tensor):
+            return value.shape[0]
+        if isinstance(value, dict):
+            bsz = _find_batch_size(value)
+            if bsz is not None:
+                return bsz
+    return None
+
+
+def _unbind_dict_along_batch(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split a batch-major dict ``{key: [B, ...]}`` into ``B`` per-sample dicts
+    ``{key: [...]}`` (the batch dim is stripped). Nested dicts are handled
+    recursively; non-tensor values are replicated across samples."""
+    bsz = _find_batch_size(data)
+    assert bsz is not None, f"No tensor found to infer batch size: {data.keys()=}"
+
+    per_sample: list[dict[str, Any]] = [{} for _ in range(bsz)]
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            parts = torch.unbind(value, dim=0)
+            for b in range(bsz):
+                per_sample[b][key] = parts[b].contiguous()
+        elif isinstance(value, dict):
+            sub = _unbind_dict_along_batch(value)
+            for b in range(bsz):
+                per_sample[b][key] = sub[b]
+        else:
+            for b in range(bsz):
+                per_sample[b][key] = value
+    return per_sample
+
+
 @dataclass(kw_only=True)
 class EmbodiedRolloutResult:
     """
     Collect chunk-step results and transitions during rollout,
     and convert them into trajectory tensors.
+
+    Storage layout: every member is ``list[list[...]]`` (or, for dict members,
+    ``list[list[dict]]``) where the **outer** list indexes the batch dim ``B``
+    and the **inner** list indexes the chunk-step dim ``T``. Each stored
+    element is a single-sample tensor with the batch dim stripped (e.g.
+    ``actions[b][t]`` has shape ``[action_dim]``). The outer (batch) lists are
+    created lazily on the first ``append_*`` call.
     """
 
     max_episode_length: int = 0
 
-    actions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    intervene_flags: list[torch.Tensor] = field(
+    # list[list[Tensor]]: [B][T] -> per-sample tensor (batch dim stripped)
+    actions: list[list[torch.Tensor]] = field(default_factory=list)  # T
+    intervene_flags: list[list[torch.Tensor]] = field(default_factory=list)  # T
+    rewards: list[list[torch.Tensor]] = field(default_factory=list)  # T
+    terminations: list[list[torch.Tensor]] = field(
         default_factory=list
-    )  # trajectory_length
-    rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    terminations: list[torch.Tensor] = field(
+    )
+    truncations: list[list[torch.Tensor]] = field(
         default_factory=list
-    )  # trajectory_length + rollout_epoch
-    truncations: list[torch.Tensor] = field(
+    )
+    dones: list[list[torch.Tensor]] = field(
         default_factory=list
-    )  # trajectory_length + rollout_epoch
-    dones: list[torch.Tensor] = field(
+    )
+    prev_logprobs: list[list[torch.Tensor]] = field(default_factory=list)  # T
+    prev_values: list[list[torch.Tensor]] = field(
         default_factory=list
-    )  # trajectory_length + rollout_epoch
-    prev_logprobs: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    prev_values: list[torch.Tensor] = field(
-        default_factory=list
-    )  # trajectory_length + rollout_epoch
-    versions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
-    forward_inputs: list[dict[str, Any]] = field(
-        default_factory=list
-    )  # trajectory_length
+    )
+    versions: list[list[torch.Tensor]] = field(default_factory=list)  # T
 
-    curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
-    next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+    # list[list[dict]]: [B][T] -> per-sample dict (batch dim stripped)
+    forward_inputs: list[list[dict[str, Any]]] = field(default_factory=list)  # T
+
+    curr_obs: list[list[dict[str, Any]]] = field(default_factory=list)  # T
+    next_obs: list[list[dict[str, Any]]] = field(default_factory=list)  # T
+
+    @staticmethod
+    def _append_tensor_field(
+        field_list: list[list[torch.Tensor]], tensor: torch.Tensor
+    ) -> None:
+        """Append a batch-major ``[B, ...]`` tensor as one stripped sample per
+        outer (batch) list. Lazily creates the ``B`` outer lists."""
+        parts = torch.unbind(tensor, dim=0)
+        if not field_list:
+            field_list.extend([] for _ in range(len(parts)))
+        for b, part in enumerate(parts):
+            field_list[b].append(part.contiguous())
+
+    @staticmethod
+    def _append_dict_field(
+        field_list: list[list[dict[str, Any]]], data: dict[str, Any]
+    ) -> None:
+        """Append a batch-major dict ``{key: [B, ...]}`` as one stripped
+        per-sample dict per outer (batch) list."""
+        per_sample = _unbind_dict_along_batch(data)
+        if not field_list:
+            field_list.extend([] for _ in range(len(per_sample)))
+        for b, item in enumerate(per_sample):
+            field_list[b].append(item)
+
+    @staticmethod
+    def _stack_tensor_field(
+        field_list: list[list[torch.Tensor]],
+    ) -> torch.Tensor:
+        """Stack ``list[list[Tensor]]`` ([B][T]) into a ``[B, T, ...]`` tensor."""
+        per_b = [torch.stack(steps, dim=0) for steps in field_list]  # each [T, ...]
+        return torch.stack(per_b, dim=0)  # [B, T, ...]
+
+    @staticmethod
+    def _stack_dict_field(
+        field_list: list[list[dict[str, Any]]],
+    ) -> dict[str, torch.Tensor]:
+        """Stack ``list[list[dict]]`` ([B][T]) into ``{key: [B, T, ...]}``."""
+        per_b = [
+            stack_list_of_dict_tensor(steps, dim=0) for steps in field_list
+        ]  # each {key: [T, ...]}
+        return stack_list_of_dict_tensor(per_b, dim=0)  # {key: [B, T, ...]}
 
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
-            self.actions.append(result.actions)
-            self.intervene_flags.append(
-                torch.zeros_like(result.actions, dtype=torch.bool)
+            self._append_tensor_field(self.actions, result.actions)
+            self._append_tensor_field(
+                self.intervene_flags,
+                torch.zeros_like(result.actions, dtype=torch.bool),
             )
         if result.rewards is not None:
-            self.rewards.append(result.rewards)
+            self._append_tensor_field(self.rewards, result.rewards)
         if result.terminations is not None:
-            self.terminations.append(result.terminations)
+            self._append_tensor_field(self.terminations, result.terminations)
         if result.truncations is not None:
-            self.truncations.append(result.truncations)
+            self._append_tensor_field(self.truncations, result.truncations)
         if result.dones is not None:
-            self.dones.append(result.dones)
+            self._append_tensor_field(self.dones, result.dones)
         if result.prev_logprobs is not None:
-            self.prev_logprobs.append(result.prev_logprobs)
+            self._append_tensor_field(self.prev_logprobs, result.prev_logprobs)
         if result.prev_values is not None:
-            self.prev_values.append(result.prev_values)
+            self._append_tensor_field(self.prev_values, result.prev_values)
         if result.versions is not None:
-            self.versions.append(result.versions)
+            self._append_tensor_field(self.versions, result.versions)
         if result.forward_inputs:
-            self.forward_inputs.append(result.forward_inputs)
+            self._append_dict_field(self.forward_inputs, result.forward_inputs)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -571,12 +656,17 @@ class EmbodiedRolloutResult:
             save_flags = save_flags[:, None]
         assert save_flags.dim() == 2, f"Expected 2D tensor, got {save_flags.shape=}"
 
-        last_action = self.actions[-1]
         bsz, num_action_chunks = save_flags.shape
-        expanded_flags = save_flags.reshape(bsz, num_action_chunks, 1).expand_as(
-            last_action.reshape(bsz, num_action_chunks, -1)
-        )
-        self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
+        for b in range(bsz):
+            last_action = self.actions[b][-1]  # [num_action_chunks x action_dim]
+            action_dim = last_action.numel() // num_action_chunks
+            expanded_flags = (
+                save_flags[b]
+                .reshape(num_action_chunks, 1)
+                .expand(num_action_chunks, action_dim)
+                .reshape(-1)
+            )
+            self.intervene_flags[b][-1] = expanded_flags.to(torch.bool)
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
@@ -585,39 +675,43 @@ class EmbodiedRolloutResult:
         # intervene_actions: [bsz, num-chunk-size x action-dim]
         # intervene_flags: [bsz, num-chunk-size]
 
-        if self.actions and len(self.actions) > 0:
-            last_action = self.actions[-1]
-            assert last_action.dim() == 2, (
-                f"Expected 2D tensor, got {last_action.shape=}"
-            )
-            assert intervene_actions.dim() == 2, (
-                f"Expected 2D tensor, got {intervene_actions.shape=}"
-            )
+        if not self.actions or len(self.actions) == 0:
+            return
 
-            # Normalize intervene_flags dimensions
-            if intervene_flags.dim() == 1:
-                intervene_flags = intervene_flags[:, None]
-            assert intervene_flags.dim() == 2, (
-                f"Expected 2D tensor, got {intervene_flags.shape=}"
-            )
+        assert intervene_actions.dim() == 2, (
+            f"Expected 2D tensor, got {intervene_actions.shape=}"
+        )
 
-            bsz, num_action_chunks = intervene_flags.shape[:2]
-            flags = intervene_flags.reshape(-1, num_action_chunks, 1)
+        # Normalize intervene_flags dimensions
+        if intervene_flags.dim() == 1:
+            intervene_flags = intervene_flags[:, None]
+        assert intervene_flags.dim() == 2, (
+            f"Expected 2D tensor, got {intervene_flags.shape=}"
+        )
+
+        bsz, num_action_chunks = intervene_flags.shape[:2]
+        for b in range(bsz):
+            last_action = self.actions[b][-1]  # [num_action_chunks x action_dim]
+            assert last_action.dim() == 1, (
+                f"Expected 1D tensor, got {last_action.shape=}"
+            )
+            action_dim = last_action.numel() // num_action_chunks
+            flags = intervene_flags[b].reshape(num_action_chunks, 1)
 
             # Combine intervene_actions and last_action based on flags
-            last_full_action = intervene_actions.reshape(
-                bsz, num_action_chunks, -1
-            ) * flags + last_action.reshape(bsz, num_action_chunks, -1) * (~flags)
-            self.actions[-1] = last_full_action.reshape(bsz, -1)
+            last_full_action = intervene_actions[b].reshape(
+                num_action_chunks, action_dim
+            ) * flags + last_action.reshape(num_action_chunks, action_dim) * (~flags)
+            self.actions[b][-1] = last_full_action.reshape(-1)
 
-            full_flags = flags.expand_as(last_full_action).reshape(bsz, -1)
-            self.intervene_flags[-1] = full_flags
+            full_flags = flags.expand(num_action_chunks, action_dim).reshape(-1)
+            self.intervene_flags[b][-1] = full_flags
 
-            if self.forward_inputs:
-                last_fi = self.forward_inputs[-1]
+            if self.forward_inputs and self.forward_inputs[b]:
+                last_fi = self.forward_inputs[b][-1]
                 if "action" in last_fi:
                     last_fi["action"] = (
-                        last_full_action.reshape(bsz, -1).cpu().contiguous()
+                        last_full_action.reshape(-1).cpu().contiguous()
                     )
                 last_fi.pop("model_action", None)
 
@@ -627,8 +721,8 @@ class EmbodiedRolloutResult:
             curr_obs.pop("task_descriptions")
         if "task_descriptions" in next_obs:
             next_obs.pop("task_descriptions")
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
+        self._append_dict_field(self.curr_obs, curr_obs)
+        self._append_dict_field(self.next_obs, next_obs)
 
     def clear(self):
         self.actions.clear()
@@ -643,6 +737,90 @@ class EmbodiedRolloutResult:
         self.forward_inputs.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
+
+    # Inner-stored fields, grouped by element type, used when slicing episodes.
+    _TENSOR_FIELDS = (
+        "actions",
+        "intervene_flags",
+        "rewards",
+        "prev_logprobs",
+        "versions",
+        "terminations",
+        "truncations",
+        "dones",
+        "prev_values",
+    )
+    _N_STEP_TENSOR_FIELDS = (
+        "actions",
+        "intervene_flags",
+        "rewards",
+        "prev_logprobs",
+        "versions",
+    )
+    _N_1_STEP_TENSOR_FIELDS = (
+        "terminations",
+        "truncations",
+        "dones",
+        "prev_values",
+    )
+
+    _DICT_FIELDS = ("forward_inputs", "curr_obs", "next_obs")
+
+    @staticmethod
+    def _detect_episode_spans(
+        done_steps: list[torch.Tensor],
+    ) -> list[tuple[int, int]]:
+        """Given a per-chunk-step ``done`` sequence for a single sample, return
+        the ``[start, end]`` spans of each *complete* episode.
+        """
+        spans: list[tuple[int, int]] = []
+        start = 0
+        for t, done in enumerate(done_steps):
+            if t > 0 and bool(done.any()):
+                spans.append((start, t))
+                start = t
+        return spans
+
+    def _build_episode_trajectory(
+        self, batch_idx: int, start: int, end: int
+    ) -> Trajectory:
+        """Build a single ``bsz=1`` :class:`Trajectory` for the episode covering
+        chunk-step range ``[start, end]`` of sample ``batch_idx``.
+
+        The time dim keeps its true (ragged) length: tensors are
+        ``[1, episode_len, ...]`` and dict values are ``{key: [1, episode_len, ...]}``.
+        """
+        trajectory = Trajectory(max_episode_length=self.max_episode_length)
+
+        for name in self._TENSOR_FIELDS:
+            field_list = getattr(self, name)
+            if not field_list or batch_idx >= len(field_list) or not field_list[batch_idx]:
+                continue
+            steps = field_list[batch_idx][start : end + 1]
+            if name in self._N_1_STEP_TENSOR_FIELDS:
+                extra_step = torch.zeros_like(steps[0])
+                steps = [extra_step, *steps]
+                
+            stacked = torch.stack(steps, dim=0).unsqueeze(0)  # [1, episode_len, ...]
+            setattr(trajectory, name, stacked.cpu().contiguous())
+
+
+        for name in self._DICT_FIELDS:
+            field_list = getattr(self, name)
+            if not field_list or batch_idx >= len(field_list) or not field_list[batch_idx]:
+                continue
+            steps = field_list[batch_idx][start : end + 1]
+            stacked = stack_list_of_dict_tensor(steps, dim=0)  # {key: [episode_len, ...]}
+            setattr(
+                trajectory,
+                name,
+                {
+                    key: value.unsqueeze(0).cpu().contiguous()
+                    for key, value in stacked.items()
+                },
+            )
+        self.curr_obs.append(curr_obs)
+        self.next_obs.append(next_obs)
 
     def to_trajectory(self) -> Trajectory:
         # return [trajectory_length, B, ...]
@@ -698,58 +876,68 @@ class EmbodiedRolloutResult:
             if trajectory.versions is not None
             else torch.zeros(1, dtype=torch.float32)
         )
-
         return trajectory
 
-    def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:
-        all_trajectory: Trajectory = self.to_trajectory()
-        splited_trajectories: list[Trajectory] = [
-            Trajectory() for _ in range(split_size)
-        ]
-
-        if len(all_trajectory.curr_obs) > 0:
-            splited_obs = split_dict_to_chunk(
-                all_trajectory.curr_obs, split_size, dim=1
+    def _assert_aligned_inner_lengths(self, batch_idx: int, ref_len: int) -> None:
+        for name in self._TENSOR_FIELDS + self._DICT_FIELDS:
+            field_list = getattr(self, name)
+            if not field_list or batch_idx >= len(field_list) or not field_list[batch_idx]:
+                continue
+            field_len = len(field_list[batch_idx])
+            if field_len == ref_len:
+                continue
+            raise NotImplementedError(
+                "Per-episode splitting with misaligned inner lengths is not "
+                f"implemented yet: field '{name}' has length {field_len} for "
+                f"batch index {batch_idx}, but the boundary axis 'dones' has "
+                f"length {ref_len}. This happens when the rollout carries "
+                "extra bootstrap entries (rollout_epoch trailing steps)."
             )
-            for i in range(split_size):
-                splited_trajectories[i].curr_obs = splited_obs[i]
-        if len(all_trajectory.next_obs) > 0:
-            splited_obs = split_dict_to_chunk(
-                all_trajectory.next_obs, split_size, dim=1
-            )
-            for i in range(split_size):
-                splited_trajectories[i].next_obs = splited_obs[i]
 
-        if (
-            all_trajectory.forward_inputs is not None
-            and len(all_trajectory.forward_inputs) > 0
-        ):
-            splited_forward_inputs = split_dict_to_chunk(
-                all_trajectory.forward_inputs, split_size, dim=1
-            )
-            for i in range(split_size):
-                splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
+    def to_trajectory(self) -> list[Trajectory]:
+        if not self.dones:
+            return []
 
-        for field_name in all_trajectory.__dataclass_fields__.keys():
-            value = getattr(all_trajectory, field_name)
+        # All inner-stored fields consumed in lock-step with ``dones``.
+        consumable_fields = self._TENSOR_FIELDS + self._DICT_FIELDS
 
-            if value is None or isinstance(value, dict):
+        trajectories: list[Trajectory] = []
+        for batch_idx in range(len(self.dones)):
+            done_steps = self.dones[batch_idx]
+            if not done_steps:
+                continue
+            self._assert_aligned_inner_lengths(batch_idx, len(done_steps))
+
+            spans = self._detect_episode_spans(done_steps)
+            if not spans:
+                # No complete episode for this sample yet; keep everything.
                 continue
 
-            if isinstance(value, int) or isinstance(value, str):
-                for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, value)
-                continue
-            elif isinstance(value, torch.Tensor):
-                chunks = torch.chunk(value, split_size, dim=1)
-                for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
-            else:
-                raise ValueError(
-                    f"Unsupported value type: {type(value)} for field_name: {field_name}"
+            for start, end in spans:
+                trajectories.append(
+                    self._build_episode_trajectory(batch_idx, start, end)
                 )
 
-        del all_trajectory
+            for name in consumable_fields:
+                field_list = getattr(self, name)
+                if not field_list or batch_idx >= len(field_list):
+                    continue
+                field_list[batch_idx] = field_list[batch_idx][end + 1:]
+
+        return trajectories
+
+    def to_splited_trajectories(self, split_size: int) -> list[list[Trajectory]]:
+        """Build per-episode trajectories (see :meth:`to_trajectory`) and
+        distribute them round-robin into ``split_size`` groups (e.g. one group
+        per actor split)."""
+        all_trajectories = self.to_trajectory()
+
+        # breakpoint()
+        splited_trajectories: list[list[Trajectory]] = [
+            [] for _ in range(split_size)
+        ]
+        for idx, trajectory in enumerate(all_trajectories):
+            splited_trajectories[idx % split_size].append(trajectory)
         return splited_trajectories
 
     def to_splited_trajectories_by_sizes(
@@ -834,15 +1022,24 @@ def convert_trajectories_to_batch(
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
 
     # -------- tensor fields --------
+    n_1_step_tensor_fields = ["dones", "terminations", "truncations", "prev_values"]
     reference_trajectory = trajectories[0]
     for field_name in reference_trajectory.__dataclass_fields__.keys():
         if not isinstance(getattr(reference_trajectory, field_name), torch.Tensor):
             continue
-        field_list = [
-            getattr(traj, field_name)
-            for traj in trajectories
-            if getattr(traj, field_name) is not None
-        ]
+
+        if field_name in n_1_step_tensor_fields:
+            field_list = [
+                getattr(traj, field_name)[:, 1:] if traj_idx > 0 else getattr(traj, field_name)
+                for traj_idx, traj in enumerate(trajectories)
+                if getattr(traj, field_name) is not None
+            ]
+        else:
+            field_list = [
+                getattr(traj, field_name)
+                for traj in trajectories
+                if getattr(traj, field_name) is not None
+            ]
         if field_list:
             batch[field_name] = torch.cat(field_list, dim=1)
 

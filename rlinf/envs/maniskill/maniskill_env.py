@@ -319,7 +319,7 @@ class ManiskillEnv(gym.Env):
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
         return extracted_obs, step_reward, terminations, truncations, infos
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, smooth_intervene_mode=False):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []

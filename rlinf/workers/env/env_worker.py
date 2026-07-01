@@ -156,8 +156,21 @@ class EnvWorker(Worker):
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
-        self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+        self._has_initialized = False
 
+        self.rollout_results: list[EmbodiedRolloutResult] = [
+            EmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+            )
+            for _ in range(self.stage_num)
+        ]
+
+    def init_worker(self, enable_barrier: bool = False):
+        # check env mode
+        env_mode = self.cfg.env.train.get("env_mode", None)
+        assert env_mode in ["decoupled", None], f"{env_mode} is not supported"
+        self.env_decoupled_mode = env_mode == "decoupled"
+        self.rollout_queue_size = self.cfg.env.train.get("rollout_queue_size", 0)
         if self.env_decoupled_mode:
             # Init the batch_router for env decoupled mode
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
@@ -796,27 +809,18 @@ class EnvWorker(Worker):
 
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
-        def get_zero_dones() -> torch.Tensor:
-            return (
-                torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
-                .unsqueeze(1)
-                .repeat(1, self.model_cfg.num_action_chunks)
-            )
 
         env_outputs: list[EnvOutput] = []
         if not self.cfg.env.train.auto_reset:
             for stage_id in range(self.stage_num):
                 self.env_list[stage_id].is_start = True
                 extracted_obs, infos = self.env_list[stage_id].reset()
-                dones = get_zero_dones()
-                terminations = dones.clone()
-                truncations = dones.clone()
 
                 env_output = EnvOutput(
                     obs=extracted_obs,
-                    dones=dones,
-                    terminations=terminations,
-                    truncations=truncations,
+                    dones=None,
+                    terminations=None,
+                    truncations=None,
                     final_obs=(
                         infos["final_observation"]
                         if "final_observation" in infos
@@ -827,17 +831,13 @@ class EnvWorker(Worker):
                 )
                 env_outputs.append(env_output)
         else:
-            dones = get_zero_dones()
-            terminations = dones.clone()
-            truncations = dones.clone()
-
             for stage_id in range(self.stage_num):
                 env_output = EnvOutput(
                     obs=self.last_obs_list[stage_id],
                     rewards=None,
-                    dones=dones,
-                    terminations=terminations,
-                    truncations=truncations,
+                    dones=None,
+                    terminations=None,
+                    truncations=None,
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
                 )
@@ -898,7 +898,7 @@ class EnvWorker(Worker):
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
     ):
-        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
+        trajectories: list[list[Trajectory]] = rollout_result.to_splited_trajectories(
             self.actor_split_num
         )
         rollout_result.clear()
@@ -917,12 +917,6 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results: list[EmbodiedRolloutResult] = [
-            EmbodiedRolloutResult(
-                max_episode_length=self.cfg.env.train.max_episode_steps,
-            )
-            for _ in range(self.stage_num)
-        ]
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
@@ -981,7 +975,7 @@ class EnvWorker(Worker):
                         ),
                         prev_values=(
                             rollout_result.prev_values
-                            if self.collect_prev_infos
+                            if self.collect_prev_infos and chunk_step_idx != 0
                             else None
                         ),
                         forward_inputs=rollout_result.forward_inputs,
@@ -1029,13 +1023,9 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
-                    should_record = (
-                        self.cfg.env.train.auto_reset
-                        or self.cfg.env.train.ignore_terminations
-                        or chunk_step_idx == self.n_train_chunk_steps - 1
-                    )
-                    if should_record:
-                        self.record_env_metrics(env_metrics, env_info)
+                    self.record_env_metrics(env_metrics, env_info, epoch)
+                    # self.record_episode_finish(env_info, env_output.dones)
+
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
