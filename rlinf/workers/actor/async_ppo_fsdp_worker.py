@@ -105,9 +105,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 self.rollout_store.remove_below(
                     self.version - self.cfg.algorithm.get("staleness_threshold", None)
                 )
-            if len(self.rollout_store) >= self.rollout_store_size:
-                if on_policy_min_ratio <= 0.0:
-                    break
+
+            local_ready = len(self.rollout_store) >= self.rollout_store_size
+            if local_ready and on_policy_min_ratio > 0.0:
                 metrics_data = self.rollout_store.get_metric()
                 on_policy_ratio = metrics_data.get(int(self.version), {}).get(
                     "ratio", 0.0
@@ -117,18 +117,25 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     f"on_policy_ratio={on_policy_ratio:.4f} "
                     f"on_policy_min_ratio={on_policy_min_ratio}"
                 )
-                if on_policy_ratio >= on_policy_min_ratio:
-                    break
+                local_ready = on_policy_ratio >= on_policy_min_ratio
+
+            ready_flag = torch.tensor(
+                [1 if local_ready else 0], dtype=torch.int32, device=self.device
+            )
+            torch.distributed.all_reduce(
+                ready_flag, op=torch.distributed.ReduceOp.MIN
+            )
+            if bool(ready_flag.item()):
+                break
             await asyncio.sleep(1)
 
     @Worker.timer("construct_rollout_batch")
     async def construct_rollout_batch(self, max_trajectories: int | None = None):
         # from _recv_queue to rollout_batch
         await self._wait_for_rollout_store_ready()
-        torch.distributed.barrier()
 
-        rollout_batch = self.rollout_store.topn(self.rollout_store_size)
         version_metrics = self.rollout_store.get_metric()
+        rollout_batch = self.rollout_store.topn(self.rollout_store_size)
         self.log_info(f"rollout store version metrics={version_metrics}")
 
         staleness_metrics: dict = {}
