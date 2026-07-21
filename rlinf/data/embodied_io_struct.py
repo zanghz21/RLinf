@@ -778,7 +778,7 @@ class EmbodiedRolloutResult:
         for t, done in enumerate(done_steps):
             if t > 0 and bool(done.any()):
                 spans.append((start, t))
-                start = t
+                start = t + 1
         return spans
 
     def _build_episode_trajectory(

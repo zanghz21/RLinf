@@ -902,7 +902,7 @@ class EnvWorker(Worker):
         trajectories: list[list[Trajectory]] = rollout_result.to_splited_trajectories(
             self.actor_split_num
         )
-        rollout_result.clear()
+        # rollout_result.clear()
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
         del trajectories
