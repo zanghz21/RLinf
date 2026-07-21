@@ -77,7 +77,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             while True:
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
-                await self.wait_if_stale()
                 for _ in range(self.rollout_epoch):
                     await self.generate_one_epoch(input_channel, output_channel)
                 if self.finished_episodes is not None:
@@ -92,25 +91,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     {"rank": self._rank, "time": rollout_metrics},
                     async_op=True,
                 )
-
-    async def wait_if_stale(self) -> None:
-        if self.staleness_threshold is None:
-            return
-        assert self.finished_episodes is not None, (
-            "finished_episodes should be initialized."
-        )
-        while True:
-            capacity = (
-                (self.staleness_threshold + self.version + 1)
-                * self.total_num_train_envs
-                * self.rollout_epoch
-            )
-            if (
-                self.finished_episodes + self.total_num_train_envs * self.rollout_epoch
-                <= capacity
-            ):
-                break
-            await asyncio.sleep(0.01)
 
     def stop(self):
         if self._generate_task is not None and not self._generate_task.done():
@@ -164,7 +144,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 self.update_dagger_beta()
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
-                await self.wait_if_stale()
             decoupled_generate_time = decoupled_generate_time + 1
             (
                 env_output,
