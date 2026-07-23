@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
+from rlinf.algorithms.utils import expand_to_target_dim
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
@@ -29,7 +30,7 @@ from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
-from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
+from rlinf.utils.utils import apply_rebalance_weight, clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor, process_nested_dict_for_train
 
 
@@ -351,6 +352,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     prev_values = data.get("prev_values", None)
                     loss_mask = data.get("loss_mask", None)
                     loss_mask_sum = data.get("loss_mask_sum", None)
+                    rebalance_weight = data.get("rebalance_weight", None)
 
                     versions = data.get("versions", None)
                     proximal_logprobs = data.get("proximal_logprobs", None)
@@ -423,6 +425,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         "huber_delta": self.cfg.algorithm.get("huber_delta", None),
                         "loss_mask": loss_mask,
                         "loss_mask_sum": loss_mask_sum,
+                        "rebalance_weight": rebalance_weight,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
                         "task_type": self.cfg.runner.task_type,
                         "critic_warmup": self.optimizer_steps
@@ -443,7 +446,13 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                             action_dim=self.cfg.actor.model.get("action_dim", 7),
                             batch_size=out["logprobs"].shape[0],
                         )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
+                        entropy_mask = loss_mask
+                        if rebalance_weight is not None:
+                            entropy_mask = apply_rebalance_weight(
+                                loss_mask,
+                                expand_to_target_dim(rebalance_weight, entropy.shape),
+                            )
+                        entropy_loss = masked_mean(entropy, mask=entropy_mask)
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
 
                     loss = loss / self.gradient_accumulation

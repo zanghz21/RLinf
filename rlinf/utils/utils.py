@@ -307,13 +307,43 @@ def configure_batch_sizes(rank, mbs, gbs, dp=1):
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis=None):
-    """Compute mean of tensor with a masked values."""
+    """Compute mean of tensor with a masked (boolean or float-weighted) values.
+
+    ``mask`` may be a boolean mask (0/1 valid indicator) or a float tensor of
+    per-element weights (e.g. produced by :func:`apply_rebalance_weight`); the
+    formula is identical in both cases since a boolean mask is just a 0/1
+    weight.
+    """
     if mask is None:
         return values.mean(axis=axis)
-    elif (~mask).all():
+    mask = mask.to(values.dtype)
+    denom = mask.sum(axis=axis)
+    if torch.all(denom == 0):
         return (values * mask).sum(axis=axis)
     else:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+        return (values * mask).sum(axis=axis) / denom
+
+
+def apply_rebalance_weight(
+    mask: Optional[torch.Tensor], weight: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Fold an optional per-sample rebalance weight into a loss mask.
+
+    During cross-rank rollout rebalancing, a real sample duplicated ``k``
+    extra times has each of its ``k + 1`` copies down-weighted to ``1 /
+    (k + 1)`` (see ``build_rollout_redistribution_plan`` in the actor
+    worker), so the group's total contribution to the loss stays at ``1.0``
+    instead of being double-counted. ``weight`` is expected to already be
+    broadcastable against ``mask`` (or the values it will be multiplied
+    with). This only rescales the final loss aggregation; it leaves the
+    original boolean ``mask`` untouched for callers that still need strict
+    boolean semantics (e.g. ``torch.where``, boolean indexing).
+    """
+    if weight is None:
+        return mask
+    if mask is None:
+        return weight
+    return mask * weight
 
 
 def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis=None):

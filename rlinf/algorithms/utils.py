@@ -290,6 +290,7 @@ def preprocess_loss_inputs(
     returns: Optional[torch.Tensor] = None,
     reward_type: Optional[str] = None,
     versions: Optional[torch.Tensor] = None,
+    rebalance_weight: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
     if reward_type == "chunk_level":
@@ -304,6 +305,8 @@ def preprocess_loss_inputs(
             prev_values = prev_values.flatten()
         if returns is not None:
             returns = returns.flatten()
+        if rebalance_weight is not None:
+            rebalance_weight = rebalance_weight.flatten()
 
     bsz = logprobs.shape[0]
     proximal_logprobs = kwargs.get("proximal_logprobs", None)
@@ -351,6 +354,7 @@ def preprocess_loss_inputs(
     prev_values = expand_to_target_dim(prev_values, target_shape)
     returns = expand_to_target_dim(returns, target_shape)
     versions = expand_to_target_dim(versions, target_shape)
+    rebalance_weight = expand_to_target_dim(rebalance_weight, target_shape)
 
     kwargs.update(
         {
@@ -364,6 +368,7 @@ def preprocess_loss_inputs(
             "values": values,
             "prev_values": prev_values,
             "returns": returns,
+            "rebalance_weight": rebalance_weight,
         }
     )
 

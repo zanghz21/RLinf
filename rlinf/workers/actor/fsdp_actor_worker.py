@@ -26,6 +26,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
+    expand_to_target_dim,
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
@@ -72,6 +73,7 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
 )
 from rlinf.utils.utils import (
+    apply_rebalance_weight,
     clear_memory,
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
@@ -249,6 +251,32 @@ def build_rollout_redistribution_plan(
         duplicate_counts[receiver["rank"]] = receiver["remaining"]
 
     return target, transfers, duplicate_counts
+
+
+def compute_dedup_weights(
+    base_count: int, duplicate_idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute loss-scale weights so duplicated rows don't get double-counted.
+
+    ``duplicate_idx`` holds indices into ``base_count`` original rows that are
+    about to be appended as extra copies (e.g. via ``torch.randint`` sampling
+    with replacement). A row duplicated ``k`` extra times, together with all
+    ``k`` of its copies, should contribute a *total* weight of ``1.0`` to the
+    loss instead of ``k + 1``, so every copy (original and duplicate) gets
+    weight ``1 / (k + 1)``.
+
+    Returns:
+        ``base_weight``: ``[base_count]`` factor to multiply into the
+            original rows' existing weight.
+        ``duplicate_weight``: ``[len(duplicate_idx)]`` weight for each
+            appended duplicate row, mirroring its source row's factor.
+    """
+    copy_counts = (
+        torch.bincount(duplicate_idx, minlength=base_count).float() + 1.0
+    )
+    base_weight = 1.0 / copy_counts
+    duplicate_weight = base_weight[duplicate_idx]
+    return base_weight, duplicate_weight
 
 
 def slice_flat_rollout_batch(flat: dict, start: int, length: int) -> dict:
@@ -1512,13 +1540,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         extra = torch.randint(0, n_local, (n_max - n_local,), generator=generator)
         idx = torch.cat([torch.arange(n_local), extra])
 
+        # Every copy of a sample duplicated `k` extra times (including the
+        # original) is down-weighted to `1 / (k + 1)`, so the group's total
+        # contribution to the loss stays at 1.0 instead of being duplicated.
+        base_weight, duplicate_weight = compute_dedup_weights(n_local, extra)
+        per_row_weight = torch.cat([base_weight, duplicate_weight])
+
         flat_padded = process_nested_dict_for_train(self.full_rollout_batch, idx)
+        flat_padded["rebalance_weight"] = flat_padded["rebalance_weight"] * per_row_weight
         self.full_rollout_batch = reconstruct_structured_rollout_batch(flat_padded)
 
         self.log_info(
             f"rebalanced rollout batch: padded {n_local} -> {n_max} samples "
-            f"(+{n_max - n_local} duplicated) to match global max across "
-            f"{world_size} ranks"
+            f"(+{n_max - n_local} duplicated, loss-scaled) to match global max "
+            f"across {world_size} ranks"
         )
 
     @torch.no_grad()
@@ -1562,6 +1597,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{n_max}; cannot rebalance and the update loop may desync."
                 )
             return
+
+        if "rebalance_weight" not in self.full_rollout_batch:
+            # One weight per top-level sample, default 1.0 (no discount). Any
+            # sample duplicated during rebalancing gets this scaled down so
+            # duplicated rows do not get double-counted in the loss.
+            self.full_rollout_batch["rebalance_weight"] = torch.ones(
+                (prev_logprobs.shape[0], prev_logprobs.shape[1]), dtype=torch.float32
+            )
 
         strategy = str(self.rebalance_rollout_strategy)
         if strategy == "local_pad_to_max":
@@ -1627,14 +1670,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             duplicate_idx = torch.randint(
                 0, current_count, (rank_duplicates,), generator=generator
             )
-            chunks.append(index_flat_rollout_batch(flat_rebalanced, duplicate_idx))
-            flat_rebalanced = concat_flat_rollout_batches(chunks)
+            # Down-weight every copy (original + duplicates) of a
+            # duplicated sample so the group sums back to a total weight of
+            # 1.0, instead of duplicated samples being double-counted.
+            base_weight, _ = compute_dedup_weights(current_count, duplicate_idx)
+            flat_rebalanced["rebalance_weight"] = (
+                flat_rebalanced["rebalance_weight"] * base_weight
+            )
+            duplicate_chunk = index_flat_rollout_batch(flat_rebalanced, duplicate_idx)
+            flat_rebalanced = concat_flat_rollout_batches(
+                [flat_rebalanced, duplicate_chunk]
+            )
 
         self.full_rollout_batch = reconstruct_structured_rollout_batch(flat_rebalanced)
         self.log_info(
             "rebalanced rollout batch: "
             f"local={n_local}, target={target}, sent={rank_sends}, "
-            f"received={rank_receives}, duplicated={rank_duplicates}, "
+            f"received={rank_receives}, duplicated={rank_duplicates} (loss-scaled), "
             f"original_min={n_min}, original_max={n_max}, "
             f"original_avg={total / world_size:.2f} across {world_size} ranks"
         )
@@ -1753,6 +1805,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         prev_values = micro_batch.get("prev_values", None)
         loss_mask = micro_batch.get("loss_mask", None)
         loss_mask_sum = micro_batch.get("loss_mask_sum", None)
+        rebalance_weight = micro_batch.get("rebalance_weight", None)
         forward_inputs = micro_batch.get("forward_inputs", None)
 
         kwargs = {}
@@ -1806,6 +1859,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
+            "rebalance_weight": rebalance_weight,
             "max_episode_steps": self.cfg.env.train.max_episode_steps,
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
@@ -1835,7 +1889,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 action_dim=self.cfg.actor.model.get("action_dim", 7),
                 batch_size=output_dict["logprobs"].shape[0],
             )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
+            entropy_mask = loss_mask
+            if rebalance_weight is not None:
+                entropy_mask = apply_rebalance_weight(
+                    loss_mask, expand_to_target_dim(rebalance_weight, entropy.shape)
+                )
+            entropy_loss = masked_mean(entropy, mask=entropy_mask)
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
