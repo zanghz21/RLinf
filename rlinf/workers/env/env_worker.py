@@ -880,6 +880,10 @@ class EnvWorker(Worker):
             rollout_channel
         )
 
+    # Episode metrics that are additionally broken down per task when the env
+    # provides a per-trajectory ``task_id`` (i.e. ``log_per_task_metrics``).
+    _PER_TASK_METRIC_KEYS = ("success_once", "success_at_end")
+
     def record_env_metrics(
         self,
         env_metrics: dict[str, list],
@@ -887,6 +891,42 @@ class EnvWorker(Worker):
     ):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
+
+    def _expand_per_task_metrics(
+        self, metrics: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Break down selected episode metrics by task id.
+
+        When the env attaches a per-trajectory ``task_id`` tensor (aligned with
+        the episode metrics), turn e.g. ``success_once`` into
+        ``per_task/success_once/task_<id>`` entries so the standard metric
+        aggregation reports a success rate per task. The overall,
+        task-agnostic metric is left untouched. This is a no-op when no
+        ``task_id`` is present (e.g. ``log_per_task_metrics`` disabled or an
+        env that does not provide it).
+        """
+        task_ids = metrics.pop("task_id", None)
+        if task_ids is None:
+            return metrics
+
+        task_ids = task_ids.detach().cpu().reshape(-1).long()
+        if task_ids.numel() == 0:
+            return metrics
+
+        unique_task_ids = torch.unique(task_ids).tolist()
+        for key in self._PER_TASK_METRIC_KEYS:
+            values = metrics.get(key, None)
+            if values is None:
+                continue
+            values = values.reshape(-1)
+            if values.numel() != task_ids.numel():
+                continue
+            for task_id in unique_task_ids:
+                mask = task_ids == task_id
+                metrics[f"per_task/{key}/task_{int(task_id)}"] = values[
+                    mask
+                ].contiguous()
+        return metrics
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
@@ -1102,7 +1142,7 @@ class EnvWorker(Worker):
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
-        return env_metrics
+        return self._expand_per_task_metrics(dict(env_metrics))
 
     @Worker.timer("interact")
     async def interact(
@@ -1216,7 +1256,7 @@ class EnvWorker(Worker):
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
-        return eval_metrics
+        return self._expand_per_task_metrics(dict(eval_metrics))
 
     def get_actor_split_num(self):
         send_num = self._component_placement.get_world_size("env") * self.stage_num

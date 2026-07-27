@@ -96,10 +96,23 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+        # When True, every env on a given logical rank (``seed_offset``) runs a
+        # single task, assigned round-robin over the allowed task pool
+        # (``task_id_filter`` if set, otherwise all tasks in the suite).
+        self.per_rank_single_task = cfg.get("per_rank_single_task", False)
+        if self.per_rank_single_task and self.specific_reset_id is not None:
+            raise ValueError(
+                "per_rank_single_task and specific_reset_id are mutually "
+                "exclusive: specific_reset_id pins one fixed trial and would "
+                "override the per-rank task sampling."
+            )
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
         self.is_eval = cfg.get("is_eval", False)
+        # When enabled, attach the per-env task id to episode metrics so that
+        # downstream logging can break success rate down by task.
+        self.log_per_task_metrics = cfg.get("log_per_task_metrics", False)
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -371,10 +384,30 @@ class LiberoEnv(gym.Env):
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
-        if self.task_id_filter is not None:
-            num_tasks = len(self.trial_id_bins)
+        num_tasks = len(self.trial_id_bins)
+
+        # Effective per-env task filter. With ``per_rank_single_task`` each
+        # logical env rank collapses the allowed pool to exactly one task,
+        # selected round-robin by ``seed_offset`` so ranks cycle through the
+        # pool (e.g. pool [4, 1, 5] -> rank 0->4, 1->1, 2->5, 3->4, ...).
+        effective_task_id_filter = self.task_id_filter
+        if self.per_rank_single_task:
+            task_pool = (
+                self.task_id_filter
+                if self.task_id_filter is not None
+                else list(range(num_tasks))
+            )
+            if len(task_pool) == 0:
+                raise ValueError(
+                    "per_rank_single_task requires a non-empty task pool "
+                    "(set task_id_filter or use a suite with tasks)."
+                )
+            assigned_task_id = task_pool[self.seed_offset % len(task_pool)]
+            effective_task_id_filter = [assigned_task_id]
+
+        if effective_task_id_filter is not None:
             validated_tids = []
-            for tid in self.task_id_filter:
+            for tid in effective_task_id_filter:
                 if not isinstance(tid, (int, np.integer)):
                     raise ValueError(
                         f"task_id_filter must contain ints, got "
@@ -573,6 +606,11 @@ class LiberoEnv(gym.Env):
         episode_info["reward"] = episode_info["return"] / np.maximum(
             episode_len_for_reward, 1
         )
+        # `self.task_ids` still reflects the currently-running episode here
+        # (auto-reset happens after `_record_metrics`), so it is aligned with
+        # the success/return metrics above and can be used to group them by task.
+        if self.log_per_task_metrics:
+            episode_info["task_id"] = self.task_ids.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 
