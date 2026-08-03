@@ -114,6 +114,22 @@ def linear_pose_waypoints(
     ]
 
 
+def tcp_pose_for_attached_column(
+    column_position: np.ndarray,
+    tcp_orientation: np.ndarray,
+    tcp_to_column: sapien.Pose,
+) -> sapien.Pose:
+    """Place an attached column while enforcing the requested TCP rotation."""
+    tcp_rotation = sapien.Pose(q=tcp_orientation)
+    column_offset = np.asarray(
+        (tcp_rotation * sapien.Pose(p=tcp_to_column.p)).p
+    )
+    return sapien.Pose(
+        p=np.asarray(column_position) - column_offset,
+        q=tcp_orientation,
+    )
+
+
 def build_lateral_grasp_candidates(
     env: PandaPlaceColumnInBoxEnv,
     column_pose: sapien.Pose,
@@ -340,12 +356,17 @@ class PandaPlaceColumnMotionPlanningExpert:
                 pose=box_pose * sapien.Pose(p=position),
             )
 
-    def _select_grasp(self) -> LateralGraspCandidate:
+    def _select_grasp(
+        self,
+    ) -> tuple[LateralGraspCandidate, np.ndarray]:
         env = self.base_env
         column_pose = single_sapien_pose(env.column.pose)
         candidates = build_lateral_grasp_candidates(
             env, column_pose, self.pregrasp_distance
         )
+        # The first candidate is the canonical world +Y approach. Use its
+        # rotation for placement even if a diagonal fallback grasp is selected.
+        placement_tcp_orientation = np.asarray(candidates[0].grasp_pose.q)
         for candidate in candidates:
             pregrasp_plan = self.planner.move_to_pose_with_rrt_connect(
                 candidate.pregrasp_pose, dry_run=True
@@ -355,20 +376,8 @@ class PandaPlaceColumnMotionPlanningExpert:
             if self.planner.can_follow_with_screw(
                 candidate.grasp_pose, pregrasp_plan
             ):
-                return candidate
+                return candidate, placement_tcp_orientation
         raise MotionPlanningFailure("pregrasp_ik", "no lateral grasp is reachable")
-
-    def _desired_tcp_pose(
-        self,
-        column_position: np.ndarray,
-        column_orientation: np.ndarray,
-        tcp_to_column: sapien.Pose,
-    ) -> sapien.Pose:
-        desired_column = sapien.Pose(
-            p=column_position,
-            q=column_orientation,
-        )
-        return desired_column * tcp_to_column.inv()
 
     def execute(self):
         """Run one expert trajectory and return the final environment step."""
@@ -376,7 +385,7 @@ class PandaPlaceColumnMotionPlanningExpert:
         self._add_static_collisions()
         self.planner.open_gripper(t=4)
 
-        candidate = self._select_grasp()
+        candidate, placement_tcp_orientation = self._select_grasp()
         self._require_motion(
             "pregrasp",
             self.planner.move_to_pose_with_rrt_connect(candidate.pregrasp_pose),
@@ -414,8 +423,10 @@ class PandaPlaceColumnMotionPlanningExpert:
         transfer_column_position = np.array(
             [box_pose.p[0], box_pose.p[1], transfer_column_z]
         )
-        transfer_tcp_pose = self._desired_tcp_pose(
-            transfer_column_position, column_pose.q, tcp_to_column
+        transfer_tcp_pose = tcp_pose_for_attached_column(
+            transfer_column_position,
+            placement_tcp_orientation,
+            tcp_to_column,
         )
         for waypoint_index, waypoint in enumerate(
             linear_pose_waypoints(
@@ -439,8 +450,10 @@ class PandaPlaceColumnMotionPlanningExpert:
                 + self.insertion_clearance,
             ]
         )
-        insertion_tcp_pose = self._desired_tcp_pose(
-            insertion_column_position, column_pose.q, tcp_to_column
+        insertion_tcp_pose = tcp_pose_for_attached_column(
+            insertion_column_position,
+            placement_tcp_orientation,
+            tcp_to_column,
         )
         self.planner.use_point_cloud = False
         self._require_motion(
