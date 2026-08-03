@@ -470,22 +470,33 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
         reward = 1 - torch.tanh(5 * tcp_to_col)
 
         is_grasped = info["is_grasped"]
-        reward = reward + is_grasped
+        reward = reward + is_grasped.float()
 
-        # Encourage moving the column above the box interior.
-        target = self.box.pose.p.clone()
-        # target[:, 2] = target[:, 2] + self._column_rest_z()
-        place_dist = torch.linalg.norm((self.column.pose.p - target)[..., :2], axis=1)
+        # While grasping, reward transporting the column over the box and
+        # keeping it upright for insertion.
+        place_dist = torch.linalg.norm(
+            (self.column.pose.p - self.box.pose.p)[..., :2], axis=1
+        )
         place_reward = 1 - torch.tanh(5 * place_dist)
-        # Encourage cylinder axis (local +X) to point along world +Z.
         col_rot = self.column.pose.to_transformation_matrix()[..., :3, :3]
         axis_up = col_rot[..., 2, 0]
         upright_reward = torch.clamp(axis_up, min=0.0)
-        place_reward = place_reward + upright_reward
-        reward = reward + place_reward * is_grasped
+        transport_reward = place_reward + upright_reward
+        reward = reward + transport_reward * is_grasped.float()
 
-        reward = reward + info["is_inside"].float()
-        reward = reward + info["success"].float()
+        is_inside = info["is_inside"]
+        is_upright = info["is_upright"]
+        reward = reward + is_inside.float()
+
+        # Releasing a correctly placed column should not lose the grasp and
+        # transport rewards while the object settles. This stage has the same
+        # maximum reward as holding the column inside the box.
+        is_released_in_box = is_inside & is_upright & (~is_grasped)
+        reward = reward + 3.0 * is_released_in_box.float()
+
+        # Success is the unique maximum reward and matches the normalization
+        # denominator below.
+        reward = torch.where(info["success"], 6.0, reward)
         return reward
 
     def compute_normalized_dense_reward(
