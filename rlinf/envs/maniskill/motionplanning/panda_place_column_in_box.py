@@ -130,6 +130,15 @@ def tcp_pose_for_attached_column(
     )
 
 
+def retreat_along_tcp_negative_z(
+    tcp_pose: sapien.Pose, retreat_distance: float
+) -> sapien.Pose:
+    """Translate backward along the TCP local Z axis."""
+    if retreat_distance <= 0:
+        raise ValueError("retreat_distance must be positive")
+    return tcp_pose * sapien.Pose(p=[0.0, 0.0, -retreat_distance])
+
+
 def build_lateral_grasp_candidates(
     env: PandaPlaceColumnInBoxEnv,
     column_pose: sapien.Pose,
@@ -467,9 +476,8 @@ class PandaPlaceColumnMotionPlanningExpert:
         self.planner.use_attached_collision = False
 
         current_tcp_pose = single_sapien_pose(env.agent.tcp_pose)
-        retreat_pose = (
-            sapien.Pose(p=[0.0, 0.0, self.retreat_distance])
-            * current_tcp_pose
+        retreat_pose = retreat_along_tcp_negative_z(
+            current_tcp_pose, self.retreat_distance
         )
         retreat_result = self.planner.move_to_pose_with_screw(retreat_pose)
         if not (isinstance(retreat_result, int) and retreat_result == -1):
