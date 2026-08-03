@@ -97,8 +97,9 @@ def build_lateral_grasp_candidates(
     column_pose: sapien.Pose,
     pregrasp_distance: float,
 ) -> list[LateralGraspCandidate]:
-    """Build cardinal horizontal grasps at the red segment's upper boundary."""
+    """Build rolled cardinal grasps at the red segment's upper boundary."""
     center = red_upper_boundary_position(column_pose, env.column_half_length)
+    wrist_roll = sapien.Pose(q=[0.0, 0.0, 0.0, 1.0])
     approach_directions = (
         np.array([1.0, 0.0, 0.0]),
         np.array([-1.0, 0.0, 0.0]),
@@ -108,23 +109,25 @@ def build_lateral_grasp_candidates(
     candidates = []
     for approaching in approach_directions:
         closing = np.array([-approaching[1], approaching[0], 0.0])
-        for closing_sign in (1.0, -1.0):
-            signed_closing = closing * closing_sign
-            grasp_pose = env.agent.build_grasp_pose(
+        grasp_pose = env.agent.build_grasp_pose(
+            approaching=approaching,
+            closing=closing,
+            center=center,
+        )
+        # Roll the TCP 180 degrees around its local approach axis. This is the
+        # wrist orientation reached by rotating Franka joint 7 by pi from the
+        # unrolled lateral grasp and matches the preferred initial wrist branch.
+        grasp_pose = grasp_pose * wrist_roll
+        candidates.append(
+            LateralGraspCandidate(
                 approaching=approaching,
-                closing=signed_closing,
-                center=center,
+                closing=-closing,
+                pregrasp_pose=lateral_pregrasp_pose(
+                    grasp_pose, pregrasp_distance
+                ),
+                grasp_pose=grasp_pose,
             )
-            candidates.append(
-                LateralGraspCandidate(
-                    approaching=approaching,
-                    closing=signed_closing,
-                    pregrasp_pose=lateral_pregrasp_pose(
-                        grasp_pose, pregrasp_distance
-                    ),
-                    grasp_pose=grasp_pose,
-                )
-            )
+        )
     return candidates
 
 
@@ -406,11 +409,39 @@ class PandaPlaceColumnMotionPlanningExpert:
         final_result = self.planner.open_gripper(t=10)
         if final_result is not None:
             release_result = final_result
-        if not self._as_bool(env.evaluate()["success"]):
+        evaluation = env.evaluate()
+        if not self._as_bool(evaluation["success"]):
+            diagnostics = self._success_diagnostics(evaluation)
             raise MotionPlanningFailure(
-                "success_check", "the released column did not satisfy success"
+                "success_check",
+                f"the released column did not satisfy success ({diagnostics})",
             )
         return release_result
+
+    def _success_diagnostics(self, evaluation: dict[str, Any]) -> str:
+        fields = (
+            "is_xy_inside",
+            "is_height_valid",
+            "is_upright",
+            "is_static",
+            "is_grasped",
+            "x_offset",
+            "y_offset",
+            "height_error",
+            "axis_up",
+            "linear_speed",
+            "angular_speed",
+        )
+        values = []
+        for field in fields:
+            value = evaluation[field]
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, float):
+                values.append(f"{field}={value:.5f}")
+            else:
+                values.append(f"{field}={value}")
+        return ", ".join(values)
 
     def close(self) -> None:
         """Release planner resources."""

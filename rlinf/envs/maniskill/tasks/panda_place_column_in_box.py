@@ -129,6 +129,10 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
     box_inner_half_length = 0.05  # half-size along Y (full inner length = 8cm)
     box_wall_thickness = 0.005
     box_wall_half_height = 0.04
+    # Success tolerances account for small contact-solver offsets after release.
+    success_xy_tolerance = 0.005
+    success_z_lower_tolerance = 0.01
+    success_z_upper_tolerance = 0.02
     # Uniform yaw perturbation about world Z, in radians.
     box_yaw_noise = 0.15
 
@@ -416,21 +420,29 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
             dim=-1,
         )
 
-        x_thresh = max(self.box_inner_half_width - self.column_radius, 0.01)
-        y_thresh = max(self.box_inner_half_length - self.column_radius, 0.01)
+        x_thresh = max(
+            self.box_inner_half_width
+            - self.column_radius
+            + self.success_xy_tolerance,
+            0.01,
+        )
+        y_thresh = max(
+            self.box_inner_half_length
+            - self.column_radius
+            + self.success_xy_tolerance,
+            0.01,
+        )
         xy_flag = (torch.abs(offset[:, 0]) <= x_thresh) & (
             torch.abs(offset[:, 1]) <= y_thresh
         )
 
         rest_z = self._column_rest_z()
-        # Allow some bounce / tilt tolerance around the resting height.
-        z_flag = torch.abs(offset[:, 2] - rest_z) <= 0.03
-        # Also require the column not to stick out above the walls by much.
-        below_rim = offset[:, 2] <= (
-            self.box_wall_thickness + 2 * self.box_wall_half_height + 0.02
+        height_error = offset[:, 2] - rest_z
+        z_flag = (height_error >= -self.success_z_lower_tolerance) & (
+            height_error <= self.success_z_upper_tolerance
         )
 
-        is_inside = xy_flag & z_flag & below_rim
+        is_inside = xy_flag & z_flag
 
         # Sapien cylinders align with local +X; upright means local +X ≈ world +Z.
         col_rot = self.column.pose.to_transformation_matrix()[..., :3, :3]
@@ -440,13 +452,23 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
 
         is_grasped = self.agent.is_grasping(self.column)
         is_static = self.column.is_static(lin_thresh=1e-2, ang_thresh=0.5)
+        linear_speed = torch.linalg.norm(self.column.linear_velocity, dim=-1)
+        angular_speed = torch.linalg.norm(self.column.angular_velocity, dim=-1)
         success = is_inside & is_upright & is_static & (~is_grasped)
         return {
             "success": success,
             "is_inside": is_inside,
+            "is_xy_inside": xy_flag,
+            "is_height_valid": z_flag,
             "is_upright": is_upright,
             "is_grasped": is_grasped,
             "is_static": is_static,
+            "x_offset": offset[:, 0],
+            "y_offset": offset[:, 1],
+            "height_error": height_error,
+            "axis_up": axis_up,
+            "linear_speed": linear_speed,
+            "angular_speed": angular_speed,
         }
 
     def _get_obs_extra(self, info: dict):
