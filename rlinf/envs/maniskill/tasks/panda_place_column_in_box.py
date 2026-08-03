@@ -181,7 +181,7 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
         # ``PandaPlaceColumnWristCam`` (``hand_camera``).
         pose = sapien_utils.look_at(eye=[-0.35, 0.0, 0.7], target=[0.0, 0.0, 0.08])
         return [
-            CameraConfig("base_camera", pose, 224, 224, np.pi * 3 / 2, 0.01, 100),
+            CameraConfig("base_camera", pose, 224, 224, np.pi * 3 / 4, 0.01, 100),
         ]
 
     @property

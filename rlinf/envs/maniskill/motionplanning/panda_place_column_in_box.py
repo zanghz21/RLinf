@@ -122,9 +122,11 @@ def build_lateral_grasp_candidates(
     """Build the rolled world-Y grasp at the red segment's upper boundary."""
     center = red_upper_boundary_position(column_pose, env.column_half_length)
     wrist_roll = sapien.Pose(q=[0.0, 0.0, 0.0, 1.0])
-    # Place the pre-grasp on the world -Y side of the column, then approach the
-    # grasp pose along world +Y.
-    approach_directions = (np.array([0.0, 1.0, 0.0]),)
+    approach_directions = (
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.707, 0.707, 0.0]),
+        np.array([-0.707, 0.707, 0.0]),
+    )
     candidates = []
     for approaching in approach_directions:
         closing = np.array([-approaching[1], approaching[0], 0.0])
@@ -271,7 +273,7 @@ class PandaPlaceColumnMotionPlanningExpert:
     rim_clearance = 0.03
     insertion_clearance = 0.002
     retreat_distance = 0.1
-    transfer_waypoint_spacing = 0.08
+    transfer_waypoint_spacing = 0.16
 
     def __init__(
         self,
