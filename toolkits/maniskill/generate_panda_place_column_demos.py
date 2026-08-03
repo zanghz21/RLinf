@@ -25,6 +25,9 @@ import gymnasium as gym
 from mani_skill.utils.wrappers.record import RecordEpisode
 from tqdm import tqdm
 
+from rlinf.envs.maniskill.motionplanning.lerobot_recorder import (
+    ManiSkillLeRobotExpertRecorder,
+)
 from rlinf.envs.maniskill.motionplanning.panda_place_column_in_box import (
     MotionPlanningFailure,
     solve,
@@ -53,6 +56,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--record-dir", type=Path, default=Path("demos"))
+    parser.add_argument(
+        "--export-format",
+        choices=("maniskill", "lerobot", "both"),
+        default="maniskill",
+        help="Dataset format to write; video recording is controlled separately.",
+    )
+    parser.add_argument(
+        "--lerobot-dir",
+        type=Path,
+        default=None,
+        help=(
+            "LeRobot dataset root; defaults to "
+            "<record-dir>/<env>/motionplanning/lerobot."
+        ),
+    )
+    parser.add_argument(
+        "--task-prompt",
+        default="Place the upright column into the open box.",
+    )
     parser.add_argument("--trajectory-name", default="trajectory")
     parser.add_argument("--obs-mode", default="none")
     parser.add_argument("--render-mode", default="rgb_array")
@@ -154,9 +176,12 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--max-episode-steps must be positive")
 
     env_id = "PandaPlaceColumnInBox-v1"
-    env = gym.make(
+    export_lerobot = args.export_format in {"lerobot", "both"}
+    export_maniskill = args.export_format in {"maniskill", "both"}
+    obs_mode = "rgb" if export_lerobot and args.obs_mode == "none" else args.obs_mode
+    base_env = gym.make(
         env_id,
-        obs_mode=args.obs_mode,
+        obs_mode=obs_mode,
         control_mode="pd_joint_pos",
         render_mode=args.render_mode,
         sensor_configs={"shader_pack": args.shader},
@@ -165,30 +190,47 @@ def main(args: argparse.Namespace) -> None:
         sim_backend="cpu",
         max_episode_steps=args.max_episode_steps,
     )
-    column_xy_list = env.unwrapped.column_xy_list
+    column_xy_list = base_env.unwrapped.column_xy_list
     required_successes = max(
         args.num_traj,
         args.min_successes_per_column_xy * len(column_xy_list),
     )
     max_attempts = args.max_attempts or required_successes * 10
     if max_attempts < required_successes:
-        env.close()
+        base_env.close()
         raise ValueError(
             "--max-attempts must be at least the larger of --num-traj and "
             "len(column_xy_list) * --min-successes-per-column-xy"
         )
     output_dir = args.record_dir / env_id / "motionplanning"
-    env = RecordEpisode(
-        env,
-        output_dir=str(output_dir),
-        trajectory_name=args.trajectory_name,
-        save_video=args.save_video,
-        source_type="motionplanning",
-        source_desc="RLinf lateral-grasp motion-planning expert",
-        video_fps=30,
-        record_reward=False,
-        save_on_reset=False,
-    )
+    lerobot_recorder = None
+    env = base_env
+    if export_lerobot:
+        lerobot_dir = args.lerobot_dir or output_dir / "lerobot"
+        fps = round(1.0 / base_env.unwrapped.control_timestep)
+        lerobot_recorder = ManiSkillLeRobotExpertRecorder(
+            env,
+            lerobot_dir,
+            task=args.task_prompt,
+            fps=fps,
+        )
+        env = lerobot_recorder
+
+    record_episode = None
+    if export_maniskill or args.save_video:
+        record_episode = RecordEpisode(
+            env,
+            output_dir=str(output_dir),
+            save_trajectory=export_maniskill,
+            trajectory_name=args.trajectory_name,
+            save_video=args.save_video,
+            source_type="motionplanning",
+            source_desc="RLinf lateral-grasp motion-planning expert",
+            video_fps=30,
+            record_reward=False,
+            save_on_reset=False,
+        )
+        env = record_episode
 
     failures: Counter[str] = Counter()
     successes = 0
@@ -234,19 +276,35 @@ def main(args: argparse.Namespace) -> None:
                 logger.exception("Expert failed for seed %d", seed)
 
             if success:
-                env.flush_trajectory()
-                if args.save_video:
-                    env.flush_video(
+                if record_episode is not None:
+                    record_episode.flush_trajectory(save=export_maniskill)
+                if args.save_video and record_episode is not None:
+                    record_episode.flush_video(
                         suffix=_video_suffix(column_xy_index, success=True)
+                    )
+                if lerobot_recorder is not None:
+                    lerobot_recorder.flush_episode(
+                        success=True,
+                        state_id=column_xy_index,
+                        save=True,
                     )
                 successes += 1
                 successes_by_column_xy[column_xy_index] += 1
             else:
                 failures[failure_stage or "unknown"] += 1
-                env.flush_trajectory(save=args.save_failures)
-                if args.save_video:
-                    env.flush_video(
+                if record_episode is not None:
+                    record_episode.flush_trajectory(
+                        save=export_maniskill and args.save_failures
+                    )
+                if args.save_video and record_episode is not None:
+                    record_episode.flush_video(
                         suffix=_video_suffix(column_xy_index, success=False),
+                        save=args.save_failures,
+                    )
+                if lerobot_recorder is not None:
+                    lerobot_recorder.flush_episode(
+                        success=False,
+                        state_id=column_xy_index,
                         save=args.save_failures,
                     )
 

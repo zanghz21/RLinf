@@ -101,3 +101,48 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPandaPlaceColumnDataConfig(DataConfigFactory):
+    """OpenPI mapping for RLinf's canonical place-column expert dataset."""
+
+    action_dim: int = 8
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.base",
+                        "observation/state": "observation.state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                maniskill_policy.ManiSkillInputs(
+                    model_type=model_config.model_type
+                )
+            ],
+            outputs=[
+                maniskill_policy.ManiSkillOutputs(action_dim=self.action_dim)
+            ],
+        )
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )

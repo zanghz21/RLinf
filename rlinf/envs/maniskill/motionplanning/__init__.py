@@ -14,6 +14,7 @@
 
 """Motion-planning experts for RLinf ManiSkill environments."""
 
+from .lerobot_recorder import ManiSkillLeRobotExpertRecorder
 from .panda_place_column_in_box import (
     MotionPlanningFailure,
     PandaPlaceColumnMotionPlanningExpert,
@@ -22,6 +23,7 @@ from .panda_place_column_in_box import (
 
 __all__ = [
     "MotionPlanningFailure",
+    "ManiSkillLeRobotExpertRecorder",
     "PandaPlaceColumnMotionPlanningExpert",
     "solve",
 ]

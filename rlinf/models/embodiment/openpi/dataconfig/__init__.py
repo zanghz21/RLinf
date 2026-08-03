@@ -52,6 +52,7 @@ from rlinf.models.embodiment.openpi.dataconfig.libero_dataconfig import (
 )
 from rlinf.models.embodiment.openpi.dataconfig.maniskill_dataconfig import (
     LeRobotManiSkillDataConfig,
+    LeRobotPandaPlaceColumnDataConfig,
 )
 from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
@@ -125,6 +126,25 @@ _CONFIGS = [
         num_train_steps=200,  # 1_000, #30_000
         log_interval=5,  # 25,
         save_interval=50,  # 200,
+    ),
+    TrainConfig(
+        name="pi0_panda_place_column",
+        model=pi0_config.Pi0Config(action_horizon=10),
+        data=LeRobotPandaPlaceColumnDataConfig(
+            repo_id="rlinf/panda_place_column_expert",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi0_panda_place_column/assets"
+            ),
+            action_dim=8,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi0_base",
+        seed=0,
+        batch_size=32,
+        num_workers=8,
+        num_train_steps=30_000,
+        log_interval=25,
+        save_interval=2_500,
     ),
     TrainConfig(
         name="pi05_maniskill",

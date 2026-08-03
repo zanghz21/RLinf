@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig
+from torch.utils.data import DataLoader, DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
@@ -73,9 +74,50 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_dreamzero_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
+        elif SupportedModel(self.cfg.actor.model.model_type) in {
+            SupportedModel.MLP_POLICY,
+            SupportedModel.CNN_POLICY,
+        }:
+            from rlinf.data.datasets.maniskill_bc import (
+                ManiSkillLeRobotBCDataset,
+            )
+
+            repo_id = resolve_lerobot_repo_id(data_paths)
+            if repo_id is None:
+                raise ValueError(
+                    "MLP/CNN SFT requires a local LeRobot dataset path."
+                )
+            policy_type = self.cfg.actor.model.model_type
+            dataset = ManiSkillLeRobotBCDataset(
+                repo_id,
+                policy_type=policy_type,
+                action_horizon=self.cfg.actor.model.num_action_chunks,
+                video_backend=self.cfg.data.get("video_backend", "pyav"),
+            )
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=self._world_size,
+                rank=self._rank,
+                shuffle=not eval_dataset,
+                seed=self.cfg.actor.seed,
+            )
+            data_loader = DataLoader(
+                dataset,
+                batch_size=(
+                    self.eval_batch_size
+                    if eval_dataset
+                    else self.micro_batch_size
+                ),
+                sampler=sampler,
+                num_workers=self.cfg.data.get("num_workers", 4),
+                pin_memory=True,
+                drop_last=not eval_dataset,
+            )
+            return data_loader, {"dataset": dataset, "sampler": sampler}
         else:
             raise KeyError(
-                f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
+                "Unsupported embodied SFT model type: "
+                f"{self.cfg.actor.model.model_type}"
             )
 
     def get_eval_model_output(self, batch: dict[str, Any]):
@@ -83,6 +125,16 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        if SupportedModel(self.cfg.actor.model.model_type) in {
+            SupportedModel.MLP_POLICY,
+            SupportedModel.CNN_POLICY,
+        }:
+            batch = {
+                key: value.to(self.device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in batch.items()
+            }
         with self.amp_context:
             output = self.model(forward_type=ForwardType.SFT, data=batch)
 
@@ -164,6 +216,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         )
         if pytorch_dl is None:
             raise TypeError(
-                "OpenPI dataloader does not expose an inner torch DataLoader; cannot infer steps per epoch from len()."
+                "OpenPI dataloader does not expose an inner torch DataLoader; "
+                "cannot infer steps per epoch from len()."
             )
         return pytorch_dl

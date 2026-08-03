@@ -1,0 +1,61 @@
+defaults:
+  - model/mlp_policy@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: maniskill_place_column_sft_mlp
+    logger_backends: [tensorboard]
+  max_epochs: 100
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 500
+
+data:
+  train_data_paths: /path/to/panda_place_column_lerobot
+  num_workers: 4
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 256
+  global_batch_size: 1024
+  seed: 0
+  model:
+    model_path: ""
+    obs_dim: 42
+    action_dim: 8
+    num_action_chunks: 1
+    add_value_head: false
+    add_q_head: false
+    precision: "32"
+  optim:
+    lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-5
+    clip_grad: 1.0
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}

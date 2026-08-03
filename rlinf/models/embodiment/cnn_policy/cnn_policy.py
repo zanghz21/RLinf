@@ -81,6 +81,7 @@ class CNNPolicy(nn.Module, BasePolicy):
     def __init__(self, cfg: CNNConfig):
         super().__init__()
         self.cfg = cfg
+        self.output_action_dim = cfg.action_dim * cfg.num_action_chunks
         self.in_channels = self.cfg.image_size[0]
         self.register_buffer(
             "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 1, 3)
@@ -129,7 +130,7 @@ class CNNPolicy(nn.Module, BasePolicy):
             init_mlp_weights(self.mix_proj, nonlinearity="tanh")
 
             self.actor_mean = layer_init(
-                nn.Linear(256, self.cfg.action_dim), std=0.01 * np.sqrt(2)
+                nn.Linear(256, self.output_action_dim), std=0.01 * np.sqrt(2)
             )
 
         assert self.cfg.add_value_head + self.cfg.add_q_head <= 1
@@ -146,19 +147,21 @@ class CNNPolicy(nn.Module, BasePolicy):
                     hidden_size=hidden_size,
                     hidden_dims=hidden_dims,
                     num_q_heads=self.cfg.num_q_heads,
-                    action_feature_dim=self.cfg.action_dim,
+                    action_feature_dim=self.output_action_dim,
                 )
             elif self.cfg.q_head_type == "crossq":
                 self.q_head = MultiCrossQHead(
                     hidden_size=hidden_size,
                     hidden_dims=hidden_dims,
                     num_q_heads=self.cfg.num_q_heads,
-                    action_feature_dim=self.cfg.action_dim,
+                    action_feature_dim=self.output_action_dim,
                 )
         if self.cfg.independent_std:
-            self.actor_logstd = nn.Parameter(torch.ones(1, self.cfg.action_dim) * -0.5)
+            self.actor_logstd = nn.Parameter(
+                torch.ones(1, self.output_action_dim) * -0.5
+            )
         else:
-            self.actor_logstd = layer_init(nn.Linear(256, self.cfg.action_dim))
+            self.actor_logstd = layer_init(nn.Linear(256, self.output_action_dim))
 
         if self.cfg.action_scale is not None:
             l, h = self.cfg.action_scale
@@ -264,7 +267,9 @@ class CNNPolicy(nn.Module, BasePolicy):
             next_obs = self.preprocess_env_obs(next_obs)
             kwargs.update({"next_obs": next_obs})
 
-        if forward_type == ForwardType.SAC:
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
+        elif forward_type == ForwardType.SAC:
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
@@ -276,6 +281,31 @@ class CNNPolicy(nn.Module, BasePolicy):
             return self.default_forward(**kwargs)
         else:
             raise NotImplementedError
+
+    def sft_forward(self, data, **kwargs):
+        """Compute behavior-cloning loss from a canonical LeRobot batch."""
+        obs = {
+            "states": data["states"],
+            "main_images": data["main_images"],
+        }
+        if "extra_view_images" in data:
+            obs["extra_view_images"] = data["extra_view_images"]
+        obs = self.preprocess_env_obs(obs)
+        _, _, pred_actions, _ = self._actor_forward_from_processed_tensors(
+            main_images=obs["main_images"],
+            states=obs["states"],
+            extra_view_images=obs.get("extra_view_images"),
+        )
+        target_actions = data["action"].to(pred_actions.device)
+        if pred_actions.shape != target_actions.shape:
+            if pred_actions.numel() != target_actions.numel():
+                raise ValueError(
+                    "CNN BC targets must match the predicted action shape, "
+                    f"got predicted {pred_actions.shape} and target "
+                    f"{target_actions.shape}."
+                )
+            target_actions = target_actions.reshape_as(pred_actions)
+        return torch.nn.functional.mse_loss(pred_actions, target_actions)
 
     def default_forward(
         self,

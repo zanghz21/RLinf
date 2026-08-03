@@ -38,6 +38,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
+        self.output_action_dim = action_dim * num_action_chunks
         self.torch_compile_enabled = False
         # default setting
         self.independent_std = True
@@ -60,14 +61,14 @@ class MLPPolicy(nn.Module, BasePolicy):
                     hidden_size=obs_dim,
                     hidden_dims=[256, 256, 256],
                     num_q_heads=2,
-                    action_feature_dim=action_dim,
+                    action_feature_dim=self.output_action_dim,
                 )
             elif q_head_type == "crossq":
                 self.q_head = MultiCrossQHead(
                     hidden_size=obs_dim,
                     hidden_dims=[256, 256, 256],
                     num_q_heads=2,
-                    action_feature_dim=action_dim,
+                    action_feature_dim=self.output_action_dim,
                 )
             else:
                 raise ValueError(f"Invalid q_head_type: {q_head_type}")
@@ -82,12 +83,16 @@ class MLPPolicy(nn.Module, BasePolicy):
             layer_init(nn.Linear(256, 256)),
             act(),
         )
-        self.actor_mean = layer_init(nn.Linear(256, action_dim), std=0.01 * np.sqrt(2))
+        self.actor_mean = layer_init(
+            nn.Linear(256, self.output_action_dim), std=0.01 * np.sqrt(2)
+        )
 
         if self.independent_std:
-            self.actor_logstd = nn.Parameter(torch.ones(1, action_dim) * -0.5)
+            self.actor_logstd = nn.Parameter(
+                torch.ones(1, self.output_action_dim) * -0.5
+            )
         else:
-            self.actor_logstd = nn.Linear(256, action_dim)
+            self.actor_logstd = nn.Linear(256, self.output_action_dim)
 
         if action_scale is not None:
             l, h = action_scale
@@ -148,12 +153,13 @@ class MLPPolicy(nn.Module, BasePolicy):
         if pred_actions.shape != target_actions.shape:
             if pred_actions.numel() != target_actions.numel():
                 raise ValueError(
-                    "MLP DAgger targets must match the predicted action shape, "
-                    f"got predicted {pred_actions.shape} and target {target_actions.shape}."
+                    "MLP BC targets must match the predicted action shape, "
+                    f"got predicted {pred_actions.shape} and target "
+                    f"{target_actions.shape}."
                 )
             target_actions = target_actions.reshape_as(pred_actions)
 
-        return F.mse_loss(pred_actions, target_actions, reduction="none")
+        return F.mse_loss(pred_actions, target_actions)
 
     def sac_forward(self, obs, **kwargs):
         feat = self.backbone(obs["states"])
