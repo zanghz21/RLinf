@@ -42,6 +42,15 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--num-traj", type=int, default=10)
+    parser.add_argument(
+        "--min-successes-per-column-xy",
+        type=int,
+        default=1,
+        help=(
+            "Require at least this many successful trajectories from every "
+            "column_xy_list anchor."
+        ),
+    )
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--record-dir", type=Path, default=Path("demos"))
     parser.add_argument("--trajectory-name", default="trajectory")
@@ -60,7 +69,10 @@ def parse_args() -> argparse.Namespace:
         "--max-attempts",
         type=int,
         default=None,
-        help="Stop after this many attempts; defaults to 10 times num-traj.",
+        help=(
+            "Stop after this many attempts; defaults to 10 times the larger "
+            "of the total and per-anchor success requirements."
+        ),
     )
     return parser.parse_args()
 
@@ -78,15 +90,67 @@ def _result_success(result) -> bool:
     return _scalar_bool(info.get("success", False))
 
 
+def _collection_complete(
+    successes: int,
+    successes_by_column_xy: list[int],
+    num_traj: int,
+    minimum_per_column_xy: int,
+) -> bool:
+    """Return whether total and per-anchor success requirements are met."""
+    return successes >= num_traj and all(
+        count >= minimum_per_column_xy for count in successes_by_column_xy
+    )
+
+
+def _coverage_progress(
+    successes: int,
+    successes_by_column_xy: list[int],
+    num_traj: int,
+    minimum_per_column_xy: int,
+) -> tuple[int, int]:
+    """Return completed and required slots for combined collection targets."""
+    coverage = sum(
+        min(count, minimum_per_column_xy)
+        for count in successes_by_column_xy
+    )
+    coverage_target = minimum_per_column_xy * len(successes_by_column_xy)
+    extra_target = max(0, num_traj - coverage_target)
+    extra_successes = successes - coverage
+    return (
+        coverage + min(extra_successes, extra_target),
+        coverage_target + extra_target,
+    )
+
+
+def _next_column_xy_index(
+    successes_by_column_xy: list[int],
+    minimum_per_column_xy: int,
+    attempt: int,
+) -> int:
+    """Cycle through anchors that have not yet reached their quota."""
+    candidates = [
+        index
+        for index, count in enumerate(successes_by_column_xy)
+        if count < minimum_per_column_xy
+    ]
+    if not candidates:
+        candidates = list(range(len(successes_by_column_xy)))
+    return candidates[attempt % len(candidates)]
+
+
+def _video_suffix(column_xy_index: int) -> str:
+    """Return the video filename annotation for a column anchor state."""
+    return f"state_id_{column_xy_index}"
+
+
 def main(args: argparse.Namespace) -> None:
     """Generate and record expert trajectories."""
     if args.num_traj <= 0:
         raise ValueError("--num-traj must be positive")
+    if args.min_successes_per_column_xy <= 0:
+        raise ValueError("--min-successes-per-column-xy must be positive")
     if args.max_episode_steps <= 0:
         raise ValueError("--max-episode-steps must be positive")
-    max_attempts = args.max_attempts or args.num_traj * 10
-    if max_attempts < args.num_traj:
-        raise ValueError("--max-attempts must be at least --num-traj")
 
     env_id = "PandaPlaceColumnInBox-v1"
     env = gym.make(
@@ -100,6 +164,18 @@ def main(args: argparse.Namespace) -> None:
         sim_backend="cpu",
         max_episode_steps=args.max_episode_steps,
     )
+    column_xy_list = env.unwrapped.column_xy_list
+    required_successes = max(
+        args.num_traj,
+        args.min_successes_per_column_xy * len(column_xy_list),
+    )
+    max_attempts = args.max_attempts or required_successes * 10
+    if max_attempts < required_successes:
+        env.close()
+        raise ValueError(
+            "--max-attempts must be at least the larger of --num-traj and "
+            "len(column_xy_list) * --min-successes-per-column-xy"
+        )
     output_dir = args.record_dir / env_id / "motionplanning"
     env = RecordEpisode(
         env,
@@ -115,21 +191,42 @@ def main(args: argparse.Namespace) -> None:
 
     failures: Counter[str] = Counter()
     successes = 0
+    successes_by_column_xy = [0] * len(column_xy_list)
     attempts = 0
-    progress = tqdm(total=args.num_traj, desc="successful trajectories")
+    progress = tqdm(total=required_successes, desc="successful trajectories")
     try:
-        while successes < args.num_traj and attempts < max_attempts:
+        while (
+            not _collection_complete(
+                successes,
+                successes_by_column_xy,
+                args.num_traj,
+                args.min_successes_per_column_xy,
+            )
+            and attempts < max_attempts
+        ):
             seed = args.start_seed + attempts
+            column_xy_index = _next_column_xy_index(
+                successes_by_column_xy,
+                args.min_successes_per_column_xy,
+                attempts,
+            )
             attempts += 1
             failure_stage = None
             try:
-                result = solve(env, seed=seed, debug=False, vis=args.vis)
+                result = solve(
+                    env,
+                    seed=seed,
+                    column_xy_index=column_xy_index,
+                    debug=False,
+                    vis=args.vis,
+                )
                 success = _result_success(result)
                 if not success:
                     failure_stage = "success_check"
             except MotionPlanningFailure as exc:
                 success = False
                 failure_stage = exc.stage
+                logger.warning("Seed %d failed: %s", seed, exc)
             except Exception:
                 success = False
                 failure_stage = "unexpected_error"
@@ -138,19 +235,31 @@ def main(args: argparse.Namespace) -> None:
             if success:
                 env.flush_trajectory()
                 if args.save_video:
-                    env.flush_video()
+                    env.flush_video(suffix=_video_suffix(column_xy_index))
                 successes += 1
-                progress.update(1)
+                successes_by_column_xy[column_xy_index] += 1
             else:
                 failures[failure_stage or "unknown"] += 1
                 env.flush_trajectory(save=args.save_failures)
                 if args.save_video:
-                    env.flush_video(save=args.save_failures)
+                    env.flush_video(
+                        suffix=_video_suffix(column_xy_index),
+                        save=args.save_failures,
+                    )
 
+            completed_slots, _ = _coverage_progress(
+                successes,
+                successes_by_column_xy,
+                args.num_traj,
+                args.min_successes_per_column_xy,
+            )
+            progress.n = completed_slots
             progress.set_postfix(
                 attempts=attempts,
                 success_rate=f"{successes / attempts:.3f}",
+                per_xy=successes_by_column_xy,
             )
+            progress.refresh()
     finally:
         progress.close()
         env.close()
@@ -161,12 +270,20 @@ def main(args: argparse.Namespace) -> None:
         attempts,
         output_dir,
     )
+    logger.info("Successes by column_xy_list index: %s", successes_by_column_xy)
     if failures:
         logger.info("Failure stages: %s", dict(failures))
-    if successes < args.num_traj:
+    if not _collection_complete(
+        successes,
+        successes_by_column_xy,
+        args.num_traj,
+        args.min_successes_per_column_xy,
+    ):
         raise RuntimeError(
-            f"Generated {successes}/{args.num_traj} successful trajectories "
-            f"before reaching --max-attempts={max_attempts}"
+            f"Generated {successes}/{args.num_traj} total successes with "
+            f"per-column-xy counts {successes_by_column_xy}; required at "
+            f"least {args.min_successes_per_column_xy} each before reaching "
+            f"--max-attempts={max_attempts}"
         )
 
 

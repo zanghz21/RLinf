@@ -506,9 +506,15 @@ def solve(
     seed: int | None = None,
     debug: bool = False,
     vis: bool = False,
+    column_xy_index: int | None = None,
 ):
     """Reset and solve one ``PandaPlaceColumnInBox-v1`` episode."""
-    env.reset(seed=seed)
+    reset_options = (
+        {"column_xy_index": column_xy_index}
+        if column_xy_index is not None
+        else None
+    )
+    env.reset(seed=seed, options=reset_options)
     expert = PandaPlaceColumnMotionPlanningExpert(
         env,
         debug=debug,

@@ -367,9 +367,29 @@ class PandaPlaceColumnInBoxEnv(BaseEnv):
             col_xy_anchors = torch.tensor(
                 self.column_xy_list, dtype=torch.float32, device=self.device
             )
-            col_xy_rand_id = torch.randint(
-                0, len(self.column_xy_list), (b,), device=self.device
-            )
+            column_xy_index = options.get("column_xy_index")
+            if column_xy_index is None:
+                col_xy_rand_id = torch.randint(
+                    0, len(self.column_xy_list), (b,), device=self.device
+                )
+            else:
+                col_xy_rand_id = torch.as_tensor(
+                    column_xy_index, dtype=torch.long, device=self.device
+                )
+                if col_xy_rand_id.ndim == 0:
+                    col_xy_rand_id = col_xy_rand_id.repeat(b)
+                if col_xy_rand_id.shape != (b,):
+                    raise ValueError(
+                        "options['column_xy_index'] must be a scalar or have "
+                        f"shape ({b},)"
+                    )
+                if torch.any(
+                    (col_xy_rand_id < 0)
+                    | (col_xy_rand_id >= len(self.column_xy_list))
+                ):
+                    raise ValueError(
+                        "options['column_xy_index'] is outside column_xy_list"
+                    )
             col_xy = col_xy_anchors[col_xy_rand_id]
             col_xy = col_xy + (
                 torch.rand((b, 2), device=self.device) * 2 - 1
