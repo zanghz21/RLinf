@@ -180,6 +180,8 @@ def build_lateral_grasp_candidates(
 class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
     """Panda planner that enables MPlib's attached-object collision flag."""
 
+    max_screw_planning_attempts = 5
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_attached_collision = False
@@ -207,6 +209,18 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
             wrt_world=True,
         )
 
+    def _plan_screw_with_retries(
+        self, pose: sapien.Pose, qpos: np.ndarray
+    ) -> dict[str, Any]:
+        """Retry screw planning when MPlib does not return success."""
+        result = None
+        for _ in range(self.max_screw_planning_attempts):
+            result = self._plan_screw_from_qpos(pose, qpos)
+            if result["status"] == "Success":
+                return result
+        assert result is not None
+        return result
+
     def _joint7_is_continuous(self, result: dict[str, Any]) -> bool:
         """Reject a plan that changes wrist branch after grasping."""
         if self.joint7_reference is None or result["status"] != "Success":
@@ -228,9 +242,7 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
         self, pose: sapien.Pose, dry_run: bool = False, refine_steps: int = 0
     ):
         """Plan and optionally execute a Cartesian screw motion."""
-        result = self._plan_screw_from_qpos(pose, self._current_qpos())
-        if result["status"] != "Success":
-            result = self._plan_screw_from_qpos(pose, self._current_qpos())
+        result = self._plan_screw_with_retries(pose, self._current_qpos())
         if result["status"] != "Success" or not self._joint7_is_continuous(
             result
         ):
@@ -269,7 +281,7 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
     ) -> bool:
         """Check a screw motion from the final state of a dry-run plan."""
         qpos = preceding_plan["position"][-1]
-        result = self._plan_screw_from_qpos(pose, qpos)
+        result = self._plan_screw_with_retries(pose, qpos)
         return result["status"] == "Success"
 
     def attach_column_proxy(
