@@ -92,6 +92,28 @@ def lateral_pregrasp_pose(
     return grasp_pose * sapien.Pose(p=[0.0, 0.0, -pregrasp_distance])
 
 
+def linear_pose_waypoints(
+    start_pose: sapien.Pose,
+    target_pose: sapien.Pose,
+    max_translation: float,
+) -> list[sapien.Pose]:
+    """Split a fixed-orientation Cartesian move into short translations."""
+    if max_translation <= 0:
+        raise ValueError("max_translation must be positive")
+    start = np.asarray(start_pose.p)
+    target = np.asarray(target_pose.p)
+    segment_count = max(
+        1, int(np.ceil(np.linalg.norm(target - start) / max_translation))
+    )
+    return [
+        sapien.Pose(
+            p=start + (target - start) * step / segment_count,
+            q=target_pose.q,
+        )
+        for step in range(1, segment_count + 1)
+    ]
+
+
 def build_lateral_grasp_candidates(
     env: PandaPlaceColumnInBoxEnv,
     column_pose: sapien.Pose,
@@ -134,6 +156,8 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_attached_collision = False
+        self.joint7_reference: float | None = None
+        self.max_joint7_drift = np.pi / 2.0
 
     def _current_qpos(self) -> np.ndarray:
         return self.robot.get_qpos().cpu().numpy()[0]
@@ -156,6 +180,23 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
             wrt_world=True,
         )
 
+    def _joint7_is_continuous(self, result: dict[str, Any]) -> bool:
+        """Reject a plan that changes wrist branch after grasping."""
+        if self.joint7_reference is None or result["status"] != "Success":
+            return True
+        positions = np.asarray(result["position"])
+        return bool(
+            positions.ndim == 2
+            and positions.shape[0] > 0
+            and positions.shape[1] > 6
+            and np.max(np.abs(positions[:, 6] - self.joint7_reference))
+            <= self.max_joint7_drift
+        )
+
+    def lock_joint7_branch(self) -> None:
+        """Use the current wrist angle as the post-grasp branch reference."""
+        self.joint7_reference = float(self._current_qpos()[6])
+
     def move_to_pose_with_screw(
         self, pose: sapien.Pose, dry_run: bool = False, refine_steps: int = 0
     ):
@@ -163,7 +204,9 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
         result = self._plan_screw_from_qpos(pose, self._current_qpos())
         if result["status"] != "Success":
             result = self._plan_screw_from_qpos(pose, self._current_qpos())
-        if result["status"] != "Success":
+        if result["status"] != "Success" or not self._joint7_is_continuous(
+            result
+        ):
             self.render_wait()
             return -1
         self.render_wait()
@@ -184,7 +227,9 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
             use_attach=self.use_attached_collision,
             wrt_world=True,
         )
-        if result["status"] != "Success":
+        if result["status"] != "Success" or not self._joint7_is_continuous(
+            result
+        ):
             self.render_wait()
             return -1
         self.render_wait()
@@ -226,6 +271,7 @@ class PandaPlaceColumnMotionPlanningExpert:
     rim_clearance = 0.03
     insertion_clearance = 0.002
     retreat_distance = 0.1
+    transfer_waypoint_spacing = 0.08
 
     def __init__(
         self,
@@ -340,6 +386,7 @@ class PandaPlaceColumnMotionPlanningExpert:
         self.planner.close_gripper(t=8)
         if not self._as_bool(env.agent.is_grasping(env.column)):
             raise MotionPlanningFailure("grasp", "the column was not secured")
+        self.planner.lock_joint7_branch()
 
         tcp_pose = single_sapien_pose(env.agent.tcp_pose)
         column_pose = single_sapien_pose(env.column.pose)
@@ -360,6 +407,7 @@ class PandaPlaceColumnMotionPlanningExpert:
         self._require_motion(
             "lift", self.planner.move_to_pose_with_screw(lift_pose)
         )
+        transfer_start_pose = single_sapien_pose(env.agent.tcp_pose)
 
         transfer_column_position = np.array(
             [box_pose.p[0], box_pose.p[1], transfer_column_z]
@@ -367,10 +415,18 @@ class PandaPlaceColumnMotionPlanningExpert:
         transfer_tcp_pose = self._desired_tcp_pose(
             transfer_column_position, column_pose.q, tcp_to_column
         )
-        self._require_motion(
-            "transfer",
-            self.planner.move_to_pose_with_rrt_connect(transfer_tcp_pose),
-        )
+        for waypoint_index, waypoint in enumerate(
+            linear_pose_waypoints(
+                transfer_start_pose,
+                transfer_tcp_pose,
+                self.transfer_waypoint_spacing,
+            ),
+            start=1,
+        ):
+            self._require_motion(
+                f"transfer_waypoint_{waypoint_index}",
+                self.planner.move_to_pose_with_screw(waypoint),
+            )
 
         insertion_column_position = np.array(
             [
