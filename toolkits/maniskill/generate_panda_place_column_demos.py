@@ -138,9 +138,10 @@ def _next_column_xy_index(
     return candidates[attempt % len(candidates)]
 
 
-def _video_suffix(column_xy_index: int) -> str:
-    """Return the video filename annotation for a column anchor state."""
-    return f"state_id_{column_xy_index}"
+def _video_suffix(column_xy_index: int, success: bool) -> str:
+    """Return state and outcome annotations for a video filename."""
+    outcome = "success" if success else "fail"
+    return f"state_id_{column_xy_index}_{outcome}"
 
 
 def main(args: argparse.Namespace) -> None:
@@ -235,7 +236,9 @@ def main(args: argparse.Namespace) -> None:
             if success:
                 env.flush_trajectory()
                 if args.save_video:
-                    env.flush_video(suffix=_video_suffix(column_xy_index))
+                    env.flush_video(
+                        suffix=_video_suffix(column_xy_index, success=True)
+                    )
                 successes += 1
                 successes_by_column_xy[column_xy_index] += 1
             else:
@@ -243,7 +246,7 @@ def main(args: argparse.Namespace) -> None:
                 env.flush_trajectory(save=args.save_failures)
                 if args.save_video:
                     env.flush_video(
-                        suffix=_video_suffix(column_xy_index),
+                        suffix=_video_suffix(column_xy_index, success=False),
                         save=args.save_failures,
                     )
 
