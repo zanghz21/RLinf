@@ -68,7 +68,17 @@ def extract_lerobot_observation(observation: Any) -> dict[str, np.ndarray]:
 
 
 class ManiSkillLeRobotExpertRecorder(gym.Wrapper):
-    """Record manually flushed motion-planning episodes in LeRobot format."""
+    """Record manually flushed motion-planning episodes in LeRobot format.
+
+    Args:
+        env: Single-environment ManiSkill env to record.
+        output_dir: Root of the LeRobot dataset to write.
+        task: Natural-language task description stored with every frame.
+        fps: Frame rate of the recorded episodes.
+        use_videos: Store camera streams as per-episode MP4 files instead of
+            individual PNG frames. Videos keep the dataset far smaller, at the
+            cost of lossy compression and decoding on read.
+    """
 
     def __init__(
         self,
@@ -77,11 +87,13 @@ class ManiSkillLeRobotExpertRecorder(gym.Wrapper):
         *,
         task: str,
         fps: int,
+        use_videos: bool = True,
     ) -> None:
         super().__init__(env)
         self.output_dir = Path(output_dir)
         self.task = task
         self.fps = fps
+        self.use_videos = use_videos
         self.writer = LeRobotDatasetWriter()
         self._writer_created = False
         self._last_observation: Any = None
@@ -130,10 +142,11 @@ class ManiSkillLeRobotExpertRecorder(gym.Wrapper):
                 "names": ["done"],
             },
         }
+        camera_dtype = "video" if self.use_videos else "image"
         for key in ("observation.images.base", "observation.images.wrist"):
             if key in frame:
                 features[key] = {
-                    "dtype": "image",
+                    "dtype": camera_dtype,
                     "shape": tuple(frame[key].shape),
                     "names": ["height", "width", "channel"],
                 }
@@ -153,9 +166,7 @@ class ManiSkillLeRobotExpertRecorder(gym.Wrapper):
             for index, frame in enumerate(self._frames):
                 frame["state_id"] = np.array([state_id], dtype=np.int64)
                 frame["is_success"] = np.array([success], dtype=bool)
-                frame["done"] = np.array(
-                    [index == len(self._frames) - 1], dtype=bool
-                )
+                frame["done"] = np.array([index == len(self._frames) - 1], dtype=bool)
             if not self._writer_created:
                 self._create_writer(self._frames[0])
             self.writer.add_episode(self._frames)

@@ -25,6 +25,9 @@ import gymnasium as gym
 from mani_skill.utils.wrappers.record import RecordEpisode
 from tqdm import tqdm
 
+from rlinf.envs.maniskill.motionplanning.action_perturbation import (
+    JointActionPerturbation,
+)
 from rlinf.envs.maniskill.motionplanning.lerobot_recorder import (
     ManiSkillLeRobotExpertRecorder,
 )
@@ -40,8 +43,7 @@ def parse_args() -> argparse.Namespace:
     """Parse demonstration-generation options."""
     parser = argparse.ArgumentParser(
         description=(
-            "Generate CPU motion-planning demonstrations for "
-            "PandaPlaceColumnInBox-v1."
+            "Generate CPU motion-planning demonstrations for PandaPlaceColumnInBox-v1."
         )
     )
     parser.add_argument("--num-traj", type=int, default=10)
@@ -72,14 +74,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--lerobot-camera-dtype",
+        choices=("video", "image"),
+        default="video",
+        help=(
+            "LeRobot storage for camera streams: 'video' writes one MP4 per "
+            "episode and camera, 'image' writes individual PNG frames."
+        ),
+    )
+    parser.add_argument(
         "--task-prompt",
-        default="Place the upright column into the open box.",
+        default="Pick up the bottle and place it in the box.",
     )
     parser.add_argument("--trajectory-name", default="trajectory")
     parser.add_argument("--obs-mode", default="none")
     parser.add_argument("--render-mode", default="rgb_array")
     parser.add_argument("--shader", default="default")
-    parser.add_argument("--max-episode-steps", type=int, default=300)
+    parser.add_argument("--max-episode-steps", type=int, default=500)
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--vis", action="store_true")
     parser.add_argument(
@@ -94,6 +105,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Stop after this many attempts; defaults to 10 times the larger "
             "of the total and per-anchor success requirements."
+        ),
+    )
+    parser.add_argument(
+        "--perturb-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-step probability of perturbing the executed arm joint targets. "
+            "The recorded action stays the expert's nominal one, so the "
+            "off-path states this creates get labelled with recovery actions."
+        ),
+    )
+    parser.add_argument(
+        "--perturb-std",
+        type=float,
+        default=0.03,
+        help=(
+            "Standard deviation in radians of the joint-target perturbation; "
+            "only used when --perturb-prob is positive."
         ),
     )
     return parser.parse_args()
@@ -132,8 +162,7 @@ def _coverage_progress(
 ) -> tuple[int, int]:
     """Return completed and required slots for combined collection targets."""
     coverage = sum(
-        min(count, minimum_per_column_xy)
-        for count in successes_by_column_xy
+        min(count, minimum_per_column_xy) for count in successes_by_column_xy
     )
     coverage_target = minimum_per_column_xy * len(successes_by_column_xy)
     extra_target = max(0, num_traj - coverage_target)
@@ -174,6 +203,10 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--min-successes-per-column-xy must be positive")
     if args.max_episode_steps <= 0:
         raise ValueError("--max-episode-steps must be positive")
+    if not 0.0 <= args.perturb_prob <= 1.0:
+        raise ValueError("--perturb-prob must be in [0, 1]")
+    if args.perturb_std < 0.0:
+        raise ValueError("--perturb-std must be non-negative")
 
     env_id = "PandaPlaceColumnInBox-v1"
     export_lerobot = args.export_format in {"lerobot", "both"}
@@ -205,6 +238,15 @@ def main(args: argparse.Namespace) -> None:
     output_dir = args.record_dir / env_id / "motionplanning"
     lerobot_recorder = None
     env = base_env
+    # Innermost wrapper: recorders above it keep the expert's nominal action.
+    perturbation = None
+    if args.perturb_prob > 0.0 and args.perturb_std > 0.0:
+        perturbation = JointActionPerturbation(
+            env,
+            probability=args.perturb_prob,
+            std=args.perturb_std,
+        )
+        env = perturbation
     if export_lerobot:
         lerobot_dir = args.lerobot_dir or output_dir / "lerobot"
         fps = round(1.0 / base_env.unwrapped.control_timestep)
@@ -213,6 +255,7 @@ def main(args: argparse.Namespace) -> None:
             lerobot_dir,
             task=args.task_prompt,
             fps=fps,
+            use_videos=args.lerobot_camera_dtype == "video",
         )
         env = lerobot_recorder
 
@@ -332,6 +375,13 @@ def main(args: argparse.Namespace) -> None:
         output_dir,
     )
     logger.info("Successes by column_xy_list index: %s", successes_by_column_xy)
+    if perturbation is not None:
+        logger.info(
+            "Perturbed %d of %d executed steps (std=%.4f rad)",
+            perturbation.num_perturbed_steps,
+            perturbation.num_steps,
+            args.perturb_std,
+        )
     if failures:
         logger.info("Failure stages: %s", dict(failures))
     if not _collection_complete(
