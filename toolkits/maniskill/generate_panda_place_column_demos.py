@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument("--record-dir", type=Path, default=Path("demos"))
     parser.add_argument(
+        "--control-mode",
+        choices=("pd_joint_pos", "pd_joint_delta_pos"),
+        default="pd_joint_pos",
+        help=(
+            "Controller action representation to execute and record. Delta "
+            "arm actions are normalized; the gripper remains absolute."
+        ),
+    )
+    parser.add_argument(
         "--export-format",
         choices=("maniskill", "lerobot", "both"),
         default="maniskill",
@@ -70,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "LeRobot dataset root; defaults to "
-            "<record-dir>/<env>/motionplanning/lerobot."
+            "<record-dir>/<env>/motionplanning[/<control-mode>]/lerobot."
         ),
     )
     parser.add_argument(
@@ -195,6 +204,14 @@ def _video_suffix(column_xy_index: int, success: bool) -> str:
     return f"state_id_{column_xy_index}_{outcome}"
 
 
+def _output_dir(record_dir: Path, env_id: str, control_mode: str) -> Path:
+    """Return a mode-isolated output directory without moving legacy data."""
+    output_dir = record_dir / env_id / "motionplanning"
+    if control_mode != "pd_joint_pos":
+        output_dir /= control_mode
+    return output_dir
+
+
 def main(args: argparse.Namespace) -> None:
     """Generate and record expert trajectories."""
     if args.num_traj <= 0:
@@ -215,7 +232,7 @@ def main(args: argparse.Namespace) -> None:
     base_env = gym.make(
         env_id,
         obs_mode=obs_mode,
-        control_mode="pd_joint_pos",
+        control_mode=args.control_mode,
         render_mode=args.render_mode,
         sensor_configs={"shader_pack": args.shader},
         human_render_camera_configs={"shader_pack": args.shader},
@@ -235,7 +252,7 @@ def main(args: argparse.Namespace) -> None:
             "--max-attempts must be at least the larger of --num-traj and "
             "len(column_xy_list) * --min-successes-per-column-xy"
         )
-    output_dir = args.record_dir / env_id / "motionplanning"
+    output_dir = _output_dir(args.record_dir, env_id, args.control_mode)
     lerobot_recorder = None
     env = base_env
     # Innermost wrapper: recorders above it keep the expert's nominal action.
@@ -268,7 +285,10 @@ def main(args: argparse.Namespace) -> None:
             trajectory_name=args.trajectory_name,
             save_video=args.save_video,
             source_type="motionplanning",
-            source_desc="RLinf lateral-grasp motion-planning expert",
+            source_desc=(
+                "RLinf lateral-grasp motion-planning expert using "
+                f"{args.control_mode}"
+            ),
             video_fps=30,
             record_reward=False,
             save_on_reset=False,
@@ -375,6 +395,7 @@ def main(args: argparse.Namespace) -> None:
         output_dir,
     )
     logger.info("Successes by column_xy_list index: %s", successes_by_column_xy)
+    logger.info("Recorded controller actions in %s mode", args.control_mode)
     if perturbation is not None:
         logger.info(
             "Perturbed %d of %d executed steps (std=%.4f rad)",

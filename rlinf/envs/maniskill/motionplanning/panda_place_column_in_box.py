@@ -139,6 +139,31 @@ def retreat_along_tcp_negative_z(
     return tcp_pose * sapien.Pose(p=[0.0, 0.0, -retreat_distance])
 
 
+def qpos_target_to_normalized_delta(
+    target_qpos: np.ndarray,
+    current_qpos: np.ndarray,
+    lower: float | np.ndarray,
+    upper: float | np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """Convert an absolute qpos target to a normalized delta action."""
+    target_qpos = np.asarray(target_qpos)
+    current_qpos = np.asarray(current_qpos)
+    lower = np.broadcast_to(np.asarray(lower), target_qpos.shape)
+    upper = np.broadcast_to(np.asarray(upper), target_qpos.shape)
+    if target_qpos.shape != current_qpos.shape:
+        raise ValueError(
+            "target_qpos and current_qpos must have the same shape, got "
+            f"{target_qpos.shape} and {current_qpos.shape}"
+        )
+    if np.any(upper <= lower):
+        raise ValueError("delta action upper bounds must exceed lower bounds")
+
+    delta_qpos = target_qpos - current_qpos
+    normalized = 2.0 * (delta_qpos - lower) / (upper - lower) - 1.0
+    clipped = bool(np.any((normalized < -1.0) | (normalized > 1.0)))
+    return np.clip(normalized, -1.0, 1.0), clipped
+
+
 def build_lateral_grasp_candidates(
     env: PandaPlaceColumnInBoxEnv,
     column_pose: sapien.Pose,
@@ -181,15 +206,114 @@ class AttachedObjectPandaPlanner(PandaArmMotionPlanningSolver):
     """Panda planner that enables MPlib's attached-object collision flag."""
 
     max_screw_planning_attempts = 5
+    max_delta_refinement_steps = 2
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_attached_collision = False
         self.joint7_reference: float | None = None
         self.max_joint7_drift = np.pi / 2.0
+        self.num_clipped_delta_actions = 0
 
     def _current_qpos(self) -> np.ndarray:
         return self.robot.get_qpos().cpu().numpy()[0]
+
+    def _action_for_qpos(
+        self, qpos: np.ndarray, qvel: np.ndarray | None = None
+    ) -> tuple[np.ndarray, bool]:
+        """Build a controller-native action for an absolute arm target."""
+        if self.control_mode == "pd_joint_pos":
+            return np.hstack([qpos, self.gripper_state]), False
+        if self.control_mode == "pd_joint_pos_vel":
+            if qvel is None:
+                qvel = np.zeros_like(qpos)
+            return np.hstack([qpos, qvel, self.gripper_state]), False
+        if self.control_mode != "pd_joint_delta_pos":
+            raise ValueError(f"Unsupported control mode: {self.control_mode}")
+
+        arm_controller = self.base_env.agent.controller.controllers["arm"]
+        if not (
+            arm_controller.config.use_delta
+            and arm_controller.config.normalize_action
+        ):
+            raise ValueError(
+                "pd_joint_delta_pos requires a normalized delta arm controller"
+            )
+        current_qpos = arm_controller.qpos.cpu().numpy()[0]
+        arm_action, clipped = qpos_target_to_normalized_delta(
+            qpos,
+            current_qpos,
+            arm_controller.config.lower,
+            arm_controller.config.upper,
+        )
+        return np.hstack([arm_action, self.gripper_state]), clipped
+
+    def _step_action(self, action: np.ndarray):
+        result = self.env.step(action)
+        self.elapsed_steps += 1
+        if self.print_env_info:
+            _, reward, _, _, info = result
+            print(
+                f"[{self.elapsed_steps:3}] Env Output: reward={reward} "
+                f"info={info}"
+            )
+        if self.vis:
+            self.base_env.render_human()
+        return result
+
+    def _follow_qpos_target(
+        self, qpos: np.ndarray, qvel: np.ndarray | None = None
+    ):
+        refinements = (
+            self.max_delta_refinement_steps
+            if self.control_mode == "pd_joint_delta_pos"
+            else 0
+        )
+        result = None
+        for _ in range(refinements + 1):
+            action, clipped = self._action_for_qpos(qpos, qvel)
+            if clipped:
+                self.num_clipped_delta_actions += 1
+            result = self._step_action(action)
+            if not clipped:
+                break
+        return result
+
+    def follow_path(self, result, refine_steps: int = 0):
+        """Execute an MPlib path with the configured joint controller."""
+        num_steps = result["position"].shape[0]
+        step_result = None
+        for index in range(num_steps + refine_steps):
+            path_index = min(index, num_steps - 1)
+            qpos = result["position"][path_index]
+            qvel = (
+                result["velocity"][path_index]
+                if self.control_mode == "pd_joint_pos_vel"
+                else None
+            )
+            step_result = self._follow_qpos_target(qpos, qvel)
+        return step_result
+
+    def _move_gripper(self, gripper_state: float, steps: int):
+        self.gripper_state = gripper_state
+        step_result = None
+        arm_dof = len(self.planner.joint_vel_limits)
+        for _ in range(steps):
+            qpos = self.robot.get_qpos()[0, :arm_dof].cpu().numpy()
+            step_result = self._follow_qpos_target(qpos)
+        return step_result
+
+    def open_gripper(self, t=6, gripper_state=None):
+        """Open the gripper while holding the arm in the active mode."""
+        if gripper_state is None:
+            gripper_state = self.OPEN
+        return self._move_gripper(gripper_state, t)
+
+    def close_gripper(self, t=6, gripper_state=None):
+        """Close the gripper while holding the arm in the active mode."""
+        if gripper_state is None:
+            gripper_state = self.CLOSED
+        return self._move_gripper(gripper_state, t)
 
     def _prepare_target(self, pose: sapien.Pose) -> sapien.Pose:
         pose = to_sapien_pose(pose)
@@ -323,10 +447,14 @@ class PandaPlaceColumnMotionPlanningExpert:
         self.base_env: PandaPlaceColumnInBoxEnv = env.unwrapped
         if self.base_env.num_envs != 1:
             raise ValueError("The motion-planning expert requires num_envs=1")
-        if self.base_env.control_mode not in {"pd_joint_pos", "pd_joint_pos_vel"}:
+        if self.base_env.control_mode not in {
+            "pd_joint_pos",
+            "pd_joint_delta_pos",
+            "pd_joint_pos_vel",
+        }:
             raise ValueError(
-                "The motion-planning expert requires pd_joint_pos or "
-                "pd_joint_pos_vel control"
+                "The motion-planning expert requires pd_joint_pos, "
+                "pd_joint_delta_pos, or pd_joint_pos_vel control"
             )
         self.planner = AttachedObjectPandaPlanner(
             env,
