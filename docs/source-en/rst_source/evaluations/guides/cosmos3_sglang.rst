@@ -124,19 +124,39 @@ Both roles use ``InferenceHTTPClient`` for HTTP transport. ``Cosmos3Client`` han
 
 Configure ``examples/embodiment/config/cosmos3_closed_loop.yaml`` with your checkpoint and LeRobot dataset paths. The default selects LIBERO-Spatial episode ``1261``, frame ``0``, dataset task index ``30``. It concatenates external and wrist views, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset's 10 FPS metadata is recorded separately because initialization uses one still observation. Subsequent observations come from generated video.
 
-Prepare the environment inside your workspace, following the :download:`runtime instructions <../../../../../toolkits/cosmos3/README.md>`. The example requirements pin SGLang 0.5.19 and Torch 2.13.0; ``uv --no-config pip install`` avoids the repository's general Torch override. Reuse your workspace's ``../.venv`` when it is already prepared. From the RLinf checkout, run three cycles:
+Prepare the environment inside your workspace, following the :download:`runtime instructions <../../../../../toolkits/cosmos3/README.md>`. The example requirements pin SGLang 0.5.19 and Torch 2.13.0; ``uv --no-config pip install`` avoids the repository's general Torch override. Reuse your workspace's ``../.venv`` when it is already prepared.
+
+For a CUDA 13 build on an NVIDIA data center GPU with driver 570, extract ``cuda-compat-13-0`` into ``../.cuda-compat/13.0`` using the download, checksum, and ``dpkg-deb -x`` commands in the runtime instructions. Reuse that directory if it is already prepared. ``examples/embodiment/run_with_cuda_compat.sh`` locates the libraries relative to the checkout's parent directory and prepends them to ``LD_LIBRARY_PATH`` for its command and child processes. Set ``COSMOS3_CUDA_COMPAT_DIR`` to the exact library directory if you use another location. The wrapper enables the override on driver 570, leaves the library path unchanged on drivers >=580, and rejects other branches.
+
+Select an available physical GPU in ``cluster.component_placement``. For example, edit the configuration to select GPU 5:
+
+.. code-block:: yaml
+
+   cluster:
+     component_placement:
+       env,rollout: 5
+
+The default configuration selects GPU 0. RLinf discovers physical devices through NVML, so ``CUDA_VISIBLE_DEVICES`` alone does not select worker placement. From the RLinf checkout, run three cycles with local assets:
 
 .. code-block:: bash
 
-   PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 ../.venv/bin/python \
+   env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+     RAY_ADDRESS=local PYTHONPATH="$PWD" HF_HUB_OFFLINE=1 \
+     XDG_CACHE_HOME="$PWD/../.cache" \
+     CUDA_CACHE_PATH="$PWD/../.cache/cuda" TRITON_CACHE_DIR="$PWD/../.cache/triton" \
+     bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
      examples/embodiment/eval_cosmos3_closed_loop.py \
      runner.logger.log_path=/shared/cosmos3/run-001
+
+This command creates an independent Ray session for a single-node smoke test and removes proxy settings from that process so the server health check connects directly. The CUDA wrapper only configures library loading. For Ray temporary data on shared storage, set ``RAY_TMPDIR`` to a short path or a short symlink to that storage; Ray's Unix socket paths have a length limit.
 
 The configuration starts one server, one rollout worker, and one environment worker. Its 48 environment steps are three chunks of 16 actions. Use a new output path for every run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://host:30000]'``. The entry checks its checkpoint path and leaves externally owned servers running. External servers must use ordinary inference and leave action normalization statistics unset.
 
 Inspect ``<log_path>/artifacts/config.json``, ``server.json``, and ``episode_000/``. Each cycle saves its input canvas, native action array, dynamics request/response, predicted video, next image, and status. The dynamics request must contain exactly the saved policy actions, and the next cycle's input must match the preceding prediction's last frame. ``closed_loop.mp4`` joins the generated trajectory without duplicated conditioning frames. Metrics report generated length and chunk count; placeholder reward tensors do not measure task success.
 
-A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. CPU tests cover real worker inference and stepping methods against a fake HTTP service; Ray scheduling and GPU model inference still require a compatible GPU run. Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot.
+A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. A real run on an A800 with driver ``570.172.08``, compatibility libraries ``580.196.07``, Torch ``2.13.0+cu130``, and SGLang ``0.5.19`` completed three cycles: 48 action steps and a 49-frame stitched video. Artifact checks confirmed exact action transfer and image feedback between cycles. This validates inference and feedback wiring; task quality requires a separate evaluation.
+
+Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot. For a multi-node Ray allocation, use its cluster address instead of ``RAY_ADDRESS=local``. Select compatibility libraries on each execution node before starting Ray there; a driver-570 override from the head node must not be applied blindly to newer-driver nodes.
 
 FAQ
 ----------------------------------------
@@ -154,8 +174,8 @@ FAQ
    * - First batch HTTP timeout
      - Increase ``rollout.sglang.http_timeout_s`` and ``http_max_retries``.
    * - Local requests blocked by proxy
-     - Set ``NO_PROXY=127.0.0.1,localhost`` before launch.
+     - Add the server's advertised IP to ``NO_PROXY``. For the local smoke command above, unset HTTP/HTTPS/ALL proxy variables in both cases.
    * - LIBERO rendering errors
      - ``run_eval.sh`` renders with EGL by default; on hosts without EGL, set ``MUJOCO_GL=osmesa`` and ``PYOPENGL_PLATFORM=osmesa``.
    * - GPU not released before re-run
-     - Confirm the previous ``ray stop`` completed; ``nvidia-smi`` shows all GPUs free; no residual ``ray::SGLangServerGroup`` processes.
+     - Check ``nvidia-smi`` and stop only processes owned by your run. Check for residual ``ray::SGLangServerGroup`` processes before reusing that GPU.

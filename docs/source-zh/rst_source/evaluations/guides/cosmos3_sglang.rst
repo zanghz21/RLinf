@@ -124,19 +124,39 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
 
 在 ``examples/embodiment/config/cosmos3_closed_loop.yaml`` 中配置 checkpoint 和 LeRobot 数据集路径。默认选择 LIBERO-Spatial episode ``1261``、frame ``0``、数据集 task index ``30``。输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。初始化只取一帧观测，因此单独记录数据集的 10 FPS 元数据。后续观测全部来自生成视频。
 
-按照 :download:`运行环境说明 <../../../../../toolkits/cosmos3/README.md>`，在当前工作区内准备环境。示例依赖固定 SGLang 0.5.19 和 Torch 2.13.0；``uv --no-config pip install`` 避免仓库通用的 Torch 覆盖规则影响此环境。若工作区已有 ``../.venv``，可直接复用。在 RLinf 根目录运行三轮闭环：
+按照 :download:`运行环境说明 <../../../../../toolkits/cosmos3/README.md>`，在当前工作区内准备环境。示例依赖固定 SGLang 0.5.19 和 Torch 2.13.0；``uv --no-config pip install`` 避免仓库通用的 Torch 覆盖规则影响此环境。若工作区已有 ``../.venv``，可直接复用。
+
+在驱动为 570 的 NVIDIA 数据中心 GPU 上运行 CUDA 13 构建时，按照运行环境说明中的下载、校验和 ``dpkg-deb -x`` 命令，将 ``cuda-compat-13-0`` 解压到 ``../.cuda-compat/13.0``。已有兼容库目录可直接复用。``examples/embodiment/run_with_cuda_compat.sh`` 相对于仓库的父目录定位这些库，并为启动命令及其子进程将库路径加入 ``LD_LIBRARY_PATH`` 最前面。使用其他位置时，将 ``COSMOS3_CUDA_COMPAT_DIR`` 设为实际存放库文件的目录。脚本在驱动 570 上启用兼容库，在驱动 >=580 上保留原库搜索路径，遇到其他驱动分支则报错退出。
+
+通过 ``cluster.component_placement`` 选择空闲的物理 GPU。例如，使用 GPU 5 时，将配置改为：
+
+.. code-block:: yaml
+
+   cluster:
+     component_placement:
+       env,rollout: 5
+
+默认配置选择 GPU 0。RLinf 通过 NVML 发现物理设备，仅设置 ``CUDA_VISIBLE_DEVICES`` 不会改变 worker 的 placement。在 RLinf 根目录使用本地模型和数据运行三轮闭环：
 
 .. code-block:: bash
 
-   PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 ../.venv/bin/python \
+   env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+     RAY_ADDRESS=local PYTHONPATH="$PWD" HF_HUB_OFFLINE=1 \
+     XDG_CACHE_HOME="$PWD/../.cache" \
+     CUDA_CACHE_PATH="$PWD/../.cache/cuda" TRITON_CACHE_DIR="$PWD/../.cache/triton" \
+     bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
      examples/embodiment/eval_cosmos3_closed_loop.py \
      runner.logger.log_path=/shared/cosmos3/run-001
+
+该命令为单节点 smoke test 创建独立的 Ray 会话，并在本次进程中取消代理设置，让 server 健康检查直接连接。CUDA wrapper 只配置动态库加载。将 Ray 临时数据放在共享存储时，应把 ``RAY_TMPDIR`` 设为较短的路径，或指向共享存储的短路径符号链接；Ray 使用的 Unix socket 路径有长度限制。
 
 配置启动一个 server、一个 rollout worker 和一个 env worker。48 个环境步对应三个包含 16 个动作的 chunk。每次运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://host:30000]'``。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 应使用普通推理模式，并保持动作归一化统计参数未设置。
 
 检查 ``<log_path>/artifacts/config.json``、``server.json`` 和 ``episode_000/``。每轮保存输入图像、原始动作数组、dynamics 请求与响应、预测视频、下一帧观测和状态。dynamics 请求中的动作必须与保存的 policy 动作完全一致，下一轮输入必须等于上一轮预测视频的最后一帧。``closed_loop.mp4`` 拼接生成轨迹并去除重复条件帧。指标只报告生成步数和 chunk 数；接口所需的占位 reward 张量不表示任务成功。
 
-获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。CPU 测试使用模拟 HTTP 服务执行真实 worker 的推理和环境步进方法；Ray 调度和 GPU 模型推理仍需在兼容的 GPU 环境中验证。较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。
+获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。已在 A800 上使用驱动 ``570.172.08``、兼容库 ``580.196.07``、Torch ``2.13.0+cu130`` 和 SGLang ``0.5.19`` 完成真实三轮闭环，共 48 个动作步，拼接视频包含 49 帧。产物检查确认动作原样传递，且前一轮生成的图像准确反馈到下一轮。这验证了推理和反馈链路，任务表现仍需单独评测。
+
+较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。多节点 Ray 任务应使用已分配集群的地址，替换 ``RAY_ADDRESS=local``。在每个执行节点启动 Ray 之前，分别选择该节点适用的兼容库；不要将头节点为驱动 570 设置的库路径直接传播到使用更新驱动的节点。
 
 常见问题
 ----------------------------------------
@@ -154,8 +174,8 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
    * - 首批请求 HTTP 超时
      - 调大 ``rollout.sglang.http_timeout_s`` 与 ``http_max_retries``。
    * - 本地请求被 proxy 拦截
-     - 启动前设 ``NO_PROXY=127.0.0.1,localhost``。
+     - 将 server 对外公布的 IP 加入 ``NO_PROXY``。上面的本地 smoke 命令会取消大小写两组 HTTP/HTTPS/ALL 代理变量。
    * - LIBERO 渲染报错
      - ``run_eval.sh`` 默认使用 EGL 渲染；若机器不支持 EGL，设 ``MUJOCO_GL=osmesa``、``PYOPENGL_PLATFORM=osmesa``。
    * - 重跑前 GPU 未释放
-     - 确认上次 ``ray stop`` 已彻底、``nvidia-smi`` 全空、无残留 ``ray::SGLangServerGroup`` 进程。
+     - 查看 ``nvidia-smi``，只停止属于本次运行的进程。复用该 GPU 前，检查是否残留 ``ray::SGLangServerGroup`` 进程。
