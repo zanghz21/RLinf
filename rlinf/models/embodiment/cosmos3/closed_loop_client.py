@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SGLang HTTP boundary for sequential Cosmos3 policy and forward dynamics."""
+"""Cosmos3 video jobs using RLinf's shared inference HTTP transport."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
+
+from rlinf.utils.http_client import InferenceHTTPClient
 
 
 def dynamics_request(
@@ -37,7 +39,7 @@ def dynamics_request(
 
 
 class Cosmos3Client:
-    """Own an HTTP session to one SGLang model server.
+    """Manage Cosmos3 video jobs through the common inference HTTP client.
 
     Generation POSTs are never automatically retried: retrying an ambiguous
     timeout could enqueue a second generation with no record of the first.
@@ -46,41 +48,24 @@ class Cosmos3Client:
     def __init__(
         self, base_url: str, timeout_s: float = 1800, poll_interval_s: float = 1
     ) -> None:
-        import requests
-
         parsed = urlparse(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"Expected an HTTP server URL, got {base_url!r}")
         if timeout_s <= 0 or poll_interval_s <= 0:
             raise ValueError("Expected positive request timeout and polling interval")
-        self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
         self.poll_interval_s = poll_interval_s
-        self.session = requests.Session()
-        if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
-            self.session.trust_env = False
+        self.http_client = InferenceHTTPClient(base_url)
 
     def close(self) -> None:
-        """Close client connections without stopping a server owned by the caller."""
-        self.session.close()
-
-    def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Make one bounded request and report server errors with their response body."""
-        timeout = kwargs.pop("timeout", self.timeout_s)
-        response = self.session.request(
-            method, self.base_url + path, timeout=timeout, **kwargs
-        )
-        if not response.ok:
-            detail = response.text[:2000]
-            response.close()
-            raise RuntimeError(
-                f"SGLang {method} {path} returned {response.status_code}: {detail}"
-            )
-        return response
+        """Release client connections without stopping the shared model server."""
+        self.http_client.close()
 
     def server_info(self) -> dict:
         """Return the model path and runtime identity advertised by the server."""
-        with self.request("GET", "/server_info") as response:
+        with self.http_client.request(
+            "GET", "/server_info", timeout_s=self.timeout_s
+        ) as response:
             return response.json()
 
     def generate_video(self, payload: dict, destination: Path) -> dict:
@@ -90,7 +75,9 @@ class Cosmos3Client:
             The submitted and completed job metadata, including any timing fields.
         """
         deadline = time.monotonic() + self.timeout_s
-        with self.request("POST", "/v1/videos", json=payload) as response:
+        with self.http_client.request(
+            "POST", "/v1/videos", json=payload, timeout_s=self.timeout_s, max_retries=0
+        ) as response:
             submitted = response.json()
         job_id = submitted.get("id")
         if not isinstance(job_id, str) or not job_id:
@@ -115,15 +102,17 @@ class Cosmos3Client:
                     raise TimeoutError(
                         f"Forward dynamics job {job_id} exceeded {self.timeout_s}s"
                     )
-                with self.request("GET", path, timeout=remaining) as response:
+                with self.http_client.request(
+                    "GET", path, timeout_s=remaining
+                ) as response:
                     job = response.json()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
                     f"Video download for {job_id} exceeded {self.timeout_s}s"
                 )
-            with self.request(
-                "GET", path + "/content", stream=True, timeout=remaining
+            with self.http_client.request(
+                "GET", path + "/content", stream=True, timeout_s=remaining
             ) as response:
                 with destination.open("xb") as output:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -138,7 +127,7 @@ class Cosmos3Client:
             # Delete this client's job; aborting GPU work depends on the server version.
             if job.get("status") != "completed":
                 try:
-                    self.request("DELETE", path, timeout=5).close()
+                    self.http_client.request("DELETE", path, timeout_s=5).close()
                 except Exception:
                     pass
             raise

@@ -4,6 +4,8 @@ The policy/world-model loop uses RLinf's existing evaluation workers. Start with
 
 `SGLangEmbodiedWorker` generates native normalized 10D actions. `EnvWorker` runs `Cosmos3Env`, which sends those exact actions to the same SGLang server for forward dynamics. `EmbodiedEvalRunner` feeds the final generated image back to the policy. This inference-only evaluation follows the existing rollout model configuration and does not launch an actor or perform training updates.
 
+Both roles use `InferenceHTTPClient` for HTTP transport. `Cosmos3Client` retains only video-job submission, polling, and download orchestration. Each worker owns its client instance; they connect to the same model server. Video submission has no automatic retries.
+
 The default uses one environment, one rollout stage, and one GPU. It starts from LIBERO-Spatial episode 1261, frame 0, then runs three chunks of 16 actions. Only the initial external/wrist images and instruction come from the dataset. Useful behavior depends on the checkpoint; the base Nano checkpoint is used first to exercise the pipeline.
 
 From the RLinf checkout, prepare a virtual environment within the current workspace:

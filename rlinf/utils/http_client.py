@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
+import weakref
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -58,16 +60,19 @@ def no_proxy_env() -> Iterator[None]:
 class InferenceHTTPClient:
     """Thin HTTP client for an sglang router or server base URL.
 
-    Both sync and async methods are provided. Async methods reuse a
-    single lazily-created :class:`aiohttp.ClientSession`, so call
-    :meth:`aclose` (or use ``async with``) to release sockets.
+    Sync methods reuse one requests session per calling thread; call :meth:`close`
+    or use ``with`` after all requests finish. Async methods reuse an aiohttp
+    session; :meth:`aclose` or ``async with`` releases both kinds of session.
+    Keep each client in its worker process.
 
 
     Example::
 
         # sync
-        client = InferenceHTTPClient("http://router:30000")
-        out = client.generate(prompt="Hello", sampling_params={"max_new_tokens": 16})
+        with InferenceHTTPClient("http://router:30000") as client:
+            out = client.generate(
+                prompt="Hello", sampling_params={"max_new_tokens": 16}
+            )
 
         # async
         async with InferenceHTTPClient("http://router:30000") as c:
@@ -90,6 +95,16 @@ class InferenceHTTPClient:
         self.connect_timeout = connect_timeout
         self.max_connections = max_connections
         self._session: Optional[aiohttp.ClientSession] = None
+        self._sync_sessions: weakref.WeakKeyDictionary[
+            threading.Thread, tuple[requests.Session, weakref.finalize]
+        ] = weakref.WeakKeyDictionary()
+        self._sync_session_lock = threading.Lock()
+        weakref.finalize(
+            self,
+            InferenceHTTPClient._close_sync_sessions,
+            self._sync_sessions,
+            self._sync_session_lock,
+        )
 
     # ------------------------------------------------------------------
     # Sync API
@@ -117,13 +132,9 @@ class InferenceHTTPClient:
 
     def health(self) -> bool:
         try:
-            r = requests.get(
-                f"{self.base_url}/health",
-                timeout=5,
-                proxies={"http": None, "https": None},
-            )
-            return r.status_code == 200
-        except requests.exceptions.RequestException:
+            with self.request("GET", "/health", timeout_s=5) as response:
+                return response.status_code == 200
+        except RuntimeError:
             return False
 
     # ------------------------------------------------------------------
@@ -164,6 +175,36 @@ class InferenceHTTPClient:
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
+    def _get_or_create_sync_session(self) -> requests.Session:
+        # Reward workers share a client across ephemeral thread pools. Weak thread
+        # ownership releases those pools without sharing mutable Session state.
+        thread = threading.current_thread()
+        with self._sync_session_lock:
+            if thread not in self._sync_sessions:
+                session = requests.Session()
+                cleanup = weakref.finalize(thread, session.close)
+                self._sync_sessions[thread] = (session, cleanup)
+            return self._sync_sessions[thread][0]
+
+    @staticmethod
+    def _close_sync_sessions(registry, lock) -> None:
+        # The GC callback must not retain the client whose lifetime it watches.
+        with lock:
+            sessions = list(registry.values())
+            registry.clear()
+        for _, cleanup in sessions:
+            cleanup()
+
+    def close(self) -> None:
+        """Close idle synchronous sessions; later requests can open new sessions."""
+        self._close_sync_sessions(self._sync_sessions, self._sync_session_lock)
+
+    def __enter__(self) -> "InferenceHTTPClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def _get_or_create_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             # limit         = total in-flight conns across all hosts
@@ -178,7 +219,8 @@ class InferenceHTTPClient:
         return self._session
 
     async def aclose(self) -> None:
-        """Close the underlying aiohttp session, if one was created."""
+        """Close both HTTP sessions, if created."""
+        self.close()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -209,6 +251,75 @@ class InferenceHTTPClient:
             body["sampling_params"] = sampling_params
         return body
 
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout_s: Optional[float] = None,
+        max_retries: int = 0,
+        retry_backoff_s: float = 0.0,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Send a synchronous request; the caller must close the returned response.
+
+        ``kwargs`` accepts requests options such as ``json``, ``data``, ``headers``
+        and ``stream``. ``timeout_s`` bounds each connect/read wait, not the full
+        transfer; connect waits are also bounded by ``connect_timeout``. Consume
+        streaming responses in the requesting thread before it exits. HTTP errors
+        and connection failures raise RuntimeError. Retries are opt-in, including
+        for POSTs whose repetition may create duplicate jobs. Environment proxies
+        are bypassed without changing environment CA or netrc settings.
+        """
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError("timeout_s must be positive or None")
+        method = method.upper()
+        url = f"{self.base_url}{path}"
+        retries = max(0, int(max_retries))
+        connect_timeout = self.connect_timeout
+        if timeout_s is not None:
+            connect_timeout = min(connect_timeout, timeout_s)
+        session = self._get_or_create_sync_session()
+        last_error: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            is_last = attempt >= retries
+            try:
+                response = session.request(
+                    method,
+                    url,
+                    timeout=(connect_timeout, timeout_s),
+                    proxies={"http": "", "https": "", "all": ""},
+                    **kwargs,
+                )
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                if is_last:
+                    raise RuntimeError(
+                        f"{method} {url} failed after {retries + 1} attempt(s): {exc}"
+                    ) from exc
+                self._sleep_before_retry(attempt, retry_backoff_s)
+                continue
+            if response.status_code in {500, 502, 503, 504} and not is_last:
+                try:
+                    last_error = RuntimeError(
+                        f"status={response.status_code}, body={response.text[:500]}"
+                    )
+                finally:
+                    response.close()
+                self._sleep_before_retry(attempt, retry_backoff_s)
+                continue
+            if not response.ok:
+                try:
+                    detail = (
+                        f"status={response.status_code}, body={response.text[:500]}"
+                    )
+                    if last_error is not None:
+                        detail += f" (after {retries + 1} attempt(s); prior error: {last_error})"
+                    raise RuntimeError(f"{method} {url} failed: {detail}")
+                finally:
+                    response.close()
+            return response
+
     def post(
         self,
         path: str,
@@ -219,22 +330,13 @@ class InferenceHTTPClient:
         max_retries: int = 0,
         retry_backoff_s: float = 0.0,
     ) -> dict:
-        """POST ``body`` to ``path`` and return the decoded response dict.
+        """POST a body and decode JSON or the SGLang msgpack envelope.
 
-        JSON by default. With ``msgpack=True`` the body (including torch tensors
-        / numpy arrays) is serialized with the sglang msgpack codec and the
-        response is msgpack-decoded; transient 5xx / connection errors are then
-        retried with linear backoff. Proxies are always stripped. Heavy deps
-        (sglang codec, torch, tianshou) are imported lazily so this module stays
-        importable without them.
+        Request retries and timeouts follow :meth:`request`. Model-specific codec
+        dependencies stay lazy so JSON callers do not need SGLang installed.
         """
-        url = f"{self.base_url}{path}"
-        retries = max(0, int(max_retries))
-        retry_statuses = {500, 502, 503, 504}
         if msgpack:
-            # 0.5.17+: sglang renamed vla/ -> action/; support both for
-            # compatibility with older sglang forks.
-
+            # SGLang renamed vla/ to action/; retain older fork compatibility.
             try:
                 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
                     pack_msgpack,
@@ -245,56 +347,29 @@ class InferenceHTTPClient:
                     pack_msgpack,
                     unpack_msgpack,
                 )
-
             ct = "application/msgpack"
             request_kwargs = {
                 "data": pack_msgpack(self._to_msgpackable(body)),
                 "headers": {"Content-Type": ct, "Accept": ct},
-                "timeout": timeout_s,
             }
         else:
-            # (connect, read) tuple: bound the TCP connect phase only.
-            request_kwargs = {
-                "json": body,
-                "timeout": (self.connect_timeout, timeout_s),
-            }
-
-        last_error: Optional[Exception] = None
-        for attempt in range(retries + 1):
-            is_last = attempt >= retries
-            try:
-                resp = requests.post(
-                    url, proxies={"http": None, "https": None}, **request_kwargs
-                )
-            except requests.exceptions.RequestException as exc:
-                last_error = exc
-                if is_last:
-                    raise RuntimeError(
-                        f"POST {url} failed after {retries + 1} attempt(s): {exc}"
-                    ) from exc
-                self._sleep_before_retry(attempt, retry_backoff_s)
-                continue
-            if resp.status_code in retry_statuses and not is_last:
-                last_error = RuntimeError(
-                    f"status={resp.status_code}, body={resp.text[:500]}"
-                )
-                self._sleep_before_retry(attempt, retry_backoff_s)
-                continue
-            if not resp.ok:
-                detail = f"status={resp.status_code}, body={resp.text[:500]}"
-                if last_error is not None:
-                    detail += (
-                        f" (after {retries + 1} attempt(s); prior error: {last_error})"
-                    )
-                raise RuntimeError(f"POST {url} failed: {detail}")
+            request_kwargs = {"json": body}
+        with self.request(
+            "POST",
+            path,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            retry_backoff_s=retry_backoff_s,
+            **request_kwargs,
+        ) as response:
             if msgpack:
-                if "msgpack" not in resp.headers.get("content-type", "").lower():
+                if "msgpack" not in response.headers.get("content-type", "").lower():
                     raise RuntimeError(
                         "expected a msgpack response, got content-type="
-                        f"{resp.headers.get('content-type')!r}"
+                        f"{response.headers.get('content-type')!r}"
                     )
-                return unpack_msgpack(resp.content)
-            return resp.json()
+                return unpack_msgpack(response.content)
+            return response.json()
 
     @staticmethod
     def _sleep_before_retry(attempt: int, retry_backoff_s: float) -> None:

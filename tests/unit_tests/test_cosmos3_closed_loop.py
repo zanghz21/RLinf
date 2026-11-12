@@ -125,6 +125,9 @@ class FakeSGLang:
                         }
                     )
                 elif self.path == "/v1/videos":
+                    if owner.mode == "submission_failed":
+                        self.respond({"error": "test submission failure"}, 503)
+                        return
                     job_id = f"video-{len(owner.jobs)}"
                     owner.jobs[job_id] = {"polls": 0, "index": len(owner.jobs)}
                     self.respond({"id": job_id, "status": "queued"})
@@ -373,6 +376,7 @@ def test_workers_preserve_actions_and_feed_back_generated_images(
         assert "return" not in metrics
     finally:
         env_worker.close_cosmos3_envs()
+        rollout.http_client.close()
 
     posts = [
         (path, body) for method, path, body in service.requests if method == "POST"
@@ -506,3 +510,19 @@ def test_env_rejects_reusing_artifact_directory(worker_config):
     with pytest.raises(FileExistsError):
         get_env_cls(cfg.env_type, cfg)(cfg=cfg, num_envs=1)
     assert sentinel.read_text() == "previous run"
+
+
+def test_video_submission_failure_is_not_retried(tmp_path, serve):
+    service = FakeSGLang(mode="submission_failed")
+    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
+    try:
+        with pytest.raises(RuntimeError, match="test submission failure"):
+            client.generate_video(
+                {"action_mode": "forward_dynamics"}, tmp_path / "prediction.mp4"
+            )
+    finally:
+        client.close()
+    assert [(method, path) for method, path, _ in service.requests] == [
+        ("POST", "/v1/videos")
+    ]
+    assert not service.jobs

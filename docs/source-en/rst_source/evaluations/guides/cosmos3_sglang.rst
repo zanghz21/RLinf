@@ -120,6 +120,8 @@ Run a Learned World Model Loop
 
 Use the existing evaluation workers to run Cosmos3 as both policy and world model. ``SGLangEmbodiedWorker`` requests actions; ``EnvWorker`` runs ``Cosmos3Env`` and sends those unchanged normalized 10D actions to the same server for forward prediction. ``EmbodiedEvalRunner`` feeds the final generated frame into the next policy call. This inference-only flow uses the rollout model configuration and omits the actor process and training updates.
 
+Both roles use ``InferenceHTTPClient`` for HTTP transport. ``Cosmos3Client`` handles video-job submission, polling, and downloading through that client. Each worker owns its own client instance and connects to the same model server; video submission has no automatic retries.
+
 Configure ``examples/embodiment/config/cosmos3_closed_loop.yaml`` with your checkpoint and LeRobot dataset paths. The default selects LIBERO-Spatial episode ``1261``, frame ``0``, dataset task index ``30``. It concatenates external and wrist views, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset's 10 FPS metadata is recorded separately because initialization uses one still observation. Subsequent observations come from generated video.
 
 Prepare the environment inside your workspace, following the :download:`runtime instructions <../../../../../toolkits/cosmos3/README.md>`. The example requirements pin SGLang 0.5.19 and Torch 2.13.0; ``uv --no-config pip install`` avoids the repository's general Torch override. Reuse your workspace's ``../.venv`` when it is already prepared. From the RLinf checkout, run three cycles:
