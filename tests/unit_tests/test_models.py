@@ -2936,6 +2936,140 @@ def test_psi0_rtc_prefix_survives_the_last_denoise_step():
     assert torch.all(transition.logprobs[:, :overlap] == 0)
 
 
+@pytest.mark.parametrize("noise_level", [0.0, 0.5, 1.0])
+def test_openpi_cps_preserves_sample_and_noise_coefficients(noise_level):
+    from rlinf.models.embodiment.openpi.sampling.rl_sampler import sample_mean_var
+
+    times = torch.tensor([1.0, 0.75, 0.5, 0.25])
+    next_times = times - 0.25
+    # Orthogonal endpoints expose the sample and predicted-noise coefficients.
+    samples = torch.stack([1 - times, times], dim=-1)[:, None, :]
+    velocity = torch.tensor([-1.0, 1.0]).expand_as(samples)
+    mean, std = sample_mean_var(
+        samples,
+        velocity,
+        torch.arange(4),
+        noise_method="flow_cps",
+        noise_level=noise_level,
+        num_steps=4,
+    )
+
+    torch.testing.assert_close(mean[:, 0, 0], 1 - next_times)
+    torch.testing.assert_close(
+        mean[:, 0, 1].square() + std[:, 0, 1].square(), next_times.square()
+    )
+    assert torch.all(std >= 0)
+    assert torch.count_nonzero(std[-1]) == 0
+    if noise_level == 0:
+        torch.testing.assert_close(mean, samples - 0.25 * velocity)
+        assert torch.count_nonzero(std) == 0
+
+
+@pytest.mark.parametrize("mode", ["gaussian", "squared_error"])
+def test_openpi_cps_terminal_transition_is_excluded_from_ratio(mode):
+    from rlinf.models.embodiment.openpi.sampling.rl_sampler import (
+        sample_mean_var,
+        transition_logprob,
+    )
+
+    sample = torch.ones(1, 2, 3)
+    velocity = torch.ones_like(sample, requires_grad=True)
+    mean, std = sample_mean_var(
+        sample,
+        velocity,
+        torch.tensor([3]),
+        noise_method="flow_cps",
+        noise_level=0.5,
+        num_steps=4,
+    )
+    score = transition_logprob(
+        sample,
+        mean,
+        std,
+        noise_method="flow_cps",
+        cps_logprob_mode=mode,
+    )
+    torch.testing.assert_close(mean, sample - 0.25 * velocity)
+    assert torch.count_nonzero(std) == 0
+    assert torch.count_nonzero(score) == 0
+    score.sum().backward()
+    assert torch.count_nonzero(velocity.grad) == 0
+
+
+@pytest.mark.parametrize("mode", ["gaussian", "squared_error"])
+def test_openpi_cps_score_ratio_and_gradient(mode):
+    from rlinf.models.embodiment.openpi.sampling.rl_sampler import transition_logprob
+
+    sample = torch.tensor([0.3, -0.2])
+    old_mean = torch.tensor([0.1, 0.0])
+    mean = torch.tensor([0.15, -0.05], requires_grad=True)
+    std = torch.tensor([0.25, 0.5])
+    scores = [
+        transition_logprob(
+            sample,
+            mu,
+            std,
+            noise_method="flow_cps",
+            cps_logprob_mode=mode,
+        )
+        for mu in (old_mean, mean)
+    ]
+    weight = 1 / (2 * std.square()) if mode == "gaussian" else torch.ones_like(std)
+    expected_score = (
+        torch.distributions.Normal(mean, std).log_prob(sample)
+        if mode == "gaussian"
+        else -(sample - mean).square()
+    )
+    torch.testing.assert_close(scores[1], expected_score)
+    ratio = (scores[1] - scores[0]).sum().exp()
+    expected_ratio = (
+        weight * ((sample - old_mean).square() - (sample - mean).square())
+    ).sum().exp()
+    torch.testing.assert_close(ratio, expected_ratio)
+    ratio.backward()
+    torch.testing.assert_close(mean.grad, 2 * weight * (sample - mean) * ratio)
+
+
+@pytest.mark.parametrize(
+    "overrides,num_steps,error",
+    [
+        ({"noise_level": 0.0}, 4, "noise_level"),
+        ({"noise_level": -0.1}, 4, "noise_level"),
+        ({"noise_level": 1.1}, 4, "noise_level"),
+        ({"noise_level": float("nan")}, 4, "noise_level"),
+        ({}, 1, "num_steps"),
+        ({"ignore_last": False}, 4, "ignore_last=True"),
+        ({"is_nft": True}, 4, "is_nft=False"),
+        ({"cps_logprob_mode": "invalid"}, 4, "cps_logprob_mode"),
+        ({"noise_method": "flow_sde"}, 4, "requires noise_method='flow_cps'"),
+    ],
+)
+def test_openpi_cps_rejects_invalid_rl_settings(overrides, num_steps, error):
+    from rlinf.models.embodiment.openpi.tasks.rl import Pi0RLConfig
+
+    settings = {
+        "noise_method": "flow_cps",
+        "noise_level": 0.5,
+        "cps_logprob_mode": "squared_error",
+        "ignore_last": True,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=error):
+        Pi0RLConfig(**settings).validate(num_steps)
+
+
+@pytest.mark.parametrize("mode", ["gaussian", "squared_error"])
+def test_openpi_cps_accepts_selected_step_rl_settings(mode):
+    from rlinf.models.embodiment.openpi.tasks.rl import Pi0RLConfig
+
+    Pi0RLConfig(
+        noise_method="flow_cps",
+        noise_level=1.0,
+        cps_logprob_mode=mode,
+        ignore_last=True,
+    ).validate(2)
+
+
 @pytest.mark.parametrize("step", [0, 4, 9])
 def test_lingbotvlav2_sde_has_finite_first_and_last_step_density(step):
     from rlinf.models.embodiment.lingbotvlav2.utils import (

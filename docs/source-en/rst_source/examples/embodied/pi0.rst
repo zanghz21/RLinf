@@ -335,16 +335,17 @@ The following is an ``openpi`` example. Launch it with
          num_steps: ${..num_steps}
          train_expert_only: True
          action_env_dim: ${..action_dim}
-         noise_method: "flow_sde" # flow_sde, flow_noise
+         noise_method: "flow_sde" # flow_sde, flow_noise, flow_cps
          add_value_head: ${..add_value_head}
          value_after_vlm: False
 
 - Set different flow-matching steps via ``num_steps``.
 
-- Use different noise injection methods by modifying ``noise_method``. We provide two options:
-  `flow_sde <https://arxiv.org/abs/2505.05470>`__ and
-  `flow_noise <https://arxiv.org/abs/2505.22094>`__.
-  ``noise_level`` controls the noise intensity for ``flow_sde``, and ``noise_logvar_range`` controls the learnable noise range for ``flow_noise``.
+- Set ``noise_method`` to `flow_sde <https://arxiv.org/abs/2505.05470>`__,
+  `flow_noise <https://arxiv.org/abs/2505.22094>`__, or the experimental
+  :ref:`flow_cps <pi0-flow-cps>` recipe below.
+  ``noise_level`` controls the noise intensity for ``flow_sde`` and ``flow_cps``;
+  ``noise_logvar_range`` controls the learnable noise range for ``flow_noise``.
 
 - Select π\ :sub:`0.5`\  through ``openpi.config_name`` (e.g. ``pi05_libero``).
   With ``openpi``, also set ``actor.model.pi05: True``; it defaults to
@@ -477,6 +478,113 @@ the LIBERO environment, run:
    bash examples/embodiment/run_embodiment.sh libero_spatial_ppo_openpi_quickstart
 
 --------------
+
+.. _pi0-flow-cps:
+
+Try Flow-CPS on LIBERO Spatial
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``libero_spatial_ppo_openpi_flow_cps`` to fine-tune π₀ with
+coefficients-preserving sampling. This experimental recipe combines the
+sampling rule from `Flow-CPS <https://arxiv.org/abs/2509.05952v4>`__ with the
+single-step PPO update in `πRL <https://arxiv.org/abs/2510.25889>`__.
+Its Ubuntu smoke test and training curves are still pending; the results below
+do not describe this recipe.
+
+At noise time :math:`t`, let :math:`s=t-\Delta t`,
+:math:`\hat{x}_0=x_t-tv_\theta`, and
+:math:`\hat{x}_1=x_t+(1-t)v_\theta`. Equation 13 of Flow-CPS gives:
+
+.. math::
+
+   \mu_\theta=(1-s)\hat{x}_0+s\cos(\eta\pi/2)\hat{x}_1,
+   \qquad \sigma=s\sin(\eta\pi/2),
+   \qquad x_s=\mu_\theta+\sigma\epsilon,\quad
+   \epsilon\sim\mathcal{N}(0,I).
+
+The two noise coefficients have squared sum :math:`s^2`, matching the next
+noise time. The recipe uses four denoising steps and randomly selects one of
+the first three for CPS. The remaining steps use Euler ODE, including the
+final transition where :math:`s=0`. Evaluation also uses Euler ODE. This is an
+adaptation to πRL's hybrid rollout, rather than the paper's full image-GRPO
+training procedure.
+
+The recipe sets these fields under ``actor.model.openpi``:
+
+.. code-block:: yaml
+
+   noise_method: flow_cps
+   noise_level: 0.5
+   cps_logprob_mode: squared_error
+   joint_logprob: False
+   ignore_last: True
+
+``noise_level`` is :math:`\eta`; use a finite value in :math:`(0,1]` for
+training. Keep at least two denoising steps and ``ignore_last: True`` so PPO
+selects a transition with nonzero variance. Use this recipe with the
+HuggingFace rollout backend and PPO; CPS is not supported by NFT training.
+
+``squared_error`` follows Equation 15: each element contributes
+:math:`-(x_s-\mu_\theta)^2` to the policy score. The existing
+``algorithm.logprob_type: chunk_level`` sums these scores over the executed
+action chunk and environment action dimensions. Both rollout collection and
+actor recomputation use the same rule. This score is a surrogate, not a
+normalized Gaussian log-likelihood; the PPO ratio is the exponential of its
+change. To isolate the sampler change while retaining Gaussian transition
+log-likelihoods, set ``actor.model.openpi.cps_logprob_mode=gaussian``. Keep
+``algorithm.kl_beta=0`` for the squared-error recipe; the paper's separate
+squared-distance KL surrogate in Equation 16 is not implemented here.
+In this mode, ``approx_kl`` reflects score differences rather than a true KL
+divergence, so compare it only across runs with the same scoring mode.
+
+After installing OpenPI and LIBERO and downloading the Spatial-Object-Goal
+checkpoint above, run from the repository root in the activated environment:
+
+.. code-block:: bash
+
+   export EMBODIED_PATH="$PWD/examples/embodiment"
+   export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+   export MUJOCO_GL=egl
+   export PYOPENGL_PLATFORM=egl
+   export ROBOT_PLATFORM=LIBERO
+   export LIBERO_TYPE=standard
+   CPS_MODEL_PATH=/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+   CPS_ARGS=(
+     --config-name libero_spatial_ppo_openpi_flow_cps
+     "actor.model.model_path=$CPS_MODEL_PATH"
+     "rollout.model.model_path=$CPS_MODEL_PATH"
+     runner.logger.log_path=logs/pi0_flow_cps
+   )
+   python examples/embodiment/train_embodied_agent.py "${CPS_ARGS[@]}"
+
+Replace ``CPS_MODEL_PATH`` with the local checkpoint directory. This launches
+the full recipe with the baseline's 64 training environments, eight rollout
+epochs, and PPO batch sizes. Adjust placement and batch sizes to your server
+as described above. To run the Gaussian ablation, append
+``actor.model.openpi.cps_logprob_mode=gaussian`` and use a different log path.
+
+For an initial single-GPU smoke run, use the same setup and argument array,
+but replace the final Python command with:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 python examples/embodiment/train_embodied_agent.py \
+     "${CPS_ARGS[@]}" \
+     runner.logger.log_path=logs/pi0_flow_cps_smoke \
+     runner.max_steps=2 runner.save_interval=-1 runner.val_check_interval=-1 \
+     env.train.total_num_envs=4 env.train.rollout_epoch=1 \
+     env.train.max_steps_per_rollout_epoch=20 env.train.max_episode_steps=20 \
+     env.train.video_cfg.save_video=False \
+     actor.micro_batch_size=1 actor.global_batch_size=16 \
+     actor.enable_offload=True rollout.enable_offload=True \
+     algorithm.update_epoch=1
+
+This reduces rollout length and batch sizes to exercise collection and two
+training iterations. It still needs a GPU with enough memory for π₀ and its
+training state. Check that losses and ratios stay finite and that both
+iterations complete before launching a full experiment. Twenty environment
+steps are too short to assess LIBERO success rates; compare training curves
+only with the full episode horizon and matched budgets.
 
 .. _pi0-hardware:
 

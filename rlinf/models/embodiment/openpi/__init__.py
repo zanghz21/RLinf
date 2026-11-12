@@ -178,6 +178,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
                 OmegaConf.select(model_cfg, "noise_method", default="flow_ode")
             ),
             noise_level=float(OmegaConf.select(model_cfg, "noise_level", default=0.0)),
+            cps_logprob_mode=str(
+                OmegaConf.select(model_cfg, "cps_logprob_mode", default="gaussian")
+            ),
             noise_logvar_range=tuple(float(x) for x in noise_logvar),
             joint_logprob=bool(
                 OmegaConf.select(model_cfg, "joint_logprob", default=False)

@@ -62,6 +62,12 @@ def sample_mean_var(
         x1_weight = (t_input - delta) - sigma_i * sigma_i * delta / (2 * t_input)
         x_t_std = torch.sqrt(delta) * sigma_i
     elif noise_method == "flow_cps":
+        if not 0.0 <= noise_level <= 1.0:
+            raise ValueError(
+                f"flow_cps requires noise_level in [0, 1], got {noise_level}."
+            )
+        # Flow-CPS Eq. (13), arXiv:2509.05952: the two noise coefficients
+        # have squared sum t_next**2, and the final transition is deterministic.
         pi = torch.pi
         level = torch.as_tensor(noise_level, device=device, dtype=x_t.dtype)
         cos_term = torch.cos(pi * level / 2)
@@ -108,6 +114,32 @@ def gaussian_entropy(sigma: torch.Tensor) -> torch.Tensor:
     sigma_safe = torch.where(mask, torch.ones_like(sigma), sigma)
     entropy = 0.5 * torch.log(2 * math.pi * math.e * (sigma_safe**2))
     return torch.where(mask, torch.zeros_like(entropy), entropy)
+
+
+def transition_logprob(
+    sample: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    noise_method: str,
+    cps_logprob_mode: str = "gaussian",
+) -> torch.Tensor:
+    """Return per-element transition scores for the PPO probability ratio.
+
+    CPS ``squared_error`` uses Eq. (15) of arXiv:2509.05952, an unnormalized
+    score rather than a Gaussian log-density. Deterministic transitions are
+    excluded in both modes. Action/chunk reduction belongs to the caller.
+    """
+    if noise_method == "flow_cps":
+        if cps_logprob_mode == "squared_error":
+            score = -(sample - mu).square()
+            return torch.where(sigma == 0, torch.zeros_like(score), score)
+        if cps_logprob_mode != "gaussian":
+            raise ValueError(
+                "Expected cps_logprob_mode 'gaussian' or 'squared_error', "
+                f"got {cps_logprob_mode!r}."
+            )
+    return gaussian_logprob(sample, mu, sigma)
 
 
 def _cast_for_value_head(

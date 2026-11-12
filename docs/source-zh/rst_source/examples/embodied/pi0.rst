@@ -311,13 +311,13 @@ LIBERO PPO 常见写法是 ``num_action_chunks: 5``，而 ``pi0_libero`` 官方 
          num_steps: ${..num_steps}
          train_expert_only: True
          action_env_dim: ${..action_dim}
-         noise_method: "flow_sde" # flow_sde, flow_noise
+         noise_method: "flow_sde" # flow_sde, flow_noise, flow_cps
          add_value_head: ${..add_value_head}
          value_after_vlm: False
 
 - 通过 ``num_steps`` 设置不同的流匹配步数。
 
-- 通过修改 ``noise_method`` 使用不同的加噪方式。我们提供\ `flow_sde <https://arxiv.org/abs/2505.05470>`__\ 和\ `flow_noise <https://arxiv.org/abs/2505.22094>`__\ 两种方式。其中 ``noise_level`` 用于控制 ``flow_sde`` 的加噪强度，``noise_logvar_range`` 用于控制 ``flow_noise`` 的可学习噪声范围。
+- 将 ``noise_method`` 设为 `flow_sde <https://arxiv.org/abs/2505.05470>`__、`flow_noise <https://arxiv.org/abs/2505.22094>`__ 或下文的实验性 :ref:`flow_cps <pi0-flow-cps>` 配置。``noise_level`` 控制 ``flow_sde`` 和 ``flow_cps`` 的加噪强度，``noise_logvar_range`` 控制 ``flow_noise`` 的可学习噪声范围。
 
 - 通过 ``openpi.config_name`` 选择 π\ :sub:`0.5`\ （例如 ``pi05_libero``）。``openpi`` 还需设置 ``actor.model.pi05: True``；省略时默认为 True，``model/pi0`` 会显式设为 False。
 
@@ -440,6 +440,76 @@ OpenPI 支持 FSDP1 的 ``no_shard``、``shard_grad_op`` 和 ``full_shard``。
 ::
 
    bash examples/embodiment/run_embodiment.sh libero_spatial_ppo_openpi_quickstart
+
+.. _pi0-flow-cps:
+
+在 LIBERO Spatial 上尝试 Flow-CPS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+使用 ``libero_spatial_ppo_openpi_flow_cps`` 配置，通过系数保持采样微调 π₀。这个实验配置将 `Flow-CPS <https://arxiv.org/abs/2509.05952v4>`__ 的采样公式接入 `πRL <https://arxiv.org/abs/2510.25889>`__ 的单步 PPO 更新。Ubuntu smoke test 和训练曲线尚待验证；下文已有的实验结果不包含这套配置。
+
+设当前噪声时刻为 :math:`t`，下一时刻为 :math:`s=t-\Delta t`，模型预测 :math:`\hat{x}_0=x_t-tv_\theta` 和 :math:`\hat{x}_1=x_t+(1-t)v_\theta`。Flow-CPS 论文的公式 13 为：
+
+.. math::
+
+   \mu_\theta=(1-s)\hat{x}_0+s\cos(\eta\pi/2)\hat{x}_1,
+   \qquad \sigma=s\sin(\eta\pi/2),
+   \qquad x_s=\mu_\theta+\sigma\epsilon,\quad
+   \epsilon\sim\mathcal{N}(0,I).
+
+两个噪声系数的平方和为 :math:`s^2`，与下一时刻的噪声水平一致。配置采用四步去噪，每次从前三步随机选一步使用 CPS，其余步骤使用 Euler ODE，最后一步 :math:`s=0` 也使用 ODE。评估阶段全部使用 Euler ODE。这是对 πRL 混合采样流程的改造，并非完整复现论文中的图像 GRPO 训练流程。
+
+配置在 ``actor.model.openpi`` 下设置以下字段：
+
+.. code-block:: yaml
+
+   noise_method: flow_cps
+   noise_level: 0.5
+   cps_logprob_mode: squared_error
+   joint_logprob: False
+   ignore_last: True
+
+``noise_level`` 对应 :math:`\eta`，训练时应设为 :math:`(0,1]` 内的有限数。保留至少两步去噪和 ``ignore_last: True``，确保 PPO 选中的转移具有非零方差。这套配置使用 HuggingFace rollout backend 和 PPO；NFT 训练不支持 CPS。
+
+``squared_error`` 对应公式 15：每个元素以 :math:`-(x_s-\mu_\theta)^2` 作为 policy score。已有的 ``algorithm.logprob_type: chunk_level`` 会对实际执行的动作块和环境动作维度求和，rollout 采集与 actor 重算采用同一规则。该 score 是 surrogate，不是归一化的高斯对数似然；PPO ratio 由新旧 score 之差取指数得到。若要保留高斯转移对数似然、单独比较采样器的影响，将 ``actor.model.openpi.cps_logprob_mode`` 设为 ``gaussian``。使用平方误差配置时保留 ``algorithm.kl_beta=0``；这里尚未实现论文公式 16 中单独的平方距离 KL surrogate。该模式下的 ``approx_kl`` 反映 score 差异，而非真实的 KL 散度，应在采用相同 score 模式的实验之间比较。
+
+按照前文安装 OpenPI 和 LIBERO、下载 Spatial-Object-Goal checkpoint 后，在已激活环境的仓库根目录运行：
+
+.. code-block:: bash
+
+   export EMBODIED_PATH="$PWD/examples/embodiment"
+   export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+   export MUJOCO_GL=egl
+   export PYOPENGL_PLATFORM=egl
+   export ROBOT_PLATFORM=LIBERO
+   export LIBERO_TYPE=standard
+   CPS_MODEL_PATH=/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+   CPS_ARGS=(
+     --config-name libero_spatial_ppo_openpi_flow_cps
+     "actor.model.model_path=$CPS_MODEL_PATH"
+     "rollout.model.model_path=$CPS_MODEL_PATH"
+     runner.logger.log_path=logs/pi0_flow_cps
+   )
+   python examples/embodiment/train_embodied_agent.py "${CPS_ARGS[@]}"
+
+将 ``CPS_MODEL_PATH`` 替换为本地 checkpoint 目录。该命令沿用基线的 64 个训练环境、8 个 rollout epoch 和 PPO batch size。根据服务器资源，按前文说明调整 placement 和 batch size。运行 Gaussian 消融实验时，追加 ``actor.model.openpi.cps_logprob_mode=gaussian``，并使用不同的日志目录。
+
+首次在单张 GPU 上做 smoke test 时，保留上述环境变量与参数数组，将最后一条 Python 命令替换为：
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 python examples/embodiment/train_embodied_agent.py \
+     "${CPS_ARGS[@]}" \
+     runner.logger.log_path=logs/pi0_flow_cps_smoke \
+     runner.max_steps=2 runner.save_interval=-1 runner.val_check_interval=-1 \
+     env.train.total_num_envs=4 env.train.rollout_epoch=1 \
+     env.train.max_steps_per_rollout_epoch=20 env.train.max_episode_steps=20 \
+     env.train.video_cfg.save_video=False \
+     actor.micro_batch_size=1 actor.global_batch_size=16 \
+     actor.enable_offload=True rollout.enable_offload=True \
+     algorithm.update_epoch=1
+
+这条命令缩短 rollout、减小 batch size，用于检查数据采集和两个训练迭代能否完成，仍需足以容纳 π₀ 及其训练状态的 GPU 显存。正式实验前，检查 loss 和 ratio 是否为有限数，并确认两个迭代均已结束。20 个环境步不足以衡量 LIBERO 成功率；比较训练曲线时应恢复完整 episode 长度，并保持实验预算一致。
 
 .. _pi0-hardware:
 

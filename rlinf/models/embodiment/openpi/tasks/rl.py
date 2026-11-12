@@ -43,6 +43,7 @@ class Pi0RLConfig:
     add_value_head: bool = False
     noise_method: str = "flow_ode"
     noise_level: float = 0.0
+    cps_logprob_mode: str = "gaussian"
     noise_logvar_range: tuple[float, float] = (0.08, 0.16)
     joint_logprob: bool = False
     ignore_last: bool = False
@@ -54,6 +55,40 @@ class Pi0RLConfig:
     train_expert_only: bool = False
     is_nft: bool = False
     config_name: str = ""
+
+    def validate(self, num_steps: int) -> None:
+        """Reject CPS RL settings without a stochastic training transition."""
+        if self.cps_logprob_mode not in {"gaussian", "squared_error"}:
+            raise ValueError(
+                "Expected openpi.cps_logprob_mode 'gaussian' or 'squared_error', "
+                f"got {self.cps_logprob_mode!r}."
+            )
+        if self.noise_method != "flow_cps":
+            if self.cps_logprob_mode != "gaussian":
+                raise ValueError(
+                    "openpi.cps_logprob_mode='squared_error' requires "
+                    f"noise_method='flow_cps', got {self.noise_method!r}."
+                )
+            return
+        if not 0.0 < self.noise_level <= 1.0:
+            raise ValueError(
+                "Flow-CPS RL requires openpi.noise_level in (0, 1], "
+                f"got {self.noise_level}."
+            )
+        if num_steps < 2:
+            raise ValueError(
+                f"Flow-CPS RL requires num_steps >= 2, got {num_steps}."
+            )
+        if self.is_nft:
+            raise ValueError(
+                "Flow-CPS RL requires openpi.is_nft=False; "
+                "NFT reconstructs Flow-SDE transitions."
+            )
+        if not self.joint_logprob and not self.ignore_last:
+            raise ValueError(
+                "Flow-CPS with joint_logprob=False requires openpi.ignore_last=True; "
+                "the final transition has zero variance."
+            )
 
 
 class Pi0RL(EnvIO, Pi0):
@@ -70,6 +105,7 @@ class Pi0RL(EnvIO, Pi0):
         config_name: str = "",
         state_indices: Sequence[int] | None = None,
     ):
+        rl_cfg.validate(num_steps)
         super().__init__(
             config,
             num_steps=num_steps,
@@ -266,7 +302,15 @@ class Pi0RL(EnvIO, Pi0):
             )
             x_t = x_t_mean + step_noise * x_t_std
             self._update_nft_state(nft_state, idx, x_t_prev, v_t, x_t, method)
-            log_probs.append(rl_sampler.gaussian_logprob(x_t, x_t_mean, x_t_std))
+            log_probs.append(
+                rl_sampler.transition_logprob(
+                    x_t,
+                    x_t_mean,
+                    x_t_std,
+                    noise_method=method,
+                    cps_logprob_mode=rl_cfg.cps_logprob_mode,
+                )
+            )
             chains.append(x_t)
             if compute_values and rl_cfg.add_value_head and not rl_cfg.value_after_vlm:
                 suffix_values.append(
@@ -479,8 +523,12 @@ class Pi0RL(EnvIO, Pi0):
                 noise_std=noise_std,
             )
             step_logprobs.append(
-                rl_sampler.gaussian_logprob(
-                    chains_next.to(torch.float32), x_t_mean, x_t_std
+                rl_sampler.transition_logprob(
+                    chains_next.to(torch.float32),
+                    x_t_mean,
+                    x_t_std,
+                    noise_method=rl_cfg.noise_method,
+                    cps_logprob_mode=rl_cfg.cps_logprob_mode,
                 )
             )
             step_entropy.append(rl_sampler.gaussian_entropy(x_t_std))
