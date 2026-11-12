@@ -3,6 +3,8 @@ Cosmos3 SGLang 评测
 
 用 SGLang 后端在 LIBERO 仿真器上评测 Cosmos3：模型放进独立的 SGLang server 进程，rollout worker 作为客户端发观测、收动作、送入仿真。适用于只做推理评测的场景。
 
+如果还希望由 Cosmos3 预测下一次观测，使用 :ref:`cosmos3-learned-loop`。该流程从 LIBERO-Spatial 的记录图像开始，验证模型生成的观测能否持续反馈；下面的仿真评测流程则用于统计任务成功率。
+
 工作原理
 ----------------------------------------
 
@@ -110,6 +112,28 @@ server 只会把 token 长度相同的 prompt 放在同一批，因此 ``Cosmos3
 5. 汇总：``success_once`` / ``success_at_end`` / ``num_trajectories``
 
 LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
+
+.. _cosmos3-learned-loop:
+
+运行模型生成的观测闭环
+----------------------------------------
+
+从一帧 LIBERO-Spatial 记录观测开始，用同一个 Cosmos3 checkpoint 生成动作和后续观测。工具先调用 policy，将其输出的归一化 10 维动作原样传给 forward dynamics，再把生成视频的最后一帧作为下一轮观测。获得微调 checkpoint 之前，可以用 Nano 基础模型验证这条数据通路；任务成功率和图像准确性需要单独评估。
+
+在 ``toolkits/cosmos3/config/closed_loop_nano.yaml`` 中设置 checkpoint 和 LeRobot 数据集路径。示例选择 episode ``1261``、frame ``0``、数据集 task index ``30``，任务是将 cookie box 旁的黑碗放到盘子上。每次输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。源数据集记录为 10 FPS；闭环只取其中一帧作为初始观测，因此会分别记录源数据和模型生成的帧率。
+
+使用同时支持动作 endpoint 和动作条件视频生成的 SGLang runtime。运行环境要求和完整命令见 :download:`工具 README <../../../../../toolkits/cosmos3/README.md>`。在 RLinf 根目录选择一张可用 GPU，先运行一轮：
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 COSMOS_PYTHON=/path/to/venv/bin/python \
+     bash toolkits/cosmos3/run_closed_loop_task.sh \
+     --output-dir /shared/cosmos3/runs/one-cycle \
+     --cycles 1
+
+该命令启动一个模型 server，读取初始图像和指令，完成两次模型调用并保存结果，最后关闭自己启动的 server。一轮成功后，换用新的输出目录并传入 ``--cycles 3``，验证观测反馈。传入 ``--server-url http://127.0.0.1:30000`` 可复用已有的兼容 server；runner 会核对模型身份，并在退出时保留该 server。
+
+检查保存的原始动作与条件动作数组、逐轮图像、生成视频、最终配置和 manifest。每轮输入必须来自上一轮的生成结果，forward dynamics 的条件动作必须与 policy 输出一致。较长实验可在提交的计算任务中调用同一脚本，使用共享存储路径，并通过 ``--task-id`` 记录任务标识。脚本在已分配的资源中执行，不负责提交任务。
 
 常见问题
 ----------------------------------------

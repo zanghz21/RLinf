@@ -177,6 +177,9 @@ jobs:
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
               - *shared
+              - 'toolkits/cosmos3/closed_loop_*.py'
+              - 'toolkits/cosmos3/run_closed_loop.py'
+              - 'toolkits/cosmos3/config/closed_loop_nano.yaml'
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the
               # real-world compatibility suite, maniskill offload, delay

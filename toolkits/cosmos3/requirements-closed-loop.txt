@@ -1,0 +1,8 @@
+# Install in the isolated server environment. The pin fixes both HTTP schemas.
+sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@0bcd822377da7b5718e674eaf9c870d349424dd1#subdirectory=python
+numpy
+Pillow
+pyarrow>=15,<26
+PyYAML
+requests
+imageio[ffmpeg]

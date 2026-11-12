@@ -3,6 +3,8 @@ Cosmos3 SGLang Evaluation
 
 Evaluate Cosmos3 on the LIBERO simulator using the SGLang backend: the model runs in a standalone SGLang server process, and rollout workers act as clients that send observations, receive action commands, and feed them into the simulation. Suitable for inference-only evaluation scenarios.
 
+To check a pipeline in which Cosmos3 also predicts the next observation, use :ref:`cosmos3-learned-loop`. That workflow starts from a recorded LIBERO-Spatial image and tests generated feedback; simulator task-success evaluation uses the workflow below.
+
 How It Works
 ----------------------------------------
 
@@ -110,6 +112,28 @@ Check ``eval_embodiment.log`` and confirm these milestones appear in order:
 5. Summary: ``success_once`` / ``success_at_end`` / ``num_trajectories``
 
 LIBERO trajectory counting rules: see :ref:`libero-eval-config`.
+
+.. _cosmos3-learned-loop:
+
+Run a Learned World Model Loop
+----------------------------------------
+
+Start from one recorded LIBERO-Spatial observation and let the same Cosmos3 checkpoint generate both actions and future observations. The toolkit calls the policy first, supplies its unchanged normalized 10D actions to forward dynamics, and feeds the final generated frame into the next cycle. A base Nano checkpoint can test this connection before a tuned checkpoint is available; task success and visual accuracy are separate evaluations.
+
+Configure ``toolkits/cosmos3/config/closed_loop_nano.yaml`` with your checkpoint and LeRobot dataset paths. The example selects episode ``1261``, frame ``0``, and dataset task index ``30``: pick up the black bowl next to the cookie box and place it on the plate. It concatenates the external and wrist cameras, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset reports 10 FPS, which is recorded separately because only one still observation initializes this loop.
+
+Use a SGLang runtime that supports both the action endpoint and action-conditioned video generation. See the :download:`toolkit README <../../../../../toolkits/cosmos3/README.md>` for runtime requirements and the full invocation. From the RLinf checkout, run one cycle on an available GPU:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 COSMOS_PYTHON=/path/to/venv/bin/python \
+     bash toolkits/cosmos3/run_closed_loop_task.sh \
+     --output-dir /shared/cosmos3/runs/one-cycle \
+     --cycles 1
+
+This command starts one model server, reads the initial images and instruction, makes both model calls, saves the trace, and stops its server. Once it succeeds, choose a new output directory and pass ``--cycles 3`` to check observation feedback. Use ``--server-url http://127.0.0.1:30000`` to reuse an existing compatible server; the runner checks its model identity and leaves it running.
+
+Inspect the saved native and conditioning action arrays, per-cycle images, generated video, resolved configuration, and manifest. Consecutive cycles must reuse the preceding generated frame, and the conditioning actions must match the policy output. Use the same launcher within a submitted compute task, with shared asset/output paths and ``--task-id`` to record its identifier. The launcher executes within your allocation; it does not submit jobs.
 
 FAQ
 ----------------------------------------
