@@ -1,0 +1,116 @@
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: 0
+
+runner:
+  task_type: embodied_eval
+  only_eval: true
+  max_epochs: 1
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+  logger:
+    log_path: ../results/cosmos3_closed_loop
+    project_name: rlinf
+    experiment_name: cosmos3_closed_loop
+    logger_backends: [tensorboard]
+
+env:
+  group_name: EnvGroup
+  eval:
+    env_type: cosmos3
+    is_eval: true
+    total_num_envs: 1
+    group_size: 1
+    rollout_epoch: 1
+    auto_reset: false
+    ignore_terminations: true
+    max_episode_steps: 48
+    max_steps_per_rollout_epoch: 48
+    seed: 1140
+    enable_offload: false
+    use_fixed_reset_state_ids: true
+    artifact_dir: ${runner.logger.log_path}/artifacts
+    dataset:
+      root: /mnt/public2/hongzhi/dataset/physical-intelligence/libero
+      episode_index: 1261
+      frame_index: 0
+    generation:
+      domain_name: libero
+      raw_action_dim: 10
+      num_frames: 17
+      width: 320
+      height: 192
+      fps: 20
+      action_fps: 20.0
+      action_view_point: ego_view
+      num_inference_steps: 30
+      seed: 1140
+    server:
+      request_timeout_s: 1800
+      poll_interval_s: 1
+    video_cfg:
+      save_video: false
+
+rollout:
+  group_name: RolloutGroup
+  rollout_backend: sglang
+  enable_offload: false
+  pipeline_stage_num: 1
+  return_logprobs: false
+  sampling_params:
+    do_sample: false
+    max_new_tokens: 1
+  sglang:
+    serving_mode: embodied
+    server_type: embodied
+    launch_server: true
+    launch_router: false
+    group_name: SGLangServerGroup
+    router_group_name: SGLangRouterGroup
+    http_timeout_s: 1800
+    http_max_retries: 0
+    http_retry_backoff_s: 0
+    seed: 1140
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    server_urls: []
+    server:
+      model_path: ${rollout.model.model_path}
+      pipeline_class_name: Cosmos3OmniDiffusersPipeline
+      backend: sglang
+      num_gpus: 1
+      tp_size: 1
+      attention_backend: TORCH_SDPA
+      dit_cpu_offload: false
+      cfg_parallel_degree: 1
+      sp_degree: 1
+      batching_max_size: 1
+  model:
+    model_type: cosmos3
+    model_path: /mnt/public2/hongzhi/models/Cosmos3-Nano
+    precision: bf16
+    is_lora: false
+    action_output: native
+    action_dim: 10
+    raw_action_dim: 10
+    action_stats_path: null
+    num_action_chunks: 16
+    domain_name: libero
+    action_mode: policy
+    num_frames: 17
+    size: 320x192
+    fps: 20
+    action_fps: 20.0
+    action_view_point: ego_view
+    num_inference_steps: 30

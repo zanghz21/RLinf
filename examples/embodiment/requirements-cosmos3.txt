@@ -1,0 +1,22 @@
+# Install with uv --no-config pip install to bypass repository Torch overrides.
+torch==2.13.0
+sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@0bcd822377da7b5718e674eaf9c870d349424dd1#subdirectory=python
+numpy
+Pillow
+pyarrow>=15,<26
+PyYAML
+requests
+imageio[ffmpeg]
+ray[default]>=2.47.0
+hydra-core<1.4.0.dev8
+gymnasium
+nvitop
+icmplib
+lz4
+zstandard
+sortedcontainers
+torchdata==0.11.0
+tensorboard
+wandb<0.25.1
+accelerate
+scipy

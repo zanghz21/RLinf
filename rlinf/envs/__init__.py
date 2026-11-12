@@ -37,6 +37,7 @@ class SupportedEnvType(Enum):
     FRANKASIM = "frankasim"
     HABITAT = "habitat"
     WORLD_MODEL = "world_model"
+    COSMOS3 = "cosmos3"
     GENESIS = "genesis"
     EMBODICHAIN = "embodichain"
     ROBOVERSE = "roboverse"
@@ -102,6 +103,10 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.sim.maniskill.maniskill_rlt_env import ManiskillRLTEnv
 
         return ManiskillRLTEnv
+    elif env_type == SupportedEnvType.COSMOS3:
+        from rlinf.envs.sim.cosmos3.env import Cosmos3Env
+
+        return Cosmos3Env
     elif env_type == SupportedEnvType.LIBERO:
         from rlinf.envs.sim.libero.libero_env import LiberoEnv
 

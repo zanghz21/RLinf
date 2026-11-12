@@ -118,22 +118,23 @@ LIBERO trajectory counting rules: see :ref:`libero-eval-config`.
 Run a Learned World Model Loop
 ----------------------------------------
 
-Start from one recorded LIBERO-Spatial observation and let the same Cosmos3 checkpoint generate both actions and future observations. The toolkit calls the policy first, supplies its unchanged normalized 10D actions to forward dynamics, and feeds the final generated frame into the next cycle. A base Nano checkpoint can test this connection before a tuned checkpoint is available; task success and visual accuracy are separate evaluations.
+Use the existing evaluation workers to run Cosmos3 as both policy and world model. ``SGLangEmbodiedWorker`` requests actions; ``EnvWorker`` runs ``Cosmos3Env`` and sends those unchanged normalized 10D actions to the same server for forward prediction. ``EmbodiedEvalRunner`` feeds the final generated frame into the next policy call. This inference-only flow uses the rollout model configuration and omits the actor process and training updates.
 
-Configure ``toolkits/cosmos3/config/closed_loop_nano.yaml`` with your checkpoint and LeRobot dataset paths. The example selects episode ``1261``, frame ``0``, and dataset task index ``30``: pick up the black bowl next to the cookie box and place it on the plate. It concatenates the external and wrist cameras, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset reports 10 FPS, which is recorded separately because only one still observation initializes this loop.
+Configure ``examples/embodiment/config/cosmos3_closed_loop.yaml`` with your checkpoint and LeRobot dataset paths. The default selects LIBERO-Spatial episode ``1261``, frame ``0``, dataset task index ``30``. It concatenates external and wrist views, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset's 10 FPS metadata is recorded separately because initialization uses one still observation. Subsequent observations come from generated video.
 
-Use a SGLang runtime that supports both the action endpoint and action-conditioned video generation. See the :download:`toolkit README <../../../../../toolkits/cosmos3/README.md>` for runtime requirements and the full invocation. From the RLinf checkout, run one cycle on an available GPU:
+Prepare the environment inside your workspace, following the :download:`runtime instructions <../../../../../toolkits/cosmos3/README.md>`. The example requirements pin SGLang 0.5.19 and Torch 2.13.0; ``uv --no-config pip install`` avoids the repository's general Torch override. Reuse your workspace's ``../.venv`` when it is already prepared. From the RLinf checkout, run three cycles:
 
 .. code-block:: bash
 
-   CUDA_VISIBLE_DEVICES=0 COSMOS_PYTHON=/path/to/venv/bin/python \
-     bash toolkits/cosmos3/run_closed_loop_task.sh \
-     --output-dir /shared/cosmos3/runs/one-cycle \
-     --cycles 1
+   PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 ../.venv/bin/python \
+     examples/embodiment/eval_cosmos3_closed_loop.py \
+     runner.logger.log_path=/shared/cosmos3/run-001
 
-This command starts one model server, reads the initial images and instruction, makes both model calls, saves the trace, and stops its server. Once it succeeds, choose a new output directory and pass ``--cycles 3`` to check observation feedback. Use ``--server-url http://127.0.0.1:30000`` to reuse an existing compatible server; the runner checks its model identity and leaves it running.
+The configuration starts one server, one rollout worker, and one environment worker. Its 48 environment steps are three chunks of 16 actions. Use a new output path for every run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://host:30000]'``. The entry checks its checkpoint path and leaves externally owned servers running. External servers must use ordinary inference and leave action normalization statistics unset.
 
-Inspect the saved native and conditioning action arrays, per-cycle images, generated video, resolved configuration, and manifest. Consecutive cycles must reuse the preceding generated frame, and the conditioning actions must match the policy output. Use the same launcher within a submitted compute task, with shared asset/output paths and ``--task-id`` to record its identifier. The launcher executes within your allocation; it does not submit jobs.
+Inspect ``<log_path>/artifacts/config.json``, ``server.json``, and ``episode_000/``. Each cycle saves its input canvas, native action array, dynamics request/response, predicted video, next image, and status. The dynamics request must contain exactly the saved policy actions, and the next cycle's input must match the preceding prediction's last frame. ``closed_loop.mp4`` joins the generated trajectory without duplicated conditioning frames. Metrics report generated length and chunk count; placeholder reward tensors do not measure task success.
+
+A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. CPU tests cover real worker inference and stepping methods against a fake HTTP service; Ray scheduling and GPU model inference still require a compatible GPU run. Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot.
 
 FAQ
 ----------------------------------------

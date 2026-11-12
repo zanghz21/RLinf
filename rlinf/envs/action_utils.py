@@ -344,6 +344,12 @@ def prepare_actions(
         raw_chunk_actions = raw_chunk_actions.numpy()
 
     env_type = SupportedEnvType(env_type)
+    if env_type == SupportedEnvType.COSMOS3:
+        if SupportedModel(model_type) != SupportedModel.COSMOS3 or action_dim != 10:
+            raise ValueError(
+                "Cosmos3 dynamics require native 10-D Cosmos3 policy actions"
+            )
+        return raw_chunk_actions
     if env_type == SupportedEnvType.LIBERO:
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,

@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise the Cosmos3 runner against an HTTP service without model weights."""
+"""Exercise Cosmos3 worker boundaries against an HTTP service without weights."""
 
-import base64
 import io
 import json
 import threading
@@ -22,14 +21,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
-from toolkits.cosmos3.closed_loop_client import Cosmos3Client, policy_request
-from toolkits.cosmos3.closed_loop_io import (
-    image_to_data_uri,
+from rlinf.models.embodiment.cosmos3.closed_loop_client import Cosmos3Client
+from rlinf.models.embodiment.cosmos3.closed_loop_io import (
     read_video_frames,
     save_video,
 )
-from toolkits.cosmos3.run_closed_loop import run, run_cycles
+from rlinf.models.embodiment.cosmos3.sglang_adapter import Cosmos3SGLangAdapter
+from rlinf.utils.http_client import InferenceHTTPClient
+from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWorker
 
 np = pytest.importorskip("numpy")
 Image = pytest.importorskip("PIL.Image")
@@ -57,6 +58,18 @@ class FakeSGLang:
                 return
 
             def respond(self, value, status=200):
+                if self.headers.get("Accept") == "application/msgpack":
+                    from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+                        pack_msgpack,
+                    )
+
+                    payload = pack_msgpack(value)
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Content-Type", "application/msgpack")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 payload = (
                     value if isinstance(value, bytes) else json.dumps(value).encode()
                 )
@@ -70,9 +83,15 @@ class FakeSGLang:
                 self.wfile.write(payload)
 
             def do_POST(self):
-                payload = json.loads(
-                    self.rfile.read(int(self.headers["Content-Length"]))
-                )
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.headers.get("Content-Type") == "application/msgpack":
+                    from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+                        unpack_msgpack,
+                    )
+
+                    payload = unpack_msgpack(raw)
+                else:
+                    payload = json.loads(raw)
                 owner.requests.append(("POST", self.path, payload))
                 if self.path == "/v1/actions/generations":
                     parameters = payload["parameters"]
@@ -193,75 +212,6 @@ def videos(tmp_path):
     return result
 
 
-def test_three_cycles_preserve_actions_and_feed_generated_pngs(
-    tmp_path, serve, generation, videos
-):
-    service = FakeSGLang(videos)
-    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
-    output = tmp_path / "run"
-    output.mkdir()
-    initial = Image.new("RGB", (16, 16), "blue")
-    try:
-        metrics = run_cycles(
-            client, initial, "put the bowl on the plate", generation, 3, output
-        )
-    finally:
-        client.close()
-
-    posts = [
-        (path, body) for method, path, body in service.requests if method == "POST"
-    ]
-    assert [path for path, _ in posts] == ["/v1/actions/generations", "/v1/videos"] * 3
-    assert len(metrics) == 3
-    for cycle in range(3):
-        directory = output / f"cycle_{cycle:03d}"
-        policy, dynamics = posts[2 * cycle][1], posts[2 * cycle + 1][1]
-        assert policy["parameters"]["action_mode"] == "policy"
-        assert policy["parameters"]["raw_action_dim"] == 10
-        assert policy["input"]["prompt"].startswith("put the bowl on the plate.")
-        assert "right half shows the wrist-mounted camera" in policy["input"]["prompt"]
-        assert dynamics["action_mode"] == "forward_dynamics"
-        assert dynamics["domain_name"] == "libero"
-        assert dynamics["reference_url"] == policy["input"]["input_reference"]
-        assert dynamics["action"] == service.policy_outputs[cycle]
-        native = np.load(directory / "actions_native.npy")
-        np.testing.assert_array_equal(
-            native, np.asarray(dynamics["action"], dtype=np.float32)
-        )
-        np.testing.assert_array_equal(
-            native, np.load(directory / "actions_conditioning.npy")
-        )
-        uri_bytes = base64.b64decode(dynamics["reference_url"].split(",", 1)[1])
-        assert uri_bytes == (directory / "input.png").read_bytes()
-        if cycle:
-            previous = output / f"cycle_{cycle - 1:03d}" / "next.png"
-            assert (directory / "input.png").read_bytes() == previous.read_bytes()
-            assert metrics[cycle]["input_sha256"] == metrics[cycle - 1]["next_sha256"]
-    assert (output / "cycle_000/input.png").read_bytes() != (
-        output / "cycle_001/input.png"
-    ).read_bytes()
-    assert read_video_frames(output / "rollout.mp4").shape == (13, 16, 16, 3)
-    assert not [request for request in service.requests if request[0] == "DELETE"]
-
-
-@pytest.mark.parametrize("values", [[[0.0] * 7] * 4, [["nan"] * 10] * 4])
-def test_policy_rejects_malformed_or_nonfinite_actions(serve, generation, values):
-    service = FakeSGLang()
-    service.policy_values = values
-    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
-    payload = policy_request(
-        "move bowl", image_to_data_uri(Image.new("RGB", (16, 16))), generation
-    )
-    try:
-        with pytest.raises(
-            ValueError, match="Expected (action shape|finite model actions)"
-        ):
-            client.generate_actions(payload)
-    finally:
-        client.close()
-    assert not service.jobs
-
-
 @pytest.mark.parametrize("cancel_status", [200, 500])
 def test_failed_video_is_cancelled_and_keeps_original_error(
     tmp_path, serve, cancel_status
@@ -293,27 +243,6 @@ def test_video_timeout_cancels_job_without_masking_timeout(
     finally:
         client.close()
     assert ("DELETE", "/v1/videos/video-0", None) in service.requests
-
-
-def test_runner_rejects_video_with_wrong_shape(tmp_path, serve, generation, videos):
-    service = FakeSGLang(videos)
-    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
-    output = tmp_path / "wrong-shape"
-    output.mkdir()
-    try:
-        with pytest.raises(ValueError, match="Expected generated video shape"):
-            run_cycles(
-                client,
-                Image.new("RGB", (32, 16)),
-                "move bowl",
-                {**generation, "width": 32},
-                1,
-                output,
-            )
-    finally:
-        client.close()
-    assert (output / "cycle_000/prediction.mp4").exists()
-    assert not (output / "cycle_000/next.png").exists()
 
 
 @pytest.fixture
@@ -371,35 +300,209 @@ def run_config(tmp_path, generation):
     }
 
 
-def test_run_retains_failure_manifest_and_external_server(tmp_path, serve, run_config):
-    service = FakeSGLang(mode="failed")
-    service.model_path = str(Path(run_config["checkpoint_path"]).resolve())
+@pytest.fixture
+def worker_config(run_config, tmp_path):
+    cfg = OmegaConf.load(
+        Path(__file__).resolve().parents[2]
+        / "examples/embodiment/config/cosmos3_closed_loop.yaml"
+    )
+    cfg.env.eval.dataset = run_config["dataset"]
+    cfg.env.eval.generation = run_config["generation"]
+    cfg.env.eval.server = run_config["server"]
+    cfg.env.eval.artifact_dir = str(tmp_path / "artifacts")
+    cfg.env.eval.max_episode_steps = 12
+    cfg.env.eval.max_steps_per_rollout_epoch = 12
+    cfg.rollout.model.model_path = run_config["checkpoint_path"]
+    cfg.rollout.sglang.server.model_path = run_config["checkpoint_path"]
+    cfg.rollout.model.num_action_chunks = 4
+    cfg.rollout.model.num_frames = 5
+    cfg.rollout.model.size = "16x16"
+    cfg.rollout.model.num_inference_steps = 1
+    cfg.rollout.sglang.seed = 17
+    return cfg
+
+
+def rollout_worker(cfg, url):
+    """Exercise the real inference method without starting a scheduler cluster."""
+    pytest.importorskip("sglang.multimodal_gen.runtime.entrypoints.action.protocol")
+    worker = object.__new__(SGLangEmbodiedWorker)
+    worker.sglang_adapter = Cosmos3SGLangAdapter(cfg, rank=0)
+    worker.http_client = InferenceHTTPClient(url)
+    worker._http_timeout_s = 5
+    worker._http_max_retries = 0
+    worker._http_retry_backoff_s = 0
+    return worker
+
+
+def test_workers_preserve_actions_and_feed_back_generated_images(
+    worker_config, serve, videos
+):
+    import torch
+
+    from rlinf.envs import get_env_cls
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    service = FakeSGLang(videos)
     url = serve(service)
-    output = tmp_path / "failed-run"
-    with pytest.raises(RuntimeError, match="test generation failure"):
-        run(run_config, output, url, "test-task-42")
-
-    manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["status"] == "failed"
-    assert "test generation failure" in manifest["error"]
-    assert manifest["task_id"] == "test-task-42"
-    assert manifest["dataset"]["source_fps"] == 10
-    assert manifest["server"]["ownership"] == "external"
-    assert manifest["finished_at"]
-    assert (output / "cycle_000/actions_native.npy").exists()
-    client = Cosmos3Client(url)
+    rollout = rollout_worker(worker_config, url)
+    env_cfg = worker_config.env.eval
+    env_worker = object.__new__(EnvWorker)
+    env_worker.cfg = worker_config
+    env_worker.model_cfg = worker_config.rollout.model
+    env_worker._rank = 0
+    env_worker._world_size = 1
+    env_worker._worker_info = None
+    env_worker.stage_num = 1
+    env_worker.set_sglang_server_urls([url])
+    env_worker.eval_env_list = env_worker._setup_env_and_wrappers(
+        get_env_cls(env_cfg.env_type, env_cfg), env_cfg, num_envs_per_stage=1
+    )
+    env = env_worker.eval_env_list[0]
+    env_worker.eval_prev_done = [torch.zeros(1, dtype=torch.bool)]
+    env_worker.use_external_reward_model = False
+    observations = []
     try:
-        assert client.server_info()["model_path"] == service.model_path
+        obs, _ = env.reset()
+        for _ in range(3):
+            observations.append(obs["main_images"].clone())
+            actions, _ = rollout.predict(obs)
+            output, metrics = env_worker.env_evaluate_step(actions.numpy(), 0)
+            obs = output.obs
+        assert metrics["episode_len"].item() == 12
+        assert "success" not in metrics
+        assert "return" not in metrics
     finally:
-        client.close()
+        env_worker.close_cosmos3_envs()
+
+    posts = [
+        (path, body) for method, path, body in service.requests if method == "POST"
+    ]
+    assert [path for path, _ in posts] == ["/v1/actions/generations", "/v1/videos"] * 3
+    for cycle in range(3):
+        policy = posts[2 * cycle][1]
+        dynamics = posts[2 * cycle + 1][1]
+        np.testing.assert_array_equal(dynamics["action"], service.policy_outputs[cycle])
+        assert dynamics["reference_url"] == policy["input"]["input_reference"][0]
+        assert dynamics["prompt"] == policy["input"]["prompt"][0]
+        assert "concatenated views" in dynamics["prompt"]
+        assert policy["parameters"]["domain_name"] == "libero"
+        if cycle:
+            previous = Path(env_cfg.artifact_dir)
+            # The downloaded clip is also the exact source of the next observation.
+            decoded = read_video_frames(
+                next(previous.rglob(f"cycle_{cycle - 1:03d}/prediction.mp4"))
+            )
+            np.testing.assert_array_equal(observations[cycle][0].numpy(), decoded[-1])
+    assert len(list(Path(env_cfg.artifact_dir).rglob("actions_native.npy"))) == 3
 
 
-def test_run_refuses_to_overwrite_existing_output_directory(tmp_path, run_config):
-    output = tmp_path / "existing-run"
-    output.mkdir()
-    sentinel = output / "manifest.json"
-    sentinel.write_text("existing results")
+@pytest.mark.parametrize("invalid", [np.nan, np.inf])
+def test_native_adapter_rejects_nonfinite_actions(worker_config, serve, invalid):
+    service = FakeSGLang()
+    values = np.zeros((4, 10), dtype=np.float32)
+    values[0, 0] = invalid
+    service.policy_values = values.tolist()
+    worker = rollout_worker(worker_config, serve(service))
+    with pytest.raises(ValueError, match="finite"):
+        worker.predict(
+            {
+                "main_images": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+                "task_descriptions": ["move bowl"],
+            }
+        )
+    assert not service.jobs
+
+
+@pytest.mark.parametrize("shape", [(3, 10), (4, 7), (4, 64)])
+def test_native_adapter_rejects_wrong_horizon_or_width(worker_config, shape):
+    adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+    with pytest.raises(ValueError, match="shape"):
+        adapter.parse_response({"data": [{"action": {"values": np.zeros(shape)}}]}, {})
+
+
+def test_native_adapter_rejects_normalization_stats(worker_config):
+    worker_config.rollout.model.action_stats_path = "/unused/stats.json"
+    with pytest.raises(ValueError, match="action_stats_path unset"):
+        Cosmos3SGLangAdapter(worker_config, rank=0)
+
+
+def test_physical_libero_conversion_remains_default(worker_config):
+    worker_config.rollout.model.pop("action_output")
+    worker_config.rollout.model.action_dim = 7
+    adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+    native = np.tile([0.2, -0.3, 0.4, 1, 0, 0, 0, 1, 0, 0.6], (4, 1))
+    actions, _ = adapter.parse_response({"data": [{"action": {"values": native}}]}, {})
+    expected = np.tile([0.2, -0.3, 0.4, 0, 0, 0, 0.6], (4, 1))
+    np.testing.assert_allclose(actions[0].numpy(), expected)
+
+
+def test_example_config_validates_without_starting_ray(worker_config):
+    from examples.embodiment.eval_cosmos3_closed_loop import validate_closed_loop_cfg
+
+    validate_closed_loop_cfg(worker_config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("runner.only_eval", False),
+        ("rollout.model.action_output", "libero"),
+        ("env.eval.generation.num_frames", 17),
+        ("env.eval.generation.seed", 99),
+        ("rollout.model.size", "32x16"),
+        ("env.eval.max_episode_steps", 16),
+        ("rollout.sglang.launch_server", False),
+    ],
+)
+def test_example_rejects_incompatible_configuration(worker_config, field, value):
+    from examples.embodiment.eval_cosmos3_closed_loop import validate_closed_loop_cfg
+
+    OmegaConf.update(worker_config, field, value)
+    with pytest.raises(ValueError):
+        validate_closed_loop_cfg(worker_config)
+
+
+def test_native_policy_preserves_seed_zero(worker_config):
+    worker_config.rollout.sglang.seed = 0
+    adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+    payload, _ = adapter.build_request(
+        {
+            "main_images": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+            "task_descriptions": ["move bowl"],
+        }
+    )
+    assert payload["parameters"]["seed"] == 0
+
+
+def test_env_failure_retains_actions_and_error(worker_config, serve):
+    from rlinf.envs import get_env_cls
+
+    service = FakeSGLang(mode="failed")
+    cfg = worker_config.env.eval
+    env = get_env_cls(cfg.env_type, cfg)(cfg=cfg, num_envs=1)
+    env.set_sglang_server_urls([serve(service)])
+    try:
+        env.reset()
+        with pytest.raises(RuntimeError, match="test generation failure"):
+            env.chunk_step(np.zeros((1, 4, 10), dtype=np.float32))
+    finally:
+        env.close()
+    cycle = Path(cfg.artifact_dir) / "episode_000/cycle_000"
+    assert (cycle / "actions_native.npy").exists()
+    status = json.loads((cycle / "status.json").read_text())
+    assert status["status"] == "failed"
+    assert "test generation failure" in status["error"]
+    assert not (cycle / "next_observation.png").exists()
+
+
+def test_env_rejects_reusing_artifact_directory(worker_config):
+    from rlinf.envs import get_env_cls
+
+    cfg = worker_config.env.eval
+    root = Path(cfg.artifact_dir)
+    root.mkdir()
+    sentinel = root / "existing.json"
+    sentinel.write_text("previous run")
     with pytest.raises(FileExistsError):
-        run(run_config, output, None, None)
-    assert sentinel.read_text() == "existing results"
-    assert list(output.iterdir()) == [sentinel]
+        get_env_cls(cfg.env_type, cfg)(cfg=cfg, num_envs=1)
+    assert sentinel.read_text() == "previous run"

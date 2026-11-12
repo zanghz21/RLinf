@@ -118,22 +118,23 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
 运行模型生成的观测闭环
 ----------------------------------------
 
-从一帧 LIBERO-Spatial 记录观测开始，用同一个 Cosmos3 checkpoint 生成动作和后续观测。工具先调用 policy，将其输出的归一化 10 维动作原样传给 forward dynamics，再把生成视频的最后一帧作为下一轮观测。获得微调 checkpoint 之前，可以用 Nano 基础模型验证这条数据通路；任务成功率和图像准确性需要单独评估。
+通过现有评测 worker，让 Cosmos3 同时生成动作和后续观测。``SGLangEmbodiedWorker`` 请求动作，``EnvWorker`` 运行 ``Cosmos3Env``，将归一化 10 维动作原样传给同一个 server 进行 forward prediction。``EmbodiedEvalRunner`` 将生成视频的最后一帧反馈给下一轮 policy。本流程使用 rollout 模型配置，只执行推理，不启动 actor 或训练更新。
 
-在 ``toolkits/cosmos3/config/closed_loop_nano.yaml`` 中设置 checkpoint 和 LeRobot 数据集路径。示例选择 episode ``1261``、frame ``0``、数据集 task index ``30``，任务是将 cookie box 旁的黑碗放到盘子上。每次输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。源数据集记录为 10 FPS；闭环只取其中一帧作为初始观测，因此会分别记录源数据和模型生成的帧率。
+在 ``examples/embodiment/config/cosmos3_closed_loop.yaml`` 中配置 checkpoint 和 LeRobot 数据集路径。默认选择 LIBERO-Spatial episode ``1261``、frame ``0``、数据集 task index ``30``。输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。初始化只取一帧观测，因此单独记录数据集的 10 FPS 元数据。后续观测全部来自生成视频。
 
-使用同时支持动作 endpoint 和动作条件视频生成的 SGLang runtime。运行环境要求和完整命令见 :download:`工具 README <../../../../../toolkits/cosmos3/README.md>`。在 RLinf 根目录选择一张可用 GPU，先运行一轮：
+按照 :download:`运行环境说明 <../../../../../toolkits/cosmos3/README.md>`，在当前工作区内准备环境。示例依赖固定 SGLang 0.5.19 和 Torch 2.13.0；``uv --no-config pip install`` 避免仓库通用的 Torch 覆盖规则影响此环境。若工作区已有 ``../.venv``，可直接复用。在 RLinf 根目录运行三轮闭环：
 
 .. code-block:: bash
 
-   CUDA_VISIBLE_DEVICES=0 COSMOS_PYTHON=/path/to/venv/bin/python \
-     bash toolkits/cosmos3/run_closed_loop_task.sh \
-     --output-dir /shared/cosmos3/runs/one-cycle \
-     --cycles 1
+   PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 ../.venv/bin/python \
+     examples/embodiment/eval_cosmos3_closed_loop.py \
+     runner.logger.log_path=/shared/cosmos3/run-001
 
-该命令启动一个模型 server，读取初始图像和指令，完成两次模型调用并保存结果，最后关闭自己启动的 server。一轮成功后，换用新的输出目录并传入 ``--cycles 3``，验证观测反馈。传入 ``--server-url http://127.0.0.1:30000`` 可复用已有的兼容 server；runner 会核对模型身份，并在退出时保留该 server。
+配置启动一个 server、一个 rollout worker 和一个 env worker。48 个环境步对应三个包含 16 个动作的 chunk。每次运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://host:30000]'``。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 应使用普通推理模式，并保持动作归一化统计参数未设置。
 
-检查保存的原始动作与条件动作数组、逐轮图像、生成视频、最终配置和 manifest。每轮输入必须来自上一轮的生成结果，forward dynamics 的条件动作必须与 policy 输出一致。较长实验可在提交的计算任务中调用同一脚本，使用共享存储路径，并通过 ``--task-id`` 记录任务标识。脚本在已分配的资源中执行，不负责提交任务。
+检查 ``<log_path>/artifacts/config.json``、``server.json`` 和 ``episode_000/``。每轮保存输入图像、原始动作数组、dynamics 请求与响应、预测视频、下一帧观测和状态。dynamics 请求中的动作必须与保存的 policy 动作完全一致，下一轮输入必须等于上一轮预测视频的最后一帧。``closed_loop.mp4`` 拼接生成轨迹并去除重复条件帧。指标只报告生成步数和 chunk 数；接口所需的占位 reward 张量不表示任务成功。
+
+获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。CPU 测试使用模拟 HTTP 服务执行真实 worker 的推理和环境步进方法；Ray 调度和 GPU 模型推理仍需在兼容的 GPU 环境中验证。较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。
 
 常见问题
 ----------------------------------------

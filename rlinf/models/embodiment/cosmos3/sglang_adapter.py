@@ -38,6 +38,11 @@ adapter must:
    (rot6d -> rotation matrix -> rotvec via scipy);
 4. re-assemble ``[trans3, axisangle3, gripper1]`` (7-D) and clip/pad the chunk
    count to ``num_action_chunks``.
+
+With ``action_output=native``, the learned Cosmos3 environment receives the
+finite, normalized 10-D chunk unchanged. Its horizon and width must match
+exactly; normalization statistics and physical-environment conversions are
+not used in this mode.
 """
 
 from __future__ import annotations
@@ -76,6 +81,18 @@ class Cosmos3SGLangAdapter:
         # Cosmos3 LIBERO recipe: rot6d 10-D, frame_wise_relative, quantile_rot.
         # raw_action_dim is the MODEL width 10, distinct from the env's 7.
         self._raw_action_dim = int(c.get("raw_action_dim", 10))
+        self._action_output = str(c.get("action_output", "libero"))
+        if self._action_output not in ("libero", "native"):
+            raise ValueError("Cosmos3 action_output must be 'libero' or 'native'")
+        if self._action_output == "native":
+            if int(c.action_dim) != self._raw_action_dim:
+                raise ValueError("Native Cosmos3 action_dim must equal raw_action_dim")
+            if c.get("action_stats_path"):
+                raise ValueError(
+                    "Native Cosmos3 actions require action_stats_path unset"
+                )
+            if int(c.num_action_chunks) != self._num_frames - 1:
+                raise ValueError("Native Cosmos3 horizon must equal num_frames - 1")
         self._action_normalization = str(c.get("action_normalization", "quantile"))
         self._action_stats_path = c.get("action_stats_path", None)
         self._stats = self._load_stats(
@@ -84,7 +101,9 @@ class Cosmos3SGLangAdapter:
 
         eval_env_cfg = cfg.env.get("eval", None) or {}
         env_type = eval_env_cfg.get("env_type", None)
-        self._domain_name = str(env_type) if env_type else None
+        self._domain_name = c.get("domain_name") or (
+            str(env_type) if env_type else None
+        )
         self._domain_id = c.get("domain_id", None)
         self._num_action_chunks = int(self.model_cfg.num_action_chunks)
         # sglang's own default for --batching-max-size is 1.
@@ -186,7 +205,8 @@ class Cosmos3SGLangAdapter:
             env_obs, len(tasks), self._target_w, self._target_h
         )
         n_cam = 2 if env_obs.get("wrist_images") is not None else 1
-        seed = int(self.cfg_rollout.get("sglang", {}).get("seed", 1140) or 1140)
+        configured_seed = self.cfg_rollout.get("sglang", {}).get("seed", 1140)
+        seed = 1140 if configured_seed is None else int(configured_seed)
         prompts = [self._augment_prompt(t, n_cam) for t in tasks]
         input_payload: dict[str, Any] = {"prompt": prompts}
         if all(image_uris):
@@ -251,7 +271,19 @@ class Cosmos3SGLangAdapter:
                 f"Cosmos3 action values have unexpected ndim={arr.ndim} "
                 f"(expected one [horizon, D] array per env); shape={arr.shape}"
             )
-        chunks = [self._action_to_env(arr[i]) for i in range(arr.shape[0])]
+        if self._action_output == "native":
+            from rlinf.models.embodiment.cosmos3.closed_loop_io import (
+                validate_native_actions,
+            )
+
+            chunks = [
+                validate_native_actions(
+                    chunk, self._num_action_chunks, self._raw_action_dim
+                )
+                for chunk in arr
+            ]
+        else:
+            chunks = [self._action_to_env(arr[i]) for i in range(arr.shape[0])]
         if not chunks:
             raise ValueError("Cosmos3 returned no action chunks to parse.")
         actions = (
@@ -259,7 +291,7 @@ class Cosmos3SGLangAdapter:
             .detach()
             .cpu()
             .contiguous()
-        )  # [N, num_action_chunks, 7]
+        )  # [N, num_action_chunks, action_dim]
         flat = actions.reshape(actions.shape[0], -1)
         info = {
             "prev_logprobs": torch.zeros_like(flat),

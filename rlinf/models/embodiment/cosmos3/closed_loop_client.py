@@ -21,17 +21,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from toolkits.cosmos3.closed_loop_io import validate_native_actions
-
-
-def policy_request(prompt: str, image_uri: str, parameters: dict) -> dict:
-    """Build a single-observation policy request in normalized model coordinates."""
-    return {
-        "input": {"prompt": prompt, "input_reference": image_uri},
-        "parameters": {**parameters, "action_mode": "policy"},
-        "runtime": {"response_format": "envelope", "output_format": "list"},
-    }
-
 
 def dynamics_request(
     prompt: str, image_uri: str, parameters: dict, actions: Any, output_path: Path
@@ -93,41 +82,6 @@ class Cosmos3Client:
         """Return the model path and runtime identity advertised by the server."""
         with self.request("GET", "/server_info") as response:
             return response.json()
-
-    def generate_actions(self, payload: dict) -> tuple[Any, dict]:
-        """Generate and validate one finite, unpadded native action chunk."""
-        with self.request("POST", "/v1/actions/generations", json=payload) as response:
-            result = response.json()
-        records = result.get("data", [])
-        if len(records) != 1:
-            raise ValueError(f"Expected one policy output, got {len(records)}")
-        record = records[0]
-        if record.get("input_index", 0) != 0:
-            raise ValueError(f"Expected policy input_index=0, got {record!r}")
-        action = record["action"]
-        parameters = payload["parameters"]
-        expected_width = parameters["raw_action_dim"]
-        if action.get("raw_action_dim", expected_width) != expected_width:
-            raise ValueError(f"Unexpected policy action width metadata: {action!r}")
-        if action.get("action_mode", "policy") != "policy":
-            raise ValueError(
-                f"Expected policy action mode, got {action.get('action_mode')}"
-            )
-        if (
-            parameters.get("domain_name") == "libero"
-            and action.get("domain_id", 5) != 5
-        ):
-            raise ValueError(
-                f"Expected LIBERO domain_id=5, got {action.get('domain_id')}"
-            )
-        actions = validate_native_actions(
-            action["values"], parameters["num_frames"] - 1, expected_width
-        )
-        if "shape" in action and list(actions.shape) != action["shape"]:
-            raise ValueError(
-                f"Policy shape metadata disagrees with values: {action['shape']}"
-            )
-        return actions, result
 
     def generate_video(self, payload: dict, destination: Path) -> dict:
         """Submit forward dynamics, await completion, and download its video.

@@ -52,6 +52,7 @@ class EnvWorker(Worker):
     _obs_split_fn = None
     _policy_input_split_fn = None
     collect_final_values = True
+    _sglang_server_urls = None
 
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -325,6 +326,32 @@ class EnvWorker(Worker):
         override_cfg["reward_image_key"] = env_cfg.main_image_key
         setattr(env_cfg, "override_cfg", OmegaConf.create(override_cfg))
 
+    def set_sglang_server_urls(self, urls: list[str]) -> None:
+        """Bind learned environments to the same server used by rollout."""
+        if len(urls) != 1:
+            raise ValueError(
+                "Cosmos3 closed-loop evaluation requires one shared server"
+            )
+        if getattr(self, "_cosmos3_envs", None):
+            raise RuntimeError(
+                "Set shared URLs before initializing Cosmos3 environments"
+            )
+        self._sglang_server_urls = list(urls)
+        self._cosmos3_envs = []
+
+    def close_cosmos3_envs(self) -> None:
+        """Release shared-server clients, including partially initialized envs."""
+        first_error = None
+        for env in reversed(getattr(self, "_cosmos3_envs", [])):
+            try:
+                env.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        self._cosmos3_envs = []
+        if first_error is not None:
+            raise first_error
+
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
 
@@ -336,6 +363,13 @@ class EnvWorker(Worker):
                 total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
             )
+            if env_cfg.env_type == "cosmos3":
+                if not self._sglang_server_urls:
+                    raise RuntimeError(
+                        "Set shared SGLang server URLs before init_worker"
+                    )
+                self._cosmos3_envs.append(env)
+                env.set_sglang_server_urls(self._sglang_server_urls)
             if (
                 self.cfg.env.get("delay_sampler", None)
                 and env_cfg is not self.cfg.env.eval

@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from toolkits.cosmos3.closed_loop_io import (
+from rlinf.models.embodiment.cosmos3.closed_loop_io import (
     augment_prompt,
     image_to_data_uri,
     load_lerobot_observation,
