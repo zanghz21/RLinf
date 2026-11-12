@@ -559,8 +559,10 @@ checkpoint above, run from the repository root in the activated environment:
 
 Replace ``CPS_MODEL_PATH`` with the local checkpoint directory. This launches
 the full recipe with the baseline's 64 training environments, eight rollout
-epochs, and PPO batch sizes. Adjust placement and batch sizes to your server
-as described above. To run the Gaussian ablation, append
+epochs, and PPO batch sizes. Select GPUs through ``cluster.component_placement``
+in the YAML: this recipe sets ``actor,env,rollout: "0"`` to share GPU 0.
+Adjust that placement and the batch sizes to your server as described above.
+To run the Gaussian ablation, append
 ``actor.model.openpi.cps_logprob_mode=gaussian`` and use a different log path.
 
 For an initial single-GPU smoke run, use the same setup and argument array,
@@ -568,7 +570,7 @@ but replace the final Python command with:
 
 .. code-block:: bash
 
-   CUDA_VISIBLE_DEVICES=0 python examples/embodiment/train_embodied_agent.py \
+   python examples/embodiment/train_embodied_agent.py \
      "${CPS_ARGS[@]}" \
      runner.logger.log_path=logs/pi0_flow_cps_smoke \
      runner.max_steps=2 runner.save_interval=-1 runner.val_check_interval=-1 \

@@ -492,13 +492,13 @@ OpenPI 支持 FSDP1 的 ``no_shard``、``shard_grad_op`` 和 ``full_shard``。
    )
    python examples/embodiment/train_embodied_agent.py "${CPS_ARGS[@]}"
 
-将 ``CPS_MODEL_PATH`` 替换为本地 checkpoint 目录。该命令沿用基线的 64 个训练环境、8 个 rollout epoch 和 PPO batch size。根据服务器资源，按前文说明调整 placement 和 batch size。运行 Gaussian 消融实验时，追加 ``actor.model.openpi.cps_logprob_mode=gaussian``，并使用不同的日志目录。
+将 ``CPS_MODEL_PATH`` 替换为本地 checkpoint 目录。该命令沿用基线的 64 个训练环境、8 个 rollout epoch 和 PPO batch size。GPU 通过 YAML 中的 ``cluster.component_placement`` 选择；这套配置使用 ``actor,env,rollout: "0"``，让三个组件共享 GPU 0。根据服务器资源，按前文说明调整该 placement 和 batch size。运行 Gaussian 消融实验时，追加 ``actor.model.openpi.cps_logprob_mode=gaussian``，并使用不同的日志目录。
 
 首次在单张 GPU 上做 smoke test 时，保留上述环境变量与参数数组，将最后一条 Python 命令替换为：
 
 .. code-block:: bash
 
-   CUDA_VISIBLE_DEVICES=0 python examples/embodiment/train_embodied_agent.py \
+   python examples/embodiment/train_embodied_agent.py \
      "${CPS_ARGS[@]}" \
      runner.logger.log_path=logs/pi0_flow_cps_smoke \
      runner.max_steps=2 runner.save_interval=-1 runner.val_check_interval=-1 \
