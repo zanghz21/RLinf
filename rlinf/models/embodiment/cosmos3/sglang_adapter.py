@@ -50,6 +50,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 from typing import Any, Literal
 
 import numpy as np
@@ -77,6 +78,12 @@ class Cosmos3SGLangAdapter:
         self._fps = int(c.get("fps", 20))
         # num_inference_steps=35 -> OOD prompt caption + different denoise.
         self._num_inference_steps = int(c.get("num_inference_steps", 30))
+        guidance = c.get("guidance_scale")
+        self._guidance_scale = None if guidance is None else float(guidance)
+        if self._guidance_scale is not None and (
+            not math.isfinite(self._guidance_scale) or self._guidance_scale < 1.0
+        ):
+            raise ValueError("Cosmos3 guidance_scale must be finite and at least 1.0")
 
         # Cosmos3 LIBERO recipe: rot6d 10-D, frame_wise_relative, quantile_rot.
         # raw_action_dim is the MODEL width 10, distinct from the env's 7.
@@ -227,6 +234,8 @@ class Cosmos3SGLangAdapter:
             "height": self._target_h,
             "width": self._target_w,
         }
+        if self._guidance_scale is not None:
+            parameters["guidance_scale"] = self._guidance_scale
         if self._domain_id is not None:
             parameters["domain_id"] = int(self._domain_id)
         elif self._domain_name is not None:

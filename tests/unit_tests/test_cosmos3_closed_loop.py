@@ -16,6 +16,9 @@
 
 import io
 import json
+import os
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -526,3 +529,162 @@ def test_video_submission_failure_is_not_retried(tmp_path, serve):
         ("POST", "/v1/videos")
     ]
     assert not service.jobs
+
+
+@pytest.mark.parametrize("guidance", [1.0, 1.5, 3.0])
+def test_policy_request_transmits_configured_guidance(worker_config, guidance):
+    worker_config.rollout.model.guidance_scale = guidance
+    adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+    payload, _ = adapter.build_request(
+        {
+            "main_images": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+            "task_descriptions": ["move bowl"],
+        }
+    )
+    assert payload["parameters"]["guidance_scale"] == guidance
+
+
+@pytest.mark.parametrize("guidance", [None, "missing"])
+def test_policy_request_omits_unconfigured_guidance(worker_config, guidance):
+    if guidance == "missing":
+        worker_config.rollout.model.pop("guidance_scale", None)
+    else:
+        worker_config.rollout.model.guidance_scale = None
+    adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+    payload, _ = adapter.build_request(
+        {
+            "main_images": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+            "task_descriptions": ["move bowl"],
+        }
+    )
+    assert "guidance_scale" not in payload["parameters"]
+
+
+@pytest.mark.parametrize("guidance", [0.5, -1.0, float("nan"), float("inf")])
+def test_policy_request_rejects_invalid_guidance(worker_config, guidance):
+    worker_config.rollout.model.guidance_scale = guidance
+    with pytest.raises(ValueError, match="guidance"):
+        adapter = Cosmos3SGLangAdapter(worker_config, rank=0)
+        adapter.build_request(
+            {
+                "main_images": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+                "task_descriptions": ["move bowl"],
+            }
+        )
+
+
+def test_cosmos3_extension_preserves_policy_guidance_and_video_defaults():
+    pytest.importorskip("sglang.multimodal_gen")
+    env = {
+        **os.environ,
+        "SGLANG_EXTERNAL_MODEL_PACKAGE": (
+            "rlinf.models.embodiment.cosmos3.sglang_extension"
+        ),
+        "CUDA_VISIBLE_DEVICES": "",
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu",
+        "HF_HUB_OFFLINE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    script = r"""
+from types import SimpleNamespace
+
+import numpy as np
+
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.registry import get_pipeline_config_classes
+from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
+    build_cosmos3_action_sampling_params,
+)
+from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    build_action_sampling_params,
+)
+
+extension = "RLinfCosmos3Pipeline"
+config_cls, sampling_cls = get_pipeline_config_classes(extension)
+assert config_cls is Cosmos3Config
+assert sampling_cls.__module__ == (
+    "rlinf.models.embodiment.cosmos3.sglang_extension"
+)
+args = SimpleNamespace(
+    pipeline_config=Cosmos3Config(is_edge=True, distilled_sigmas=None),
+    pipeline_class_name=extension,
+    model_path="/unused/checkpoint",
+    backend="sglang",
+    model_id=None,
+    batching_max_size=1,
+    num_gpus=1,
+    output_path=None,
+    comfyui_mode=False,
+)
+parameters = {
+    "action_mode": "policy",
+    "domain_name": "libero",
+    "raw_action_dim": 10,
+    "num_frames": 17,
+    "height": 480,
+    "width": 832,
+    "num_inference_steps": 30,
+    "seed": 17,
+}
+
+def policy(guidance=None, stock=False):
+    values = dict(parameters)
+    if guidance is not None:
+        values["guidance_scale"] = guidance
+    payload = {
+        "input": {
+            "prompt": "move bowl",
+            "input_reference": np.zeros((1, 16, 16, 3), dtype=np.uint8),
+        },
+        "parameters": values,
+    }
+    if stock:
+        return build_cosmos3_action_sampling_params(
+            payload, payload["input"], args, Cosmos3SamplingParams
+        )
+    return build_action_sampling_params(payload, args)
+
+assert policy().guidance_scale == 1.0
+for guidance in (1.0, 1.5, 3.0):
+    result = policy(guidance)
+    assert result.guidance_scale == guidance, result.guidance_scale
+    assert result.num_frames == 17
+    assert result.num_inference_steps == 30
+
+assert policy(3.0, stock=True).guidance_scale == 5.0
+
+for guidance, expected in ((None, 5.0), (3.0, 3.0)):
+    kwargs = {
+        **parameters,
+        "action_mode": "forward_dynamics",
+        "action": [[0.0] * 10] * 16,
+    }
+    if guidance is not None:
+        kwargs["guidance_scale"] = guidance
+    result = SamplingParams.from_user_sampling_params_args(
+        args.model_path, args, **kwargs
+    )
+    stock_result = Cosmos3SamplingParams(**kwargs)
+    stock_result._explicit_fields = set(kwargs)
+    stock_result._adjust(args)
+    for item in (result, stock_result):
+        assert item.guidance_scale == expected
+        assert item.num_frames == 17
+        assert item.action_mode == "forward_dynamics"
+
+args.pipeline_class_name = extension
+args.pipeline_config.distilled_sigmas = [1.0, 0.5, 0.1, 0.0]
+result = policy(3.0)
+assert result.guidance_scale == 1.0
+assert result.num_inference_steps == 4
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

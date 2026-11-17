@@ -59,7 +59,6 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         "rollout.sglang.tensor_parallel_size": 1,
         "rollout.sglang.pipeline_parallel_size": 1,
         "rollout.sglang.http_max_retries": 0,
-        "rollout.sglang.server.pipeline_class_name": "Cosmos3OmniDiffusersPipeline",
         "rollout.sglang.server.num_gpus": 1,
         "rollout.sglang.server.tp_size": 1,
         "rollout.sglang.server.cfg_parallel_degree": 1,
@@ -80,6 +79,20 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         if actual != value:
             raise ValueError(f"{field} must be {value!r}, got {actual!r}")
     model, env, serving = cfg.rollout.model, cfg.env.eval, cfg.rollout.sglang
+    pipeline_name = serving.server.pipeline_class_name
+    if pipeline_name not in ("Cosmos3OmniDiffusersPipeline", "RLinfCosmos3Pipeline"):
+        raise ValueError(f"Unsupported Cosmos3 pipeline: {pipeline_name!r}")
+    if (
+        model.get("guidance_scale") is not None
+        and pipeline_name != "RLinfCosmos3Pipeline"
+    ):
+        raise ValueError("Configurable policy guidance requires RLinfCosmos3Pipeline")
+    if pipeline_name == "RLinfCosmos3Pipeline" and serving.launch_server:
+        expected_package = "rlinf.models.embodiment.cosmos3.sglang_extension"
+        if serving.server.get("external_model_package") != expected_package:
+            raise ValueError(
+                f"Cosmos3 external_model_package must be {expected_package!r}"
+            )
     for field in (
         "num_frames",
         "fps",

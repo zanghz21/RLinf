@@ -87,7 +87,8 @@ rollout:
     server_urls: []
     server:
       model_path: ${rollout.model.model_path}
-      pipeline_class_name: Cosmos3OmniDiffusersPipeline
+      pipeline_class_name: RLinfCosmos3Pipeline
+      external_model_package: rlinf.models.embodiment.cosmos3.sglang_extension
       backend: sglang
       num_gpus: 1
       tp_size: 1
@@ -108,6 +109,7 @@ rollout:
     num_action_chunks: 16
     domain_name: libero
     action_mode: policy
+    guidance_scale: 1.5
     num_frames: 17
     size: 320x192
     fps: 20

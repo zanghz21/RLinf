@@ -68,6 +68,9 @@ def _run_sglang_server(
     # discover_metadata step hangs and worker registration fails.
     with no_proxy_env():
         if server_type == "embodied":
+            external_package = server_args_kwargs.pop("external_model_package", None)
+            if external_package:
+                os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_package
             from sglang.multimodal_gen.runtime.launch_server import dispatch_launch
             from sglang.multimodal_gen.runtime.server_args import (
                 ServerArgs,
@@ -144,6 +147,8 @@ class SGLangServerWorker(Worker):
         sglang_cfg: The sub-config block whose keys are forwarded verbatim
             as ``ServerArgs(**)`` kwargs — except ``host`` / ``port`` /
             ``dist_init_addr``, which are filled in at runtime here.
+            Embodied servers also consume ``external_model_package`` to load
+            SGLang's external diffusion package in every server process.
             Typically ``config.rollout.server`` when used inside a rollout,
             but any compatible block works (the server isn't tied to the
             rollout pipeline).

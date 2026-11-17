@@ -100,6 +100,25 @@ server 只会把 token 长度相同的 prompt 放在同一批，因此 ``Cosmos3
    * - ``env.eval.total_num_envs``
      - 并行环境数，按 GPU / 显存调整。
 
+配置 Policy Guidance
+----------------------------------------
+
+通过 ``rollout.model.guidance_scale`` 设置 policy 采样时对任务文本的强调程度。该值必须有限且大于等于 ``1.0``；``1.0`` 直接使用条件预测，不进行 CFG 放大。对于 Cosmos3 Edge，选择 RLinf 扩展，让 action 端点保留请求中的 guidance 值：
+
+.. code-block:: yaml
+
+   rollout:
+     model:
+       guidance_scale: 1.5
+     sglang:
+       server:
+         external_model_package: rlinf.models.embodiment.cosmos3.sglang_extension
+         pipeline_class_name: RLinfCosmos3Pipeline
+
+server worker 通过 SGLang 官方的 ``SGLANG_EXTERNAL_MODEL_PACKAGE`` 接口，在每个 server 进程中加载此模块。扩展复用 Cosmos3 模型和 pipeline stages，保持已安装的 SGLang 源码不变。使用该扩展时，policy 请求省略 guidance 会采用 ``1.0``；``forward_dynamics`` 请求沿用 SGLang 的视频采样默认值及显式覆盖规则。蒸馏 checkpoint 仍采用固定的 guidance ``1.0``。
+
+模型观测闭环示例已选择此扩展，并将 policy guidance 设为 ``1.5``。连接外部管理的 server 时，也应在服务启动时选择相同的外部模块和 pipeline。
+
 验证
 ----------------------------------------
 

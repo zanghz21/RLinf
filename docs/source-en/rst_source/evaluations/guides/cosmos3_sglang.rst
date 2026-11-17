@@ -100,6 +100,37 @@ Key Configuration
    * - ``env.eval.total_num_envs``
      - Number of parallel environments; adjust by GPU / memory.
 
+Configure Policy Guidance
+----------------------------------------
+
+To set the strength of text conditioning during policy sampling, configure
+``rollout.model.guidance_scale``. Use a finite value greater than or equal to
+``1.0``; ``1.0`` uses the conditional prediction without CFG amplification.
+For Cosmos3 Edge, select the RLinf extension so the action endpoint preserves
+the requested value:
+
+.. code-block:: yaml
+
+   rollout:
+     model:
+       guidance_scale: 1.5
+     sglang:
+       server:
+         external_model_package: rlinf.models.embodiment.cosmos3.sglang_extension
+         pipeline_class_name: RLinfCosmos3Pipeline
+
+The server worker loads this module through SGLang's official
+``SGLANG_EXTERNAL_MODEL_PACKAGE`` interface in each server process.
+The extension reuses the Cosmos3 model and pipeline stages while keeping the
+installed SGLang source unchanged. Policy requests that omit guidance use
+``1.0`` with this extension; requests for ``forward_dynamics`` retain SGLang's
+video sampling defaults and explicit overrides. Distilled checkpoints retain
+their fixed guidance of ``1.0``.
+
+The learned-loop example selects this extension and policy guidance ``1.5``.
+When connecting to an externally managed server, launch it with the same
+external module and pipeline selection.
+
 Verification
 ----------------------------------------
 
