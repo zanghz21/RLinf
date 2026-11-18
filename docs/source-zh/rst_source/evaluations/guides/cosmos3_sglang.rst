@@ -139,7 +139,7 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
 
 通过现有评测 worker，让 Cosmos3 同时生成动作和后续观测。``SGLangEmbodiedWorker`` 请求动作，``EnvWorker`` 运行 ``Cosmos3Env``，将归一化 10 维动作原样传给同一个 server 进行 forward prediction。``EmbodiedEvalRunner`` 将生成视频的最后一帧反馈给下一轮 policy。本流程使用 rollout 模型配置，只执行推理，不启动 actor 或训练更新。
 
-两条路径都使用 ``InferenceHTTPClient`` 发送 HTTP 请求。``Cosmos3Client`` 通过它组织视频任务的提交、轮询和下载。每个 worker 持有自己的 client 实例，连接同一个模型 server；视频提交保持零自动重试。
+policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosmos3Client`` 向同一个 server 的官方 ``POST /rollout/generate`` 接口发送仅推理请求（``rollout=false``）。server 通过 MessagePack 响应返回 safetensors 编码的已解码张量。RLinf 在内存中按 SGLang 的裁剪与截断规则，将浮点像素转换为 ``uint8`` RGB，再把最后一帧直接传给下一轮 policy。条件图像使用内存中的无损 PNG data URI，反馈链路不经过 MP4 编码和解码。
 
 在 ``examples/embodiment/config/cosmos3_closed_loop.yaml`` 中配置 checkpoint 和 LeRobot 数据集路径。默认选择 LIBERO-Spatial episode ``1261``、frame ``0``、数据集 task index ``30``。输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。初始化只取一帧观测，因此单独记录数据集的 10 FPS 元数据。后续观测全部来自生成视频。
 
@@ -165,17 +165,33 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
      CUDA_CACHE_PATH="$PWD/../.cache/cuda" TRITON_CACHE_DIR="$PWD/../.cache/triton" \
      bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
      examples/embodiment/eval_cosmos3_closed_loop.py \
-     runner.logger.log_path=/shared/cosmos3/run-001
+     runner.logger.log_path=/shared/cosmos3/run-001 \
+     env.eval.max_episode_steps=48 env.eval.max_steps_per_rollout_epoch=48
 
 该命令为单节点 smoke test 创建独立的 Ray 会话，并在本次进程中取消代理设置，让 server 健康检查直接连接。CUDA wrapper 只配置动态库加载。将 Ray 临时数据放在共享存储时，应把 ``RAY_TMPDIR`` 设为较短的路径，或指向共享存储的短路径符号链接；Ray 使用的 Unix socket 路径有长度限制。
 
-配置启动一个 server、一个 rollout worker 和一个 env worker。48 个环境步对应三个包含 16 个动作的 chunk。每次运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://host:30000]'``。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 应使用普通推理模式，并保持动作归一化统计参数未设置。
+默认配置在同一节点启动一个 server、一个 rollout worker 和一个 env worker。命令中的 48 个环境步对应三个包含 16 个动作的 chunk。每次 debug 运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://model-server:30000]'``。支持 HTTP 和 HTTPS 地址，server 可以部署在其他节点。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 必须支持 rollout 接口，使用普通推理模式，并保持动作归一化统计参数未设置。
 
-检查 ``<log_path>/artifacts/config.json``、``server.json`` 和 ``episode_000/``。每轮保存输入图像、原始动作数组、dynamics 请求与响应、预测视频、下一帧观测和状态。dynamics 请求中的动作必须与保存的 policy 动作完全一致，下一轮输入必须等于上一轮预测视频的最后一帧。``closed_loop.mp4`` 拼接生成轨迹并去除重复条件帧。指标只报告生成步数和 chunk 数；接口所需的占位 reward 张量不表示任务成功。
+默认 ``env.eval.debug.save_artifacts=false``，环境只在内存中保留当前观测，不累积轨迹帧，也不写入图像、视频或请求记录。指标只报告生成步数和 chunk 数；接口所需的占位 reward 张量不表示任务成功。
 
-获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。已在 A800 上使用驱动 ``570.172.08``、兼容库 ``580.196.07``、Torch ``2.13.0+cu130`` 和 SGLang ``0.5.19`` 完成真实三轮闭环，共 48 个动作步，拼接视频包含 49 帧。产物检查确认动作原样传递，且前一轮生成的图像准确反馈到下一轮。这验证了推理和反馈链路，任务表现仍需单独评测。
+需要检查某次运行时，开启 debug 产物：
 
-较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。多节点 Ray 任务应使用已分配集群的地址，替换 ``RAY_ADDRESS=local``。在每个执行节点启动 Ray 之前，分别选择该节点适用的兼容库；不要将头节点为驱动 570 设置的库路径直接传播到使用更新驱动的节点。
+.. code-block:: yaml
+
+   env:
+     eval:
+       debug:
+         save_artifacts: true
+       video_cfg:
+         save_video: false
+
+debug 模式在 ``<log_path>/artifacts/`` 下记录输入与下一次观测的 PNG、预测原始帧、native 动作、请求元数据和每轮状态，并保存预览 MP4 与去除重复条件帧后的 ``closed_loop.mp4``。即使开启 debug，下一次观测也始终来自原始帧，预览视频的压缩不会改变反馈像素。保持 ``video_cfg.save_video=false``，由环境自身管理 debug 录制。
+
+检查 dynamics 请求是否接收到 policy 原样输出的 native 动作，以及下一轮观测是否逐像素等于前一轮原始预测的最后一帧。debug 模式会为预览保留轨迹帧；只需要指标的运行应保持关闭。
+
+获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。闭环跑通说明推理和反馈链路正常，任务表现仍需单独评测。
+
+较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。默认示例使用单节点，HTTP 传输也支持独立部署的兼容 server。在各执行节点启动 Ray 之前，选择该节点适用的兼容库；不要将驱动 570 所用的库路径直接应用于使用更新驱动的节点。
 
 常见问题
 ----------------------------------------

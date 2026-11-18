@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING, Any
 
 from packaging.version import parse
 
@@ -33,14 +35,26 @@ if package_version is None:
     raise ValueError("sglang is not installed.")
 elif package_version >= parse("0.4.4") and package_version <= parse("0.5.19"):
     sglang_version = package_version
-    from rlinf.hybrid_engines.sglang.common import io_struct
-    from rlinf.hybrid_engines.sglang.common.sgl_engine import (
-        Engine,
-    )
 else:
     raise ValueError(
         f"sglang version {package_version} is not supported "
         "(supported range: >=0.4.4, <=0.5.19)."
     )
 
+if TYPE_CHECKING:
+    from rlinf.hybrid_engines.sglang.common import io_struct
+    from rlinf.hybrid_engines.sglang.common.sgl_engine import Engine
+
 __all__ = ["Engine", "io_struct"]
+
+
+def __getattr__(name: str) -> Any:
+    """Load text-engine patches only when a text rollout requests them."""
+    if name == "Engine":
+        value = import_module("rlinf.hybrid_engines.sglang.common.sgl_engine").Engine
+    elif name == "io_struct":
+        value = import_module("rlinf.hybrid_engines.sglang.common.io_struct")
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value

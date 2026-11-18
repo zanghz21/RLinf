@@ -12,24 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise Cosmos3 worker boundaries against an HTTP service without weights."""
+"""Exercise Cosmos3 worker boundaries with raw frames and no model weights."""
 
+import base64
 import io
 import json
 import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
 
-from rlinf.models.embodiment.cosmos3.closed_loop_client import Cosmos3Client
+from rlinf.models.embodiment.cosmos3.closed_loop_client import (
+    Cosmos3Client,
+    dynamics_request,
+)
 from rlinf.models.embodiment.cosmos3.closed_loop_io import (
     read_video_frames,
-    save_video,
 )
 from rlinf.models.embodiment.cosmos3.sglang_adapter import Cosmos3SGLangAdapter
 from rlinf.utils.http_client import InferenceHTTPClient
@@ -41,17 +45,19 @@ pytest.importorskip("requests")
 
 
 class FakeSGLang:
-    """Serve policy envelopes and asynchronous video jobs at the process boundary."""
+    """Serve policy and raw rollout responses at the real HTTP boundary."""
 
-    def __init__(self, videos=(), mode="completed", cancel_status=200):
-        self.videos = videos
-        self.mode = mode
-        self.cancel_status = cancel_status
+    def __init__(self, frames=None):
+        self.frames = frames or []
+        self.generated_output = None
+        self.response_count = 1
+        self.error_status = None
+        self.delay_s = 0
+        self.rollout_requests = []
         self.model_path = "/unused/checkpoint"
         self.requests = []
         self.policy_values = None
         self.policy_outputs = []
-        self.jobs = {}
 
     def handler(self):
         owner = self
@@ -61,7 +67,7 @@ class FakeSGLang:
                 return
 
             def respond(self, value, status=200):
-                if self.headers.get("Accept") == "application/msgpack":
+                if status < 400 and self.headers.get("Accept") == "application/msgpack":
                     from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
                         pack_msgpack,
                     )
@@ -127,43 +133,69 @@ class FakeSGLang:
                             ]
                         }
                     )
-                elif self.path == "/v1/videos":
-                    if owner.mode == "submission_failed":
-                        self.respond({"error": "test submission failure"}, 503)
+                elif self.path == "/rollout/generate":
+                    import msgspec
+                    import torch
+                    from safetensors.torch import save
+
+                    owner.rollout_requests.append(payload)
+                    assert self.headers.get("Content-Type") == "application/json"
+                    assert self.headers.get("Accept") == "application/msgpack"
+                    if owner.delay_s:
+                        time.sleep(owner.delay_s)
+                    if owner.error_status:
+                        self.respond(
+                            {"detail": "test generation failure"}, owner.error_status
+                        )
                         return
-                    job_id = f"video-{len(owner.jobs)}"
-                    owner.jobs[job_id] = {"polls": 0, "index": len(owner.jobs)}
-                    self.respond({"id": job_id, "status": "queued"})
+                    output = owner.generated_output
+                    if output is None:
+                        frames = owner.frames[
+                            (len(owner.rollout_requests) - 1) % len(owner.frames)
+                        ]
+                        output = (
+                            torch.from_numpy(frames.copy()).permute(3, 0, 1, 2).float()
+                            / 255
+                        )
+                    output = output.contiguous()
+                    response = {
+                        "request_id": f"test-request-{len(owner.rollout_requests)}",
+                        "prompt": payload["prompt"],
+                        "seed": payload["seed"],
+                        "generated_output": {
+                            "__tensor__": True,
+                            "data": save({"t": output}),
+                            "shape": list(output.shape),
+                            "dtype": str(output.dtype),
+                        },
+                        "inference_time_s": 0.01,
+                    }
+                    body = msgspec.msgpack.encode([response] * owner.response_count)
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Content-Type", "application/msgpack")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
                 else:
                     self.respond({"error": "unknown route"}, 404)
 
             def do_GET(self):
                 owner.requests.append(("GET", self.path, None))
                 if self.path == "/server_info":
+                    from sglang.version import __version__
+
                     self.respond(
-                        {"model_path": owner.model_path, "pipeline": "Cosmos3Pipeline"}
+                        {
+                            "model_path": owner.model_path,
+                            "pipeline": "RLinfCosmos3Pipeline",
+                            "version": __version__,
+                        }
                     )
                     return
-                pieces = self.path.strip("/").split("/")
-                if len(pieces) < 3 or pieces[:2] != ["v1", "videos"]:
-                    self.respond({"error": "unknown route"}, 404)
-                    return
-                job_id = pieces[2]
-                job = owner.jobs[job_id]
-                if pieces[-1] == "content":
-                    self.respond(owner.videos[job["index"] % len(owner.videos)])
-                    return
-                job["polls"] += 1
-                status = owner.mode
-                if status == "completed" and job["polls"] == 1:
-                    status = "in_progress"
-                self.respond(
-                    {"id": job_id, "status": status, "error": "test generation failure"}
-                )
-
-            def do_DELETE(self):
-                owner.requests.append(("DELETE", self.path, None))
-                self.respond({"status": "cancelled"}, owner.cancel_status)
+                self.respond({"error": "unknown route"}, 404)
 
         return Handler
 
@@ -205,50 +237,147 @@ def generation():
 
 
 @pytest.fixture
-def videos(tmp_path):
-    pytest.importorskip("imageio.v2")
-    pytest.importorskip("imageio_ffmpeg")
-    result = []
-    for index in range(3):
-        frames = np.full((5, 16, 16, 3), 40 + index * 50, dtype=np.uint8)
-        frames[-1, :, :, 0] += 20
-        path = tmp_path / f"source_{index}.mp4"
-        save_video(path, frames, 20)
-        result.append(path.read_bytes())
-    return result
+def raw_frames():
+    rng = np.random.default_rng(718)
+    return [rng.integers(0, 256, (5, 16, 16, 3), dtype=np.uint8) for _ in range(3)]
 
 
-@pytest.mark.parametrize("cancel_status", [200, 500])
-def test_failed_video_is_cancelled_and_keeps_original_error(
-    tmp_path, serve, cancel_status
-):
-    service = FakeSGLang(mode="failed", cancel_status=cancel_status)
-    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
+def test_raw_dynamics_returns_frames_without_video_jobs(generation, serve, raw_frames):
+    service = FakeSGLang(raw_frames)
+    client = Cosmos3Client(serve(service), timeout_s=5)
+    source = np.full((16, 16, 3), 17, dtype=np.uint8)
+    actions = np.arange(40, dtype=np.float32).reshape(4, 10)
+    payload = dynamics_request("move bowl", source, generation, actions)
     try:
-        with pytest.raises(RuntimeError, match="test generation failure"):
-            client.generate_video(
-                {"action_mode": "forward_dynamics"}, tmp_path / "prediction.mp4"
+        frames, metadata = client.generate_frames(payload)
+    finally:
+        client.close()
+        client.close()
+    np.testing.assert_array_equal(frames, raw_frames[0])
+    request = service.rollout_requests[0]
+    np.testing.assert_array_equal(decode_image(request["image_path"][0]), source)
+    params = request["extra_sampling_params"]
+    np.testing.assert_array_equal(params["action"], actions)
+    assert request["rollout"] is False
+    assert request["rollout_debug_mode"] is False
+    assert request["seed"] == generation["seed"]
+    assert params["save_output"] is False
+    assert params["return_frames"] is False
+    assert params["return_file_paths_only"] is False
+    assert "return_raw_frames" not in params
+    assert "output_path" not in params
+    assert "seed" not in params
+    assert metadata["request_id"] == "test-request-1"
+    assert metadata["generation_time_s"] == 0.01
+    assert metadata["raw_shape"] == [3, 5, 16, 16]
+    assert all(path == "/rollout/generate" for _, path, _ in service.requests)
+
+
+def decode_image(uri):
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))))
+
+
+@pytest.mark.parametrize("failure", ["http_error", "timeout"])
+def test_raw_dynamics_failure_is_not_retried(generation, serve, raw_frames, failure):
+    service = FakeSGLang(raw_frames)
+    if failure == "http_error":
+        service.error_status = 500
+    else:
+        service.delay_s = 0.2
+    client = Cosmos3Client(
+        serve(service), timeout_s=0.05 if failure == "timeout" else 5
+    )
+    try:
+        with pytest.raises(RuntimeError, match="failed"):
+            client.generate_frames(
+                dynamics_request(
+                    "move bowl",
+                    np.zeros((16, 16, 3), dtype=np.uint8),
+                    generation,
+                    np.zeros((4, 10), dtype=np.float32),
+                )
             )
     finally:
         client.close()
-    assert ("DELETE", "/v1/videos/video-0", None) in service.requests
-    assert not any(path.endswith("/content") for _, path, _ in service.requests)
+    assert len(service.rollout_requests) == 1
+    assert all(path == "/rollout/generate" for _, path, _ in service.requests)
 
 
-@pytest.mark.parametrize("cancel_status", [200, 500])
-def test_video_timeout_cancels_job_without_masking_timeout(
-    tmp_path, serve, cancel_status
+@pytest.mark.parametrize(
+    "layout,dtype", [("cthw", "float32"), ("thwc", "float32"), ("thwc", "uint8")]
+)
+def test_raw_dynamics_decodes_supported_tensor_layouts(
+    generation, serve, raw_frames, layout, dtype
 ):
-    service = FakeSGLang(mode="in_progress", cancel_status=cancel_status)
-    client = Cosmos3Client(serve(service), timeout_s=0.15, poll_interval_s=0.01)
+    import torch
+
+    service = FakeSGLang(raw_frames)
+    output = torch.from_numpy(raw_frames[0].copy())
+    if dtype == "float32":
+        output = output.float() / 255
+    if layout == "cthw":
+        output = output.permute(3, 0, 1, 2)
+    service.generated_output = output
+    client = Cosmos3Client(serve(service), timeout_s=5)
     try:
-        with pytest.raises(TimeoutError, match="exceeded"):
-            client.generate_video(
-                {"action_mode": "forward_dynamics"}, tmp_path / "prediction.mp4"
+        frames, _ = client.generate_frames(
+            dynamics_request(
+                "move bowl", raw_frames[0][0], generation, np.zeros((4, 10))
+            )
+        )
+    finally:
+        client.close()
+    np.testing.assert_array_equal(frames, raw_frames[0])
+    assert frames.dtype == np.uint8
+
+
+def test_raw_dynamics_matches_official_pixel_quantization(
+    generation, serve, raw_frames
+):
+    import torch
+    from sglang.multimodal_gen.runtime.entrypoints.utils import _sample_to_uint8_frames
+
+    service = FakeSGLang(raw_frames)
+    raw = torch.from_numpy(raw_frames[0].copy()).permute(3, 0, 1, 2).float() / 255
+    raw[0, 0, 0, :3] = torch.tensor([-0.5, 0.5, 1.5])
+    service.generated_output = raw
+    expected = np.stack(_sample_to_uint8_frames(raw))
+    client = Cosmos3Client(serve(service), timeout_s=5)
+    try:
+        frames, _ = client.generate_frames(
+            dynamics_request(
+                "move bowl", raw_frames[0][0], generation, np.zeros((4, 10))
+            )
+        )
+    finally:
+        client.close()
+    np.testing.assert_array_equal(frames, expected)
+    np.testing.assert_array_equal(frames[0, 0, :3, 0], [0, 127, 255])
+
+
+@pytest.mark.parametrize(
+    "shape,response_count",
+    [((3, 5, 16, 16), 0), ((3, 5, 16, 16), 2), ((1, 3, 5, 16, 16), 1)],
+)
+def test_raw_dynamics_rejects_batch_or_tensor_shape(
+    generation, serve, raw_frames, shape, response_count
+):
+    import torch
+
+    service = FakeSGLang(raw_frames)
+    service.generated_output = torch.zeros(shape)
+    service.response_count = response_count
+    client = Cosmos3Client(serve(service), timeout_s=5)
+    try:
+        with pytest.raises(ValueError):
+            client.generate_frames(
+                dynamics_request(
+                    "move bowl", raw_frames[0][0], generation, np.zeros((4, 10))
+                )
             )
     finally:
         client.close()
-    assert ("DELETE", "/v1/videos/video-0", None) in service.requests
+    assert len(service.rollout_requests) == 1
 
 
 @pytest.fixture
@@ -301,7 +430,6 @@ def run_config(tmp_path, generation):
         "server": {
             "startup_timeout_s": 5,
             "request_timeout_s": 5,
-            "poll_interval_s": 0.001,
         },
     }
 
@@ -340,15 +468,17 @@ def rollout_worker(cfg, url):
     return worker
 
 
-def test_workers_preserve_actions_and_feed_back_generated_images(
-    worker_config, serve, videos
+@pytest.mark.parametrize("debug", [False, True])
+def test_workers_preserve_actions_and_feed_back_raw_images(
+    worker_config, serve, raw_frames, debug
 ):
     import torch
 
     from rlinf.envs import get_env_cls
     from rlinf.workers.env.env_worker import EnvWorker
 
-    service = FakeSGLang(videos)
+    worker_config.env.eval.debug.save_artifacts = debug
+    service = FakeSGLang(raw_frames)
     url = serve(service)
     rollout = rollout_worker(worker_config, url)
     env_cfg = worker_config.env.eval
@@ -369,38 +499,71 @@ def test_workers_preserve_actions_and_feed_back_generated_images(
     observations = []
     try:
         obs, _ = env.reset()
-        for _ in range(3):
+        for cycle in range(3):
             observations.append(obs["main_images"].clone())
             actions, _ = rollout.predict(obs)
             output, metrics = env_worker.env_evaluate_step(actions.numpy(), 0)
             obs = output.obs
+            np.testing.assert_array_equal(
+                obs["main_images"][0].numpy(), raw_frames[cycle][-1]
+            )
+            if not debug:
+                assert env._frames == []
         assert metrics["episode_len"].item() == 12
         assert "success" not in metrics
         assert "return" not in metrics
+        if debug:
+            preview = Path(env_cfg.artifact_dir) / "episode_000/closed_loop.mp4"
+            written_at = preview.stat().st_mtime_ns
+            env.flush_video()
+            env.flush_video()
+            assert preview.stat().st_mtime_ns == written_at
+        else:
+            assert not Path(env_cfg.artifact_dir).exists()
     finally:
         env_worker.close_cosmos3_envs()
         rollout.http_client.close()
 
-    posts = [
-        (path, body) for method, path, body in service.requests if method == "POST"
+    policies = [
+        body
+        for method, path, body in service.requests
+        if method == "POST" and path == "/v1/actions/generations"
     ]
-    assert [path for path, _ in posts] == ["/v1/actions/generations", "/v1/videos"] * 3
-    for cycle in range(3):
-        policy = posts[2 * cycle][1]
-        dynamics = posts[2 * cycle + 1][1]
-        np.testing.assert_array_equal(dynamics["action"], service.policy_outputs[cycle])
-        assert dynamics["reference_url"] == policy["input"]["input_reference"][0]
-        assert dynamics["prompt"] == policy["input"]["prompt"][0]
-        assert "concatenated views" in dynamics["prompt"]
-        assert policy["parameters"]["domain_name"] == "libero"
+    assert len(policies) == 3
+    assert not any(path.startswith("/v1/videos") for _, path, _ in service.requests)
+    dynamics = service.rollout_requests
+    assert len(dynamics) == 3
+    for cycle, (policy, request) in enumerate(zip(policies, dynamics, strict=True)):
+        np.testing.assert_array_equal(
+            request["extra_sampling_params"]["action"], service.policy_outputs[cycle]
+        )
+        encoded = policy["input"]["input_reference"][0].split(",", 1)[1]
+        policy_image = np.asarray(Image.open(io.BytesIO(base64.b64decode(encoded))))
+        np.testing.assert_array_equal(
+            policy_image, decode_image(request["image_path"][0])
+        )
+        np.testing.assert_array_equal(policy_image, observations[cycle][0].numpy())
+        assert request["prompt"] == policy["input"]["prompt"][0]
+        assert "concatenated views" in request["prompt"]
         if cycle:
-            previous = Path(env_cfg.artifact_dir)
-            # The downloaded clip is also the exact source of the next observation.
-            decoded = read_video_frames(
-                next(previous.rglob(f"cycle_{cycle - 1:03d}/prediction.mp4"))
+            np.testing.assert_array_equal(policy_image, raw_frames[cycle - 1][-1])
+        if debug:
+            directory = Path(env_cfg.artifact_dir) / f"episode_000/cycle_{cycle:03d}"
+            np.testing.assert_array_equal(
+                np.load(directory / "frames.npy"), raw_frames[cycle]
             )
-            np.testing.assert_array_equal(observations[cycle][0].numpy(), decoded[-1])
-    assert len(list(Path(env_cfg.artifact_dir).rglob("actions_native.npy"))) == 3
+            np.testing.assert_array_equal(
+                np.asarray(Image.open(directory / "next_observation.png")),
+                raw_frames[cycle][-1],
+            )
+            assert not np.array_equal(
+                read_video_frames(directory / "prediction.mp4")[-1],
+                raw_frames[cycle][-1],
+            )
+    if debug:
+        assert preview.stat().st_mtime_ns == written_at
+    else:
+        assert not Path(env_cfg.artifact_dir).exists()
 
 
 @pytest.mark.parametrize("invalid", [np.nan, np.inf])
@@ -417,7 +580,6 @@ def test_native_adapter_rejects_nonfinite_actions(worker_config, serve, invalid)
                 "task_descriptions": ["move bowl"],
             }
         )
-    assert not service.jobs
 
 
 @pytest.mark.parametrize("shape", [(3, 10), (4, 7), (4, 64)])
@@ -459,6 +621,7 @@ def test_example_config_validates_without_starting_ray(worker_config):
         ("rollout.model.size", "32x16"),
         ("env.eval.max_episode_steps", 16),
         ("rollout.sglang.launch_server", False),
+        ("env.eval.video_cfg.save_video", True),
     ],
 )
 def test_example_rejects_incompatible_configuration(worker_config, field, value):
@@ -467,6 +630,17 @@ def test_example_rejects_incompatible_configuration(worker_config, field, value)
     OmegaConf.update(worker_config, field, value)
     with pytest.raises(ValueError):
         validate_closed_loop_cfg(worker_config)
+
+
+@pytest.mark.parametrize(
+    "url", ["http://model-server:30000", "https://model-server:30000"]
+)
+def test_example_accepts_external_http_servers(worker_config, url):
+    from examples.embodiment.eval_cosmos3_closed_loop import validate_closed_loop_cfg
+
+    worker_config.rollout.sglang.launch_server = False
+    worker_config.rollout.sglang.server_urls = [url]
+    validate_closed_loop_cfg(worker_config)
 
 
 def test_native_policy_preserves_seed_zero(worker_config):
@@ -481,11 +655,13 @@ def test_native_policy_preserves_seed_zero(worker_config):
     assert payload["parameters"]["seed"] == 0
 
 
-def test_env_failure_retains_actions_and_error(worker_config, serve):
+def test_env_failure_retains_debug_actions_and_error(worker_config, serve, raw_frames):
     from rlinf.envs import get_env_cls
 
-    service = FakeSGLang(mode="failed")
+    service = FakeSGLang(raw_frames)
+    service.error_status = 500
     cfg = worker_config.env.eval
+    cfg.debug.save_artifacts = True
     env = get_env_cls(cfg.env_type, cfg)(cfg=cfg, num_envs=1)
     env.set_sglang_server_urls([serve(service)])
     try:
@@ -506,6 +682,7 @@ def test_env_rejects_reusing_artifact_directory(worker_config):
     from rlinf.envs import get_env_cls
 
     cfg = worker_config.env.eval
+    cfg.debug.save_artifacts = True
     root = Path(cfg.artifact_dir)
     root.mkdir()
     sentinel = root / "existing.json"
@@ -515,20 +692,21 @@ def test_env_rejects_reusing_artifact_directory(worker_config):
     assert sentinel.read_text() == "previous run"
 
 
-def test_video_submission_failure_is_not_retried(tmp_path, serve):
-    service = FakeSGLang(mode="submission_failed")
-    client = Cosmos3Client(serve(service), timeout_s=5, poll_interval_s=0.001)
-    try:
-        with pytest.raises(RuntimeError, match="test submission failure"):
-            client.generate_video(
-                {"action_mode": "forward_dynamics"}, tmp_path / "prediction.mp4"
-            )
-    finally:
-        client.close()
-    assert [(method, path) for method, path, _ in service.requests] == [
-        ("POST", "/v1/videos")
-    ]
-    assert not service.jobs
+def test_embodied_import_does_not_load_text_engine():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from rlinf.workers.rollout.sglang.sglang_embodied_worker "
+            "import SGLangEmbodiedWorker; "
+            "assert 'rlinf.hybrid_engines.sglang.common.sgl_engine' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("guidance", [1.0, 1.5, 3.0])
@@ -600,6 +778,13 @@ from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     build_action_sampling_params,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import RolloutRequest
+from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import _build_sampling_kwargs
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+
+from rlinf.models.embodiment.cosmos3.closed_loop_client import dynamics_request
 
 extension = "RLinfCosmos3Pipeline"
 config_cls, sampling_cls = get_pipeline_config_classes(extension)
@@ -617,6 +802,8 @@ args = SimpleNamespace(
     num_gpus=1,
     output_path=None,
     comfyui_mode=False,
+    attention_backend_config=SimpleNamespace(VSA_sparsity=0.0),
+    enable_trace=False,
 )
 parameters = {
     "action_mode": "policy",
@@ -673,6 +860,30 @@ for guidance, expected in ((None, 5.0), (3.0, 3.0)):
         assert item.guidance_scale == expected
         assert item.num_frames == 17
         assert item.action_mode == "forward_dynamics"
+
+set_global_server_args(args)
+http_parameters = {key: value for key, value in parameters.items() if key != "action_mode"}
+http_parameters.update(fps=20, action_fps=20.0, action_view_point="ego_view")
+native_actions = np.zeros((16, 10), dtype=np.float32)
+payload = dynamics_request(
+    "move bowl", np.zeros((480, 832, 3), dtype=np.uint8),
+    http_parameters, native_actions,
+)
+request = RolloutRequest(**payload)
+kwargs = _build_sampling_kwargs(request)
+sampling = build_sampling_params("test-http-dynamics", **kwargs)
+assert isinstance(sampling, sampling_cls)
+assert sampling.guidance_scale == 5.0
+assert sampling.action_mode == "forward_dynamics"
+assert sampling.num_frames == 17
+assert sampling.width == 832 and sampling.height == 480
+prepared = prepare_request(server_args=args, sampling_params=sampling)
+assert prepared.rollout is False
+assert prepared.save_output is False
+assert prepared.return_frames is False
+assert prepared.return_raw_frames is False
+assert prepared.return_file_paths_only is False
+np.testing.assert_array_equal(prepared.action, native_actions)
 
 args.pipeline_class_name = extension
 args.pipeline_config.distilled_sigmas = [1.0, 0.5, 0.1, 0.0]

@@ -49,6 +49,7 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         "env.eval.rollout_epoch": 1,
         "env.eval.auto_reset": False,
         "env.eval.enable_offload": False,
+        "env.eval.video_cfg.save_video": False,
         "rollout.pipeline_stage_num": 1,
         "rollout.rollout_backend": "sglang",
         "rollout.return_logprobs": False,
@@ -124,8 +125,8 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
     for field in ("width", "height", "fps", "action_fps", "num_inference_steps"):
         if env.generation[field] <= 0:
             raise ValueError(f"Generation {field} must be positive")
-    if env.server.request_timeout_s <= 0 or env.server.poll_interval_s <= 0:
-        raise ValueError("Server timeouts must be positive")
+    if env.server.request_timeout_s <= 0:
+        raise ValueError("Server request timeout must be positive")
     if Path(serving.server.model_path).resolve() != Path(model.model_path).resolve():
         raise ValueError("Policy and dynamics must use the same checkpoint")
     urls = list(serving.server_urls)
@@ -172,7 +173,8 @@ def run(cfg: DictConfig) -> None:
     """Run the normal evaluation runner with one server shared by both workers."""
     validate_closed_loop_cfg(cfg)
     artifact_dir = Path(cfg.env.eval.artifact_dir).resolve()
-    if artifact_dir.exists():
+    save_artifacts = bool(cfg.env.eval.get("debug", {}).get("save_artifacts", False))
+    if save_artifacts and artifact_dir.exists():
         raise FileExistsError(f"Choose a new artifact directory: {artifact_dir}")
     cfg = validate_cfg(cfg)
     cluster = Cluster(cluster_cfg=cfg.cluster)
@@ -224,16 +226,17 @@ def run(cfg: DictConfig) -> None:
         env_group.set_sglang_server_urls(urls).wait()
         runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
         runner.init_workers()
-        # Environment initialization owns creation of the new artifact directory.
-        (artifact_dir / "config.json").write_text(
-            json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2) + "\n"
-        )
-        (artifact_dir / "server.json").write_text(
-            json.dumps(server_info, indent=2) + "\n"
-        )
-        (artifact_dir / "runtime.json").write_text(
-            json.dumps(runtime_metadata(), indent=2) + "\n"
-        )
+        if save_artifacts:
+            # Environment initialization owns creation of the new artifact directory.
+            (artifact_dir / "config.json").write_text(
+                json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2) + "\n"
+            )
+            (artifact_dir / "server.json").write_text(
+                json.dumps(server_info, indent=2) + "\n"
+            )
+            (artifact_dir / "runtime.json").write_text(
+                json.dumps(runtime_metadata(), indent=2) + "\n"
+            )
         runner.run()
     finally:
         for group, method in (

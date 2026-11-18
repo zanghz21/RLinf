@@ -151,7 +151,7 @@ Run a Learned World Model Loop
 
 Use the existing evaluation workers to run Cosmos3 as both policy and world model. ``SGLangEmbodiedWorker`` requests actions; ``EnvWorker`` runs ``Cosmos3Env`` and sends those unchanged normalized 10D actions to the same server for forward prediction. ``EmbodiedEvalRunner`` feeds the final generated frame into the next policy call. This inference-only flow uses the rollout model configuration and omits the actor process and training updates.
 
-Both roles use ``InferenceHTTPClient`` for HTTP transport. ``Cosmos3Client`` handles video-job submission, polling, and downloading through that client. Each worker owns its own client instance and connects to the same model server; video submission has no automatic retries.
+The policy uses ``InferenceHTTPClient`` for action requests. For forward dynamics, ``Cosmos3Client`` sends an inference-only request (``rollout=false``) to the same server's official ``POST /rollout/generate`` endpoint. The server returns decoded tensors in a MessagePack response with safetensors data. RLinf converts floating-point pixels to ``uint8`` RGB in memory using SGLang's clamp-and-truncate rule, then passes the final frame directly to the next policy call. Conditioning images use lossless PNG data URIs in memory. MP4 encoding and decoding are outside the feedback path.
 
 Configure ``examples/embodiment/config/cosmos3_closed_loop.yaml`` with your checkpoint and LeRobot dataset paths. The default selects LIBERO-Spatial episode ``1261``, frame ``0``, dataset task index ``30``. It concatenates external and wrist views, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset's 10 FPS metadata is recorded separately because initialization uses one still observation. Subsequent observations come from generated video.
 
@@ -177,17 +177,33 @@ The default configuration selects GPU 0. RLinf discovers physical devices throug
      CUDA_CACHE_PATH="$PWD/../.cache/cuda" TRITON_CACHE_DIR="$PWD/../.cache/triton" \
      bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
      examples/embodiment/eval_cosmos3_closed_loop.py \
-     runner.logger.log_path=/shared/cosmos3/run-001
+     runner.logger.log_path=/shared/cosmos3/run-001 \
+     env.eval.max_episode_steps=48 env.eval.max_steps_per_rollout_epoch=48
 
 This command creates an independent Ray session for a single-node smoke test and removes proxy settings from that process so the server health check connects directly. The CUDA wrapper only configures library loading. For Ray temporary data on shared storage, set ``RAY_TMPDIR`` to a short path or a short symlink to that storage; Ray's Unix socket paths have a length limit.
 
-The configuration starts one server, one rollout worker, and one environment worker. Its 48 environment steps are three chunks of 16 actions. Use a new output path for every run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://host:30000]'``. The entry checks its checkpoint path and leaves externally owned servers running. External servers must use ordinary inference and leave action normalization statistics unset.
+The default configuration starts one server, one rollout worker, and one environment worker on the same node. The command's 48 environment steps are three chunks of 16 actions. Use a new output path for every debug run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://model-server:30000]'``. HTTP and HTTPS server URLs are supported; the server can run on another node. The entry checks its checkpoint path and leaves externally owned servers running. External servers must support the rollout endpoint, use ordinary inference, and leave action normalization statistics unset.
 
-Inspect ``<log_path>/artifacts/config.json``, ``server.json``, and ``episode_000/``. Each cycle saves its input canvas, native action array, dynamics request/response, predicted video, next image, and status. The dynamics request must contain exactly the saved policy actions, and the next cycle's input must match the preceding prediction's last frame. ``closed_loop.mp4`` joins the generated trajectory without duplicated conditioning frames. Metrics report generated length and chunk count; placeholder reward tensors do not measure task success.
+By default, ``env.eval.debug.save_artifacts=false``: the environment keeps the current observation in memory and does not accumulate trajectory frames or write images, videos, or request records. Metrics report generated length and chunk count; placeholder reward tensors do not measure task success.
 
-A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. A real run on an A800 with driver ``570.172.08``, compatibility libraries ``580.196.07``, Torch ``2.13.0+cu130``, and SGLang ``0.5.19`` completed three cycles: 48 action steps and a 49-frame stitched video. Artifact checks confirmed exact action transfer and image feedback between cycles. This validates inference and feedback wiring; task quality requires a separate evaluation.
+To inspect a run, enable debug artifacts:
 
-Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot. For a multi-node Ray allocation, use its cluster address instead of ``RAY_ADDRESS=local``. Select compatibility libraries on each execution node before starting Ray there; a driver-570 override from the head node must not be applied blindly to newer-driver nodes.
+.. code-block:: yaml
+
+   env:
+     eval:
+       debug:
+         save_artifacts: true
+       video_cfg:
+         save_video: false
+
+Debug mode records the input and next-observation PNGs, raw predicted frames, native actions, request metadata, and per-cycle status under ``<log_path>/artifacts/``. It also saves preview MP4s and ``closed_loop.mp4``, joining the trajectory without repeated conditioning frames. The next observation always comes from the raw frames, including in debug mode; preview compression cannot change feedback pixels. Keep ``video_cfg.save_video=false`` because this environment owns its debug recording.
+
+Check that each dynamics request receives the policy's unchanged native actions and that the next cycle's observation exactly matches the preceding raw prediction's final frame. Debug mode retains trajectory frames for the preview; leave it disabled for runs that only need metrics.
+
+A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. Completing the loop verifies inference and feedback wiring; task quality requires a separate evaluation.
+
+Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot. The default is a single-node example; HTTP transport also permits a separately hosted compatible server. Select compatibility libraries for each execution node before starting Ray; a driver-570 override must not be applied blindly to newer-driver nodes.
 
 FAQ
 ----------------------------------------

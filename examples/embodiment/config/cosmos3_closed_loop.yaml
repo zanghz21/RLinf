@@ -41,8 +41,10 @@ env:
     enable_offload: false
     use_fixed_reset_state_ids: true
     artifact_dir: ${runner.logger.log_path}/artifacts
+    debug:
+      save_artifacts: false
     dataset:
-      root: /mnt/public2/hongzhi/dataset/physical-intelligence/libero
+      root: /mnt/public/hongzhi/datasets/physical-intelligence/libero
       episode_index: 1261
       frame_index: 0
     generation:
@@ -58,7 +60,6 @@ env:
       seed: 1140
     server:
       request_timeout_s: 1800
-      poll_interval_s: 1
     video_cfg:
       save_video: false
 
@@ -90,6 +91,7 @@ rollout:
       pipeline_class_name: RLinfCosmos3Pipeline
       external_model_package: rlinf.models.embodiment.cosmos3.sglang_extension
       backend: sglang
+      input_save_path: null
       num_gpus: 1
       tp_size: 1
       attention_backend: TORCH_SDPA
@@ -99,7 +101,7 @@ rollout:
       batching_max_size: 1
   model:
     model_type: cosmos3
-    model_path: /mnt/public2/hongzhi/models/Cosmos3-Nano
+    model_path: /mnt/public/hongzhi/cosmos-simulator-policy/global_step_5000/actor/model_diffusers
     precision: bf16
     is_lora: false
     action_output: native
