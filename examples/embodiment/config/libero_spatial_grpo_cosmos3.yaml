@@ -1,0 +1,45 @@
+defaults:
+  - training/cosmos3_grpo
+  - env/libero_spatial@env.train
+  - env/libero_spatial@env.eval
+  - override hydra/job_logging: stdout
+  - _self_
+
+cluster:
+  component_placement:
+    actor: 0
+    rollout,env: 1
+
+runner:
+  logger:
+    experiment_name: libero_spatial_grpo_cosmos3
+
+actor:
+  model:
+    image_size: [192, 320]
+
+env:
+  train:
+    total_num_envs: 4
+    group_size: ${algorithm.group_size}
+    rollout_epoch: 1
+    seed: ${actor.seed}
+    reset_gripper_open: false
+    action_stats_path: /path/to/libero_native_frame_wise_relative_rot6d.json
+    action_normalization: quantile_rot
+    video_cfg:
+      save_video: false
+  eval:
+    task_suite_name: ${env.train.task_suite_name}
+    total_num_envs: ${env.train.total_num_envs}
+    rollout_epoch: 1
+    auto_reset: true
+    ignore_terminations: true
+    is_eval: true
+    use_ordered_reset_state_ids: true
+    reset_gripper_open: ${env.train.reset_gripper_open}
+    action_stats_path: ${env.train.action_stats_path}
+    action_normalization: ${env.train.action_normalization}
+    video_cfg:
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval

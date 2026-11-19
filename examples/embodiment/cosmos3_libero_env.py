@@ -23,9 +23,8 @@ from typing import Any
 
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
 
-from rlinf.models.embodiment.cosmos3.closed_loop_io import prepare_canvas
+from rlinf.models.embodiment.cosmos3.closed_loop_io import prepare_libero_canvases
 
 
 class LiberoComparisonEnv:
@@ -113,22 +112,13 @@ class LiberoComparisonEnv:
             raise RuntimeError("LIBERO comparison environment is closed")
 
     def _canvases(self, observation: dict) -> np.ndarray:
-        frames = []
-        for external, wrist in zip(
-            observation["main_images"], observation["wrist_images"], strict=True
-        ):
-            canvas, _ = prepare_canvas(
-                Image.fromarray(np.asarray(external)),
-                Image.fromarray(np.asarray(wrist)),
-                self._image_shape[1],
-                self._image_shape[0],
-            )
-            frames.append(np.asarray(canvas).copy())
-        images = np.stack(frames)
-        if (
-            images.shape != (self.num_envs, *self._image_shape)
-            or images.dtype != np.uint8
-        ):
+        images = prepare_libero_canvases(
+            observation["main_images"],
+            observation["wrist_images"],
+            self._image_shape[1],
+            self._image_shape[0],
+        )
+        if images.shape != (self.num_envs, *self._image_shape):
             raise ValueError("Expected one uint8 camera canvas per LIBERO environment")
         return images
 

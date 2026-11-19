@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import math
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -33,8 +36,205 @@ from rlinf.scheduler import Cluster
 from rlinf.utils.logging import get_logger
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWorker
-from rlinf.workers.rollout.sglang_server import launch_sglang_router_and_server
+from rlinf.workers.rollout.sglang_server import SGLangServerWorker
+
+
+def _validate_serving_cfg(
+    serving: DictConfig, model_path: str, role: str, *, single_server: bool
+) -> None:
+    """Validate one role's server before allocating workers."""
+    expected = {
+        "serving_mode": "embodied",
+        "server_type": "embodied",
+        "launch_router": False,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "http_max_retries": 0,
+        "server.num_gpus": 1,
+        "server.tp_size": 1,
+        "server.cfg_parallel_degree": 1,
+        "server.sp_degree": 1,
+    }
+    for field, value in expected.items():
+        actual = OmegaConf.select(serving, field)
+        if actual != value:
+            raise ValueError(f"{role} {field} must be {value!r}, got {actual!r}")
+    if type(serving.launch_server) is not bool:
+        raise ValueError(f"{role} launch_server must be a boolean")
+    if (
+        type(serving.server.batching_max_size) is not int
+        or serving.server.batching_max_size <= 0
+    ):
+        raise ValueError(f"{role} server.batching_max_size must be a positive integer")
+    if not math.isfinite(serving.http_timeout_s) or serving.http_timeout_s <= 0:
+        raise ValueError(f"{role} http_timeout_s must be finite and positive")
+    pipeline_name = serving.server.pipeline_class_name
+    if pipeline_name not in ("Cosmos3OmniDiffusersPipeline", "RLinfCosmos3Pipeline"):
+        raise ValueError(f"Unsupported {role} Cosmos3 pipeline: {pipeline_name!r}")
+    if pipeline_name == "RLinfCosmos3Pipeline" and serving.launch_server:
+        expected_package = "rlinf.models.embodiment.cosmos3.sglang_extension"
+        if serving.server.get("external_model_package") != expected_package:
+            raise ValueError(
+                f"{role} external_model_package must be {expected_package!r}"
+            )
+    advertised_path = serving.server.get("model_path")
+    if (
+        not advertised_path
+        or Path(advertised_path).resolve() != Path(model_path).resolve()
+    ):
+        raise ValueError(
+            f"{role} server.model_path must match its configured checkpoint"
+        )
+    urls = list(serving.server_urls)
+    if serving.launch_server:
+        if urls:
+            raise ValueError(
+                f"Disable {role} launch_server when supplying an external URL"
+            )
+    elif (
+        not urls
+        or (single_server and len(urls) != 1)
+        or any(
+            not isinstance(url, str)
+            or urlparse(url).scheme not in ("http", "https")
+            or not urlparse(url).netloc
+            for url in urls
+        )
+    ):
+        raise ValueError(
+            f"{role} external mode requires absolute HTTP(S) server URLs "
+            "(one in closed-loop eval)"
+        )
+
+
+def get_cosmos_server_configs(
+    cfg: DictConfig, *, single_server: bool = True
+) -> dict[str, DictConfig]:
+    """Resolve shared or independent role servers without changing user config.
+
+    Simulator serving options inherit the policy defaults. Its checkpoint,
+    launch mode, URLs and worker names are independently configured.
+    """
+    share_weights = OmegaConf.select(cfg, "cosmos.share_weights", default=True)
+    if type(share_weights) is not bool:
+        raise ValueError("cosmos.share_weights must be a boolean")
+    policy_path = cfg.rollout.model.model_path
+    if not isinstance(policy_path, str) or not policy_path.strip():
+        raise ValueError("rollout.model.model_path must be a nonempty checkpoint path")
+    policy = OmegaConf.create(OmegaConf.to_container(cfg.rollout.sglang, resolve=True))
+    _validate_serving_cfg(policy, policy_path, "policy", single_server=single_server)
+    simulator_path = OmegaConf.select(cfg, "cosmos.simulator.model_path")
+    overrides = OmegaConf.select(cfg, "cosmos.simulator.sglang", default={})
+    if share_weights:
+        if simulator_path is not None or overrides.get("server_urls"):
+            raise ValueError(
+                "Shared weights use rollout.model.model_path and rollout.sglang; "
+                "clear cosmos.simulator.model_path and simulator server_urls"
+            )
+        return {"policy": policy, "simulator": policy}
+    if not single_server:
+        raise ValueError("Cosmos3 comparison requires cosmos.share_weights=true")
+    if not isinstance(simulator_path, str) or not simulator_path.strip():
+        raise ValueError("Separate weights require cosmos.simulator.model_path")
+    simulator = OmegaConf.merge(
+        policy,
+        {
+            "launch_server": True,
+            "server_urls": [],
+            "group_name": "Cosmos3SimulatorServerGroup",
+            "router_group_name": "Cosmos3SimulatorRouterGroup",
+            "server": {"model_path": simulator_path},
+        },
+        OmegaConf.to_container(overrides, resolve=True)
+        if isinstance(overrides, DictConfig)
+        else overrides,
+    )
+    _validate_serving_cfg(
+        simulator, simulator_path, "simulator", single_server=single_server
+    )
+    if policy.launch_server and simulator.launch_server:
+        if policy.group_name == simulator.group_name:
+            raise ValueError("Separate servers require distinct group_name values")
+    if not policy.launch_server and not simulator.launch_server:
+        if {url.rstrip("/") for url in policy.server_urls} & {
+            url.rstrip("/") for url in simulator.server_urls
+        }:
+            raise ValueError(
+                "Separate weights require distinct policy and simulator URLs"
+            )
+    return {"policy": policy, "simulator": simulator}
+
+
+def validate_server_checkpoint(url: str, serving: DictConfig, role: str) -> dict:
+    """Check a server's advertised checkpoint before either role sends actions."""
+    client = Cosmos3Client(url, timeout_s=serving.http_timeout_s)
+    try:
+        info = client.server_info()
+    finally:
+        client.close()
+    advertised = info.get("model_path")
+    expected = serving.server.model_path
+    if not advertised or Path(advertised).resolve() != Path(expected).resolve():
+        raise ValueError(
+            f"{role} server checkpoint differs from configured model_path "
+            f"{expected!r}: {advertised!r}"
+        )
+    return info
+
+
+def _stop_server(group: object) -> None:
+    try:
+        group.stop().wait()
+    except Exception:
+        get_logger().exception("Failed to stop Cosmos3 server")
+
+
+@contextmanager
+def cosmos_servers(
+    cfg: DictConfig, cluster: Cluster, placement: HybridComponentPlacement
+) -> Iterator[tuple[dict[str, list[str]], dict]]:
+    """Own locally launched servers; leave externally supplied servers running.
+
+    Shared weights allocate one model instance. Separate weights allocate one
+    instance per role, with simulator placement selected by ``simulator``.
+    Cleanup is registered before model initialization so failed warmup is safe.
+    """
+    serving_configs = get_cosmos_server_configs(cfg)
+    shared = serving_configs["policy"] is serving_configs["simulator"]
+    urls, metadata = {}, {"share_weights": shared}
+    with ExitStack() as cleanup:
+        for role in ("policy", "simulator"):
+            if role == "simulator" and shared:
+                urls[role] = urls["policy"]
+                metadata[role] = metadata["policy"]
+                continue
+            serving = serving_configs[role]
+            if serving.launch_server:
+                component = "rollout" if role == "policy" else "simulator"
+                if placement.get_world_size(component) != 1:
+                    raise ValueError(f"Expected one {component} server worker")
+                strategy = placement.get_strategy(component)
+                assignments = strategy.get_placement(cluster)
+                if any(len(item.visible_accelerators) != 1 for item in assignments):
+                    raise ValueError(f"Each {role} server requires one accelerator")
+                group = SGLangServerWorker.create_group(
+                    config=cfg,
+                    sglang_cfg=serving.server,
+                    server_type=serving.server_type,
+                ).launch(
+                    cluster=cluster,
+                    name=serving.group_name,
+                    placement_strategy=strategy,
+                )
+                cleanup.callback(_stop_server, group)
+                group.init_server().wait()
+                urls[role] = list(group.get_server_url().wait())
+            else:
+                urls[role] = list(serving.server_urls)
+            if len(urls[role]) != 1:
+                raise ValueError(f"Expected one {role} server URL, got {urls[role]}")
+            metadata[role] = validate_server_checkpoint(urls[role][0], serving, role)
+        yield urls, metadata
 
 
 def validate_closed_loop_cfg(cfg: DictConfig, *, single_server: bool = True) -> None:
@@ -53,16 +253,6 @@ def validate_closed_loop_cfg(cfg: DictConfig, *, single_server: bool = True) -> 
         "rollout.rollout_backend": "sglang",
         "rollout.return_logprobs": False,
         "rollout.enable_offload": False,
-        "rollout.sglang.serving_mode": "embodied",
-        "rollout.sglang.server_type": "embodied",
-        "rollout.sglang.launch_router": False,
-        "rollout.sglang.tensor_parallel_size": 1,
-        "rollout.sglang.pipeline_parallel_size": 1,
-        "rollout.sglang.http_max_retries": 0,
-        "rollout.sglang.server.num_gpus": 1,
-        "rollout.sglang.server.tp_size": 1,
-        "rollout.sglang.server.cfg_parallel_degree": 1,
-        "rollout.sglang.server.sp_degree": 1,
         "rollout.model.model_type": "cosmos3",
         "rollout.model.action_output": "native",
         "rollout.model.action_dim": 10,
@@ -78,29 +268,15 @@ def validate_closed_loop_cfg(cfg: DictConfig, *, single_server: bool = True) -> 
         if actual != value:
             raise ValueError(f"{field} must be {value!r}, got {actual!r}")
     model, env, serving = cfg.rollout.model, cfg.env.eval, cfg.rollout.sglang
-    if (
-        type(serving.server.batching_max_size) is not int
-        or serving.server.batching_max_size <= 0
-    ):
-        raise ValueError(
-            "rollout.sglang.server.batching_max_size must be a positive integer"
-        )
+    get_cosmos_server_configs(cfg, single_server=single_server)
     if type(env.total_num_envs) is not int or env.total_num_envs <= 0:
         raise ValueError("env.eval.total_num_envs must be a positive integer")
     pipeline_name = serving.server.pipeline_class_name
-    if pipeline_name not in ("Cosmos3OmniDiffusersPipeline", "RLinfCosmos3Pipeline"):
-        raise ValueError(f"Unsupported Cosmos3 pipeline: {pipeline_name!r}")
     if (
         model.get("guidance_scale") is not None
         and pipeline_name != "RLinfCosmos3Pipeline"
     ):
         raise ValueError("Configurable policy guidance requires RLinfCosmos3Pipeline")
-    if pipeline_name == "RLinfCosmos3Pipeline" and serving.launch_server:
-        expected_package = "rlinf.models.embodiment.cosmos3.sglang_extension"
-        if serving.server.get("external_model_package") != expected_package:
-            raise ValueError(
-                f"Cosmos3 external_model_package must be {expected_package!r}"
-            )
     for field in (
         "num_frames",
         "fps",
@@ -134,23 +310,6 @@ def validate_closed_loop_cfg(cfg: DictConfig, *, single_server: bool = True) -> 
             raise ValueError(f"Generation {field} must be positive")
     if env.server.request_timeout_s <= 0:
         raise ValueError("Server request timeout must be positive")
-    if Path(serving.server.model_path).resolve() != Path(model.model_path).resolve():
-        raise ValueError("Policy and dynamics must use the same checkpoint")
-    urls = list(serving.server_urls)
-    if serving.launch_server:
-        if urls:
-            raise ValueError("Disable launch_server when supplying an external URL")
-    elif (
-        not urls
-        or (single_server and len(urls) != 1)
-        or any(
-            urlparse(url).scheme not in ("http", "https") or not urlparse(url).netloc
-            for url in urls
-        )
-    ):
-        raise ValueError(
-            "External mode requires absolute HTTP(S) server URLs (one in closed-loop eval)"
-        )
 
 
 def runtime_metadata() -> dict:
@@ -180,7 +339,7 @@ def runtime_metadata() -> dict:
 
 
 def run(cfg: DictConfig) -> None:
-    """Run the normal evaluation runner with one server shared by both workers."""
+    """Evaluate Cosmos3 using shared or independent policy and dynamics weights."""
     validate_closed_loop_cfg(cfg)
     artifact_dir = Path(cfg.env.eval.artifact_dir).resolve()
     save_artifacts = bool(cfg.env.eval.get("debug", {}).get("save_artifacts", False))
@@ -192,36 +351,25 @@ def run(cfg: DictConfig) -> None:
     for name in ("env", "rollout"):
         if placement.get_world_size(name) != 1:
             raise ValueError(f"Cosmos3 initial loop requires one {name} worker")
-    server_group = router_group = env_group = None
+    with cosmos_servers(cfg, cluster, placement) as (urls, server_info):
+        _run_workers(
+            cfg, cluster, placement, urls, server_info, artifact_dir, save_artifacts
+        )
+
+
+def _run_workers(
+    cfg: DictConfig,
+    cluster: Cluster,
+    placement: HybridComponentPlacement,
+    urls: dict[str, list[str]],
+    server_info: dict,
+    artifact_dir: Path,
+    save_artifacts: bool,
+) -> None:
+    from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWorker
+
+    env_group = None
     try:
-        serving = cfg.rollout.sglang
-        if serving.launch_server:
-            server_group, router_group = launch_sglang_router_and_server(
-                cfg,
-                cluster,
-                rollout_hardware_ranks=None,
-                router_server_args=serving,
-                placement_strategy=placement.get_strategy("rollout"),
-            )
-            urls = list(server_group.get_server_url().wait())
-        else:
-            urls = list(serving.server_urls)
-        if len(urls) != 1:
-            raise ValueError(f"Expected one shared Cosmos3 server, got {urls}")
-        client = Cosmos3Client(urls[0], timeout_s=serving.http_timeout_s)
-        try:
-            server_info = client.server_info()
-        finally:
-            client.close()
-        advertised = server_info.get("model_path")
-        if (
-            not advertised
-            or Path(advertised).resolve()
-            != Path(cfg.rollout.model.model_path).resolve()
-        ):
-            raise ValueError(
-                f"Server checkpoint differs from rollout.model.model_path: {advertised}"
-            )
         rollout_group = SGLangEmbodiedWorker.create_group(cfg, placement).launch(
             cluster,
             name=cfg.rollout.group_name,
@@ -232,8 +380,8 @@ def run(cfg: DictConfig) -> None:
             name=cfg.env.group_name,
             placement_strategy=placement.get_strategy("env"),
         )
-        rollout_group.set_sglang_server_urls(urls).wait()
-        env_group.set_sglang_server_urls(urls).wait()
+        rollout_group.set_sglang_server_urls(urls["policy"]).wait()
+        env_group.set_sglang_server_urls(urls["simulator"]).wait()
         runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
         runner.init_workers()
         if save_artifacts:
@@ -249,16 +397,11 @@ def run(cfg: DictConfig) -> None:
             )
         runner.run()
     finally:
-        for group, method in (
-            (env_group, "close_cosmos3_envs"),
-            (router_group, "stop"),
-            (server_group, "stop"),
-        ):
-            if group is not None:
-                try:
-                    getattr(group, method)().wait()
-                except Exception:
-                    get_logger().exception("Failed to close %s", method)
+        if env_group is not None:
+            try:
+                env_group.close_cosmos3_envs().wait()
+            except Exception:
+                get_logger().exception("Failed to close Cosmos3 environments")
 
 
 @hydra.main(version_base="1.1", config_path="config", config_name="cosmos3_closed_loop")

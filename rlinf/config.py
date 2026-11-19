@@ -1062,6 +1062,14 @@ def validate_embodied_cfg(cfg):
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     algorithm_cfg = cfg.get("algorithm", {}) or {}
     model_type = SupportedModel(model_cfg.model_type)
+    if model_type == SupportedModel.COSMOS3 and OmegaConf.select(
+        model_cfg, "wovr.enabled", default=False
+    ):
+        from rlinf.models.embodiment.cosmos3.cosmos3_config import (
+            configure_native_rl_envs,
+        )
+
+        configure_native_rl_envs(cfg, model_cfg)
     assert model_type in EMBODIED_MODEL or model_type in DIFFUSION_MODELS, (
         f"Model type: '{model_cfg.model_type}' is not supported by the embodied runner. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}; "

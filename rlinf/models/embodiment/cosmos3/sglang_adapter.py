@@ -49,12 +49,13 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import math
 from typing import Any, Literal
 
 import numpy as np
 import torch
+
+from rlinf.models.embodiment.cosmos3.libero_actions import Cosmos3LiberoActionConverter
 
 
 class Cosmos3SGLangAdapter:
@@ -100,12 +101,6 @@ class Cosmos3SGLangAdapter:
                 )
             if int(c.num_action_chunks) != self._num_frames - 1:
                 raise ValueError("Native Cosmos3 horizon must equal num_frames - 1")
-        self._action_normalization = str(c.get("action_normalization", "quantile"))
-        self._action_stats_path = c.get("action_stats_path", None)
-        self._stats = self._load_stats(
-            self._action_stats_path, self._action_normalization
-        )
-
         eval_env_cfg = cfg.env.get("eval", None) or {}
         env_type = eval_env_cfg.get("env_type", None)
         self._domain_name = c.get("domain_name") or (
@@ -113,6 +108,12 @@ class Cosmos3SGLangAdapter:
         )
         self._domain_id = c.get("domain_id", None)
         self._num_action_chunks = int(self.model_cfg.num_action_chunks)
+        self._libero_actions = Cosmos3LiberoActionConverter(
+            self._num_action_chunks,
+            self._raw_action_dim,
+            str(c.get("action_normalization", "quantile")),
+            c.get("action_stats_path"),
+        )
         # sglang's own default for --batching-max-size is 1.
         server_cfg = cfg.rollout.get("sglang", {}).get("server", {}) or {}
         self._max_request_batch = max(
@@ -148,58 +149,6 @@ class Cosmos3SGLangAdapter:
             return int(w_s), int(h_s)
         except Exception:
             return 832, 480
-
-    @staticmethod
-    def _load_stats(path: Any, normalization: str) -> dict[str, np.ndarray] | None:
-        # Per-channel stats keys loaded from the LIBERO quantile stats JSON.
-        stat_keys = ("mean", "std", "min", "max", "q01", "q99")
-        if not path:
-            return None
-        with open(path, encoding="utf-8") as f:  # noqa: PTH123
-            raw = json.load(f)
-        key = "global_raw" if normalization == "quantile_rot" else "global"
-        if isinstance(raw, dict) and key in raw:
-            raw = raw[key]
-        return {
-            k: np.asarray(v, dtype=np.float32) for k, v in raw.items() if k in stat_keys
-        }
-
-    def _denormalize(self, action: np.ndarray) -> np.ndarray:
-        """Invert the action normalization for the first ``raw_action_dim`` channels."""
-        d = self._raw_action_dim
-        norm = action[..., :d]
-        if self._stats is None:
-            return norm
-        method = self._action_normalization
-        if method in ("quantile", "quantile_rot"):
-            q01 = self._stats["q01"]
-            q99 = self._stats["q99"]
-            return (norm + 1.0) / 2.0 * (q99 - q01) + q01
-        if method == "meanstd":
-            mean = self._stats["mean"]
-            std = self._stats["std"]
-            return norm * std + mean
-        if method == "minmax":
-            lo = self._stats["min"]
-            hi = self._stats["max"]
-            return (norm + 1.0) / 2.0 * (hi - lo) + lo
-        return norm
-
-    def _rot6d_to_axisangle(self, rot6d: np.ndarray) -> np.ndarray:
-        """rot6d ``[N, 6]`` -> axis-angle (rotvec) ``[N, 3]``."""
-        from scipy.spatial.transform import Rotation as R
-
-        rot6d = np.asarray(rot6d, dtype=np.float32).reshape(-1, 6)
-        col0 = rot6d[:, :3]
-        col1 = rot6d[:, 3:6]
-        # Re-orthogonalize (the network output is only approximately rot6d).
-        col0 = col0 / np.clip(np.linalg.norm(col0, axis=-1, keepdims=True), 1e-8, None)
-        col1 = col1 - np.sum(col1 * col0, axis=-1, keepdims=True) * col0
-        col1 = col1 / np.clip(np.linalg.norm(col1, axis=-1, keepdims=True), 1e-8, None)
-        col2 = np.cross(col0, col1)
-        mat = np.stack([col0, col1, col2], axis=-1)  # [N, 3, 3] (columns)
-        # scipy wants [..., 3, 3] with rows as basis -> transpose (columns->rows).
-        return R.from_matrix(mat).as_rotvec().astype(np.float32, copy=False)
 
     def build_request(
         self, env_obs: dict, mode: Literal["train", "eval"] = "eval"
@@ -312,36 +261,8 @@ class Cosmos3SGLangAdapter:
     def native_actions_to_libero(
         self, native_batch: np.ndarray | torch.Tensor
     ) -> np.ndarray:
-        """Convert normalized Cosmos actions to continuous LIBERO actions.
-
-        Uses this adapter's normalization statistics. Padded action channels are
-        discarded, and each horizon is clipped or padded to num_action_chunks.
-        Gripper values remain continuous; environment preparation is separate.
-
-        Args:
-            native_batch: Actions with shape [batch, horizon, padded_action_dim].
-
-        Returns:
-            Float32 actions with shape [batch, num_action_chunks, 7].
-        """
-        if isinstance(native_batch, torch.Tensor):
-            native_batch = native_batch.detach().to(dtype=torch.float32).cpu().numpy()
-        actions = np.asarray(native_batch, dtype=np.float32)
-        if actions.ndim != 3:
-            raise ValueError(
-                "Cosmos3 native action batch must have shape [batch, horizon, D], "
-                f"got {actions.shape}"
-            )
-        if actions.shape[0] == 0:
-            raise ValueError(
-                "Cosmos3 native action batch must contain at least one env"
-            )
-        if actions.shape[-1] < self._raw_action_dim:
-            raise ValueError(
-                f"Cosmos3 native action width must be at least {self._raw_action_dim}, "
-                f"got {actions.shape[-1]}"
-            )
-        return np.stack([self._action_to_env(chunk) for chunk in actions], axis=0)
+        """Return continuous 7-D LIBERO commands using the rollout model statistics."""
+        return self._libero_actions.native_actions_to_libero(native_batch)
 
     @staticmethod
     def _extract_tasks(env_obs: dict) -> list[str]:
@@ -446,68 +367,3 @@ class Cosmos3SGLangAdapter:
                 f"— check action_gen=true and action_mode=policy. resp={resp}"
             )
         return values
-
-    def _action_to_env(self, action: Any) -> np.ndarray:
-        """Model action chunk -> env-scale ``[num_action_chunks, action_dim]``."""
-        a = action
-        while (
-            isinstance(a, list)
-            and len(a) == 1
-            and isinstance(a[0], list)
-            and a[0]
-            and isinstance(a[0][0], (list, tuple))
-        ):
-            a = a[0]
-        if isinstance(a, (list, tuple)) and a and not isinstance(a[0], (list, tuple)):
-            a = [list(a)]
-        rows = [[float(v) for v in r] for r in a]
-        if not rows:
-            raise ValueError("Cosmos3 returned an empty action array")
-        arr = np.asarray(rows, dtype=np.float32)  # [T, D] (D may be padded > raw)
-        raw_norm = arr[..., : self._raw_action_dim]  # server output (normalized?)
-
-        arr = self._denormalize(raw_norm)  # [T, 10]
-        trans = arr[:, :3]
-        rot6d = arr[:, 3:9]
-        gripper = arr[:, 9:10]
-        axisangle = self._rot6d_to_axisangle(rot6d)  # [T, 3]
-        env = np.concatenate([trans, axisangle, gripper], axis=-1)  # [T, 7]
-
-        if not getattr(self, "_dbg_printed", False):
-            self._dbg_printed = True
-            import sys
-
-            print(
-                f"[C3DBG] raw_norm shape={raw_norm.shape} "
-                f"min={raw_norm.min():.4f} max={raw_norm.max():.4f} "
-                f"mean={raw_norm.mean():.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            print(
-                f"[C3DBG] denorm shape={arr.shape} min={arr.min():.4f} "
-                f"max={arr.max():.4f} | trans[min/max]={trans.min():.4f}/"
-                f"{trans.max():.4f} rot6d[min/max]={rot6d.min():.4f}/"
-                f"{rot6d.max():.4f} gripper[min/max]={gripper.min():.4f}/"
-                f"{gripper.max():.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            print(
-                f"[C3DBG] axisangle min/max={axisangle.min():.4f}/"
-                f"{axisangle.max():.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            print(
-                f"[C3DBG] env chunk0={env[0].tolist()}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-        if env.shape[0] < self._num_action_chunks:
-            pad = np.repeat(env[-1:], self._num_action_chunks - env.shape[0], axis=0)
-            env = np.concatenate([env, pad], axis=0)
-        elif env.shape[0] > self._num_action_chunks:
-            env = env[: self._num_action_chunks]
-        return env

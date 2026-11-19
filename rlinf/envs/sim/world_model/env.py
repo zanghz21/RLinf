@@ -54,6 +54,7 @@ class WorldModelEnv:
         total_num_processes,
         record_metrics=True,
         worker_info: Optional[WorkerInfo] = None,
+        shared_model: Optional[torch.nn.Module] = None,
     ):
         backend = cfg.get("backend", None) or get_backend_name(
             getattr(cfg, "env_type", None)
@@ -90,6 +91,11 @@ class WorldModelEnv:
                 "auto_reset nothing is bootstrapped at the limit."
             )
         self.use_rel_reward = getattr(cfg, "use_rel_reward", False)
+        self.terminate_at_first_success = cfg.get("terminate_at_first_success", False)
+        self._episode_done = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._episode_terminated = torch.zeros_like(self._episode_done)
 
         self._is_start = True
         self._elapsed_steps = torch.zeros(
@@ -118,8 +124,9 @@ class WorldModelEnv:
         self.update_reset_state_ids()
 
         # Generation geometry is a property of the model, so it comes from the backend.
+        backend_kwargs = {} if shared_model is None else {"shared_model": shared_model}
         self.backend: WorldModelBackend = self._backend_cls(
-            self.cfg, self._get_runtime_device()
+            self.cfg, self._get_runtime_device(), **backend_kwargs
         )
         self.chunk = self.backend.chunk  # Ta
         self.condition_frame_length = self.backend.condition_frame_length  # To
@@ -195,12 +202,16 @@ class WorldModelEnv:
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
             self._elapsed_steps[mask] = 0
+            self._episode_done[mask] = False
+            self._episode_terminated[mask] = False
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.returns[mask] = 0
         else:
             self.prev_step_reward[:] = 0
             self._elapsed_steps[:] = 0
+            self._episode_done[:] = False
+            self._episode_terminated[:] = False
             if self.record_metrics:
                 self.success_once[:] = False
                 self.returns[:] = 0.0
@@ -216,6 +227,9 @@ class WorldModelEnv:
                     f"{self._backend_cls.__name__} does not support enable_kir"
                 )
             self.enable_kir = False
+        build_dataset = getattr(self._backend_cls, "build_dataset", None)
+        if build_dataset is not None:
+            return build_dataset(cfg)
         return NpyTrajectoryDatasetWrapper(
             cfg.initial_image_path, enable_kir=self.enable_kir
         )
@@ -416,11 +430,6 @@ class WorldModelEnv:
         )
         num_slots = len(target_slots)
 
-        if len(self.dataset) < self.num_envs:
-            raise ValueError(
-                f"Not enough episodes in dataset. Found {len(self.dataset)}, need {self.num_envs}"
-            )
-
         # If episode_indices not provided, randomly select
         if episode_indices is None:
             # Set random seed if provided
@@ -430,9 +439,17 @@ class WorldModelEnv:
                 else:
                     np.random.seed(seed)
 
-            episode_indices = np.random.choice(
-                len(self.dataset), size=num_slots, replace=False
-            )
+            if env_idx is None and self.group_size > 1:
+                self.update_reset_state_ids()
+                episode_indices = self.reset_state_ids.cpu().numpy()
+            else:
+                if len(self.dataset) < num_slots:
+                    raise ValueError(
+                        f"Not enough episodes to sample without replacement: found {len(self.dataset)}, need {num_slots}"
+                    )
+                episode_indices = np.random.choice(
+                    len(self.dataset), size=num_slots, replace=False
+                )
         else:
             # Convert to numpy if tensor
             if isinstance(episode_indices, torch.Tensor):
@@ -474,18 +491,40 @@ class WorldModelEnv:
             for slot in target_slots
         ]
 
-        # One seed is shared by the batch; per-trajectory seeds are future work.
         self.backend.close_session(target_slots)
+        session_kwargs = {}
+        session_seeds = [0] * num_slots
+        if getattr(self.backend, "requires_instructions", False):
+            session_kwargs["instructions"] = [
+                self.task_descriptions[slot] for slot in target_slots
+            ]
+            session_seeds = torch.randint(
+                0, 2**32, (num_slots,), generator=self._generator, dtype=torch.int64
+            ).tolist()
         self.backend.open_session(
             env_ids=target_slots,
             init_frames=init_frames,
             init_actions=torch.stack(
                 [window[1] for window in condition_windows], dim=0
             ).to(self.device),
-            seeds=[0] * num_slots,
+            seeds=session_seeds,
+            **session_kwargs,
         )
 
         self._reset_metrics(env_idx=None if env_idx is None else target_slots)
+
+        if self.cfg.get("reject_successful_reset", False):
+            frames = self.current_obs[target_slots, :, 0, -1]
+            instructions = (
+                [self.task_descriptions[slot] for slot in target_slots]
+                if self._reward_instructions() is not None
+                else None
+            )
+            scores = self._score_reward_frames(frames, instructions)
+            if (scores >= self.cfg.get("success_reward_threshold", 0.9)).any():
+                raise ValueError(
+                    "World-model reset keyframes are already successful; select unsolved keyframes or check the reward checkpoint"
+                )
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
@@ -526,13 +565,32 @@ class WorldModelEnv:
             .to(self.device)
         )
 
-        instructions = self._reward_instructions()
-        if instructions is None:
-            rewards = self.reward_model.predict_rew(chunk_obs)
-        else:
-            rewards = self.reward_model.predict_rew(chunk_obs, instructions)
-
+        rewards = self._score_reward_frames(chunk_obs, self._reward_instructions())
         return rewards.reshape(self.num_envs, self.chunk)
+
+    def _score_reward_frames(
+        self, images: torch.Tensor, instructions: Optional[list[str]]
+    ) -> torch.Tensor:
+        """Score normalized frames through the selected existing reward model."""
+        select_images = getattr(self.backend, "reward_images", None)
+        if select_images is not None:
+            images = select_images(images)
+        if hasattr(self.reward_model, "compute_reward"):
+            pixels = ((images.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+            rewards = self.reward_model.compute_reward(
+                {
+                    "main_images": pixels.permute(0, 2, 3, 1),
+                    "task_descriptions": instructions,
+                }
+            )
+        elif instructions is None:
+            rewards = self.reward_model.predict_rew(images)
+        else:
+            rewards = self.reward_model.predict_rew(images, instructions)
+        rewards = torch.as_tensor(rewards, device=self.device).reshape(-1)
+        if rewards.numel() != images.shape[0] or not torch.isfinite(rewards).all():
+            raise ValueError("Reward model must return one finite value per frame")
+        return rewards
 
     def _infer_next_chunk_frames(self, actions):
         """Advance the world model by one action chunk."""
@@ -542,7 +600,20 @@ class WorldModelEnv:
         )
 
         # The new frames only, [num_envs, C, T, H, W] in [-1, 1]; T follows the model.
-        videos = self.backend.generate(env_ids=range(num_envs), actions=actions)
+        active = (
+            (~self._episode_done).nonzero().flatten().tolist()
+            if self.terminate_at_first_success
+            else list(range(num_envs))
+        )
+        if len(active) == num_envs:
+            videos = self.backend.generate(env_ids=active, actions=actions)
+        else:
+            videos = (
+                self.current_obs[:, :, 0, -1:].repeat(1, 1, self.chunk, 1, 1).clone()
+            )
+            if active:
+                batch = self.backend.generate(env_ids=active, actions=actions[active])
+                videos[active] = batch.to(videos)
 
         # Reshape to match current_obs format: [num_envs, C, 1, T, H, W]
         x_samples = videos.unsqueeze(2).to(self.device, dtype=self.current_obs.dtype)
@@ -581,6 +652,8 @@ class WorldModelEnv:
             full_image = full_image.permute(0, 2, 3, 1)  # [num_envs, H, W, 3]
 
         # Convert to uint8 tensor (keep as tensor, not numpy)
+        if self.cfg.get("backend") == "cosmos3":
+            full_image = full_image.round()
         full_image = full_image.to(torch.uint8)
 
         # Get states (dummy for now, can be extended)
@@ -619,25 +692,41 @@ class WorldModelEnv:
     def chunk_step(self, policy_output_action):
         """Advance one action chunk: [num_envs, chunk, action_dim]."""
         self.onload()
+        previously_done = self._episode_done.clone()
+        previous_steps = self._elapsed_steps.clone()
         self._infer_next_chunk_frames(policy_output_action)
 
         # Update elapsed steps (incremented after inference)
         self._elapsed_steps += self.chunk
-
-        # Read the last frame from self.current_obs
-        extracted_obs = self._wrap_obs()
 
         chunk_rewards = self._infer_next_chunk_rewards()
         chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
 
         estimated_success = self._estimate_success_from_rewards(chunk_rewards)
 
-        # Create terminations tensor: success is marked at the last step of chunk
+        # Terminations retain per-action success boundaries when configured.
         raw_chunk_terminations = torch.zeros(
             self.num_envs, self.chunk, dtype=torch.bool, device=self.device
         )
-        if not self.ignore_terminations:
+        if self.terminate_at_first_success and not self.ignore_terminations:
+            successes = chunk_rewards >= self.cfg.get("success_reward_threshold", 0.9)
+            for slot in range(self.num_envs):
+                if previously_done[slot]:
+                    raw_chunk_terminations[slot] = self._episode_terminated[slot]
+                    chunk_rewards_tensors[slot] = 0
+                    self._elapsed_steps[slot] = previous_steps[slot]
+                elif successes[slot].any():
+                    first = int(successes[slot].to(torch.int64).argmax())
+                    raw_chunk_terminations[slot, first:] = True
+                    chunk_rewards_tensors[slot, first + 1 :] = 0
+                    self._elapsed_steps[slot] = previous_steps[slot] + first + 1
+                    # Observations stop at the same frame as the first terminal action.
+                    frames = self.current_obs[slot, :, :, -self.chunk :]
+                    frames[:, :, first + 1 :] = frames[:, :, first : first + 1].clone()
+        elif not self.ignore_terminations:
             raw_chunk_terminations[:, -1] = estimated_success
+
+        extracted_obs = self._wrap_obs()
 
         raw_chunk_truncations = torch.zeros(
             self.num_envs, self.chunk, dtype=torch.bool, device=self.device
@@ -655,6 +744,9 @@ class WorldModelEnv:
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
+        if self.terminate_at_first_success:
+            self._episode_done |= past_dones
+            self._episode_terminated |= past_terminations
 
         # Before auto reset, as in LiberoEnv: reset() zeroes the per-slot accumulators,
         # so elapsed_steps read afterwards is the restarted slot's zero. Success comes
@@ -673,8 +765,10 @@ class WorldModelEnv:
             # reset() returns a fresh infos; the step reported is still the one that ended.
             infos["episode"] = episode_info
 
-        chunk_terminations = torch.zeros_like(raw_chunk_terminations)
-        chunk_terminations[:, -1] = past_terminations
+        chunk_terminations = raw_chunk_terminations
+        if not self.terminate_at_first_success:
+            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            chunk_terminations[:, -1] = past_terminations
 
         chunk_truncations = torch.zeros_like(raw_chunk_truncations)
         chunk_truncations[:, -1] = past_truncations
@@ -696,6 +790,8 @@ class WorldModelEnv:
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
         self.prev_step_reward = self.prev_step_reward.cpu()
         self._elapsed_steps = self._elapsed_steps.cpu()
+        self._episode_done = self._episode_done.cpu()
+        self._episode_terminated = self._episode_terminated.cpu()
         self.reset_state_ids = self.reset_state_ids.cpu()
         if self.record_metrics:
             self.success_once = self.success_once.cpu()
@@ -712,6 +808,8 @@ class WorldModelEnv:
         self.current_obs = recursive_to_device(self.current_obs, self.device)
         self.prev_step_reward = self.prev_step_reward.to(self.device)
         self._elapsed_steps = self._elapsed_steps.to(self.device)
+        self._episode_done = self._episode_done.to(self.device)
+        self._episode_terminated = self._episode_terminated.to(self.device)
         self.reset_state_ids = self.reset_state_ids.to(self.device)
         if self.record_metrics:
             self.success_once = self.success_once.to(self.device)

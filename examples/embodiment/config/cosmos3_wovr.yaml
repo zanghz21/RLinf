@@ -1,0 +1,60 @@
+defaults:
+  - training/cosmos3_grpo
+  - override hydra/job_logging: stdout
+  - _self_
+
+cluster:
+  component_placement:
+    actor: 0
+    rollout: 1
+    env: 2
+
+runner:
+  logger:
+    experiment_name: cosmos3_wovr
+
+cosmos:
+  share_weights: true
+  simulator:
+    # In independent mode, this checkpoint stays fixed throughout training.
+    model_path: null
+    native_config_path: null
+
+env:
+  train:
+    env_type: world_model
+    backend: cosmos3
+    wm_env_type: libero
+    action_dim: ${actor.model.action_dim}
+    chunk: ${actor.model.num_action_chunks}
+    num_frames: 17
+    image_size: [192, 320]
+    condition_frame_length: 1
+    seed: ${actor.seed}
+    total_num_envs: 4
+    group_size: ${algorithm.group_size}
+    rollout_epoch: 1
+    max_episode_steps: 48
+    max_steps_per_rollout_epoch: ${.max_episode_steps}
+    auto_reset: false
+    ignore_terminations: false
+    use_fixed_reset_state_ids: true
+    reset_gripper_open: false
+    enable_kir: true
+    dataset:
+      root: /path/to/lerobot/libero
+      keyframes:
+        - episode_index: 1261
+          frame_index: 0
+    use_rel_reward: true
+    reward_coef: 1.0
+    success_reward_threshold: 0.5
+    terminate_at_first_success: true
+    reject_successful_reset: true
+    reward_model:
+      type: resnet
+      model_path: /path/to/libero-reward-model
+      camera_view: external
+      view_size: [160, 160]
+    video_cfg:
+      save_video: false

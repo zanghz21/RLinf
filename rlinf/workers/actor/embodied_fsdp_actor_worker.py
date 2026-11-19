@@ -136,6 +136,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
+        await self._sync_model_weights(
+            self.weight_syncer, self._rollout_group_name, self._rollout_all_ranks
+        )
+
+    @Worker.timer("actor/sync_model_to_env")
+    async def sync_model_to_env(self) -> None:
+        """Publish policy updates to a simulator sharing the policy weights."""
+        if not hasattr(self, "_env_weight_syncer"):
+            self._env_weight_syncer = WeightSyncer.create(self.cfg.weight_syncer)
+        await self._sync_model_weights(
+            self._env_weight_syncer,
+            self._env_group_name,
+            list(range(self._component_placement.get_world_size("env"))),
+        )
+
+    async def _sync_model_weights(
+        self, syncer: WeightSyncer, destination_group: str, destination_ranks: list[int]
+    ) -> None:
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
@@ -152,23 +170,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 data,
                 groups=[
                     (self._group_name, 0),
-                    (self._rollout_group_name, self._rollout_all_ranks),
+                    (destination_group, destination_ranks),
                 ],
                 src=(self._group_name, 0),
                 async_op=True,
-                options=self._sync_weight_comm_options,
+                options=syncer.comm_options,
             ).async_wait()
 
         async def recv_func():
             return await self.recv(
-                src_group_name=self._rollout_group_name,
+                src_group_name=destination_group,
                 src_rank=0,
                 async_op=True,
-                options=self._sync_weight_comm_options,
+                options=syncer.comm_options,
             ).async_wait()
 
-        if not self.weight_syncer.sender_initialized():
-            await self.weight_syncer.init_sender(
+        if not syncer.sender_initialized():
+            await syncer.init_sender(
                 state_dict=state_dict,
                 send=send_func,
                 recv=recv_func,
@@ -181,11 +199,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if hasattr(self, "get_rollout_sync_version")
             else self.version
         )
-        await self.weight_syncer.sync(state_dict, send_func, version=version)
+        await syncer.sync(state_dict, send_func, version=version)
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
-                "weight should be offloaded in sync_model_to_rollout"
+                "weights must be loaded while synchronizing"
             )
             self.offload_param_and_grad(True)
 

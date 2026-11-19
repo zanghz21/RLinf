@@ -5,6 +5,8 @@ Evaluate Cosmos3 on the LIBERO simulator using the SGLang backend: the model run
 
 To check a pipeline in which Cosmos3 also predicts the next observation, use :ref:`cosmos3-learned-loop`. That workflow starts from a recorded LIBERO-Spatial image and tests generated feedback; simulator task-success evaluation uses the workflow below. For matched initial states and action replay videos, use :ref:`cosmos3-simulator-comparison`.
 
+To update a Cosmos policy inside its learned simulator, use :ref:`cosmos3-wovr-training`. That training entry uses the native Cosmos SDK and a trained reward model. Both closed-loop entries select shared or separate policy/simulator weights with ``cosmos.share_weights``.
+
 How It Works
 ----------------------------------------
 
@@ -149,9 +151,9 @@ LIBERO trajectory counting rules: see :ref:`libero-eval-config`.
 Run a Learned World Model Loop
 ----------------------------------------
 
-Use the existing evaluation workers to run Cosmos3 as both policy and world model. ``SGLangEmbodiedWorker`` requests actions; ``EnvWorker`` runs ``Cosmos3Env`` and sends those unchanged normalized 10D actions to the same server for forward prediction. ``EmbodiedEvalRunner`` feeds the final generated frame into the next policy call. This inference-only flow uses the rollout model configuration and omits the actor process and training updates.
+Use the existing evaluation workers to run Cosmos3 as both policy and world model. ``SGLangEmbodiedWorker`` requests actions; ``EnvWorker`` runs ``Cosmos3Env`` and sends those unchanged normalized 10D actions to the simulator server for forward prediction. ``EmbodiedEvalRunner`` feeds the final generated frame into the next policy call. This inference-only flow uses the rollout model configuration; training uses the separate entry below.
 
-The policy uses ``InferenceHTTPClient`` for action requests. For forward dynamics, ``Cosmos3Client`` sends an inference-only request (``rollout=false``) to the same server's official ``POST /rollout/generate`` endpoint. The server returns decoded tensors in a MessagePack response with safetensors data. RLinf converts floating-point pixels to ``uint8`` RGB in memory using SGLang's clamp-and-truncate rule, then passes the final frame directly to the next policy call. Conditioning images use lossless PNG data URIs in memory. MP4 encoding and decoding are outside the feedback path.
+The policy uses ``InferenceHTTPClient`` for action requests. For forward dynamics, ``Cosmos3Client`` sends an inference-only request (``rollout=false``) to the simulator's official ``POST /rollout/generate`` endpoint. The server returns decoded tensors in a MessagePack response with safetensors data. RLinf converts floating-point pixels to ``uint8`` RGB in memory using SGLang's clamp-and-truncate rule, then passes the final frame directly to the next policy call. Conditioning images use lossless PNG data URIs in memory. MP4 encoding and decoding are outside the feedback path.
 
 Configure ``examples/embodiment/config/cosmos3_closed_loop.yaml`` with your checkpoint and LeRobot dataset paths. The default selects LIBERO-Spatial episode ``1261``, frame ``0``, dataset task index ``30``. It concatenates external and wrist views, predicts 16 actions, and requests 17 video frames at 20 FPS. The dataset's 10 FPS metadata is recorded separately because initialization uses one still observation. Subsequent observations come from generated video.
 
@@ -183,6 +185,24 @@ The default configuration selects GPU 0. RLinf discovers physical devices throug
 This command creates an independent Ray session for a single-node smoke test and removes proxy settings from that process so the server health check connects directly. The CUDA wrapper only configures library loading. For Ray temporary data on shared storage, set ``RAY_TMPDIR`` to a short path or a short symlink to that storage; Ray's Unix socket paths have a length limit.
 
 The default configuration starts one server, one rollout worker, and one environment worker on the same node. The command's 48 environment steps are three chunks of 16 actions. Use a new output path for every debug run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://model-server:30000]'``. HTTP and HTTPS server URLs are supported; the server can run on another node. The entry checks its checkpoint path and leaves externally owned servers running. External servers must support the rollout endpoint, use ordinary inference, and leave action normalization statistics unset.
+
+The default ``cosmos.share_weights=true`` loads one model instance for both roles, using ``rollout.model.model_path``. Keep ``cosmos.simulator.model_path=null`` and its server URLs empty in this mode. To use independent weights, edit the same YAML:
+
+.. code-block:: yaml
+
+   cosmos:
+     share_weights: false
+     simulator:
+       model_path: /path/to/simulator/model_diffusers
+   rollout:
+     model:
+       model_path: /path/to/policy/model_diffusers
+   cluster:
+     component_placement:
+       env,rollout: 0
+       simulator: 1
+
+This starts a policy server on GPU 0 and a simulator server on GPU 1. Simulator serving options inherit ``rollout.sglang`` except for the independently configured checkpoint, launch mode, URLs, and worker names. Override other settings under ``cosmos.simulator.sglang``, for example ``+cosmos.simulator.sglang.server.batching_max_size=2``. For external simulation, set ``cosmos.simulator.sglang.launch_server=false`` and ``cosmos.simulator.sglang.server_urls='[http://simulator:30000]'``; simulator placement is then unused. Each role may independently launch or reuse a server. Separate external roles require distinct URLs. Startup checks each role's advertised checkpoint and cleanup stops only servers owned by this run, including after failed model initialization. Debug ``server.json`` records ``share_weights`` and the ``policy`` and ``simulator`` server metadata.
 
 Set ``env.eval.total_num_envs`` to run multiple learned environments in one environment worker. Actions have shape ``[B,T,10]`` and observations have shape ``[B,H,W,3]``. Each chunk dispatches B independent HTTP requests concurrently, then keeps the responses in environment order. Observations and episode counters advance only after every response succeeds. A failed batch waits for the other client requests to finish and raises without retrying generation.
 
@@ -217,10 +237,95 @@ A base Nano checkpoint can exercise this connection before a tuned checkpoint is
 
 Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot. The default is a single-node example; HTTP transport also permits a separately hosted compatible server. Select compatibility libraries for each execution node before starting Ray; a driver-570 override must not be applied blindly to newer-driver nodes.
 
+.. _cosmos3-wovr-training:
+
+Train Cosmos in Its Learned Simulator
+-------------------------------------
+
+The ``cosmos3_wovr`` recipe uses the standard embodied training entry. The rollout
+worker samples native 10D actions. ``WorldModelEnv`` runs Cosmos forward dynamics,
+feeds its last generated frame back to the policy and scores each action's frame
+with a frozen reward model. The FSDP actor uses RLinf's GRPO advantages and
+clipped actor loss. The default placement assigns one GPU each to the actor,
+rollout and environment workers.
+
+Install the native SDK revision used by the adapter, then supply an unquantized
+Cosmos export with trained LIBERO action heads, a LeRobot v2 dataset and a
+trained RLinf ResNet reward checkpoint. The native export's ``config.json`` can
+also be supplied with ``actor.model.native_config_path``.
+
+.. code-block:: bash
+
+   COSMOS3_GIT_REF=4ed6244506e00bb270ed17d4532897f2aaa7bc16 \
+     bash requirements/install.sh embodied --model cosmos3 --env libero
+   source .venv/bin/activate
+   export PYTHONPATH="$PWD" EMBODIED_PATH="$PWD/examples/embodiment"
+   python examples/embodiment/train_embodied_agent.py --config-name cosmos3_wovr \
+     actor.model.model_path=/shared/cosmos-policy \
+     env.train.dataset.root=/shared/lerobot/libero \
+     'env.train.dataset.keyframes=[{episode_index:1261,frame_index:0}]' \
+     env.train.reward_model.model_path=/shared/rewards/libero.pth
+
+Choose unsolved keyframes from the target task. Each GRPO group starts from the
+same frame and instruction. The default classifier sees the external view
+cropped to 160 by 160 from the dual-camera canvas. ``success_reward_threshold``
+in ``env.train`` sets the first success. The actor's loss mask includes that action
+and excludes subsequent actions. For each chunk, the rollout samples a denoising
+transition index and records its input, output and behavior log probabilities.
+The actor replays that transition and sums log probabilities across the ten
+action channels. The optimized ratio is the conditional transition density.
+
+With ``cosmos.share_weights=true``, the actor publishes updated weights to both the
+rollout and simulator workers before the next scheduled rollout. The simulator
+holds its own inference replica. To train against a fixed simulator, append the
+following overrides to the same command. For an independent native model config,
+also set ``cosmos.simulator.native_config_path``.
+
+.. code-block:: bash
+
+   cosmos.share_weights=false cosmos.simulator.model_path=/shared/cosmos-simulator
+
+The usual embodied checkpoint settings apply. Set ``runner.save_interval`` to the
+desired number of iterations and resume with
+``runner.resume_dir=/shared/run/checkpoints/global_step_5``. Training metrics
+are available through ``runner.logger``. The reward measures predicted success in
+the learned simulator. Use the LIBERO evaluation for physical-simulator success.
+
+.. _cosmos3-libero-grpo:
+
+Train Cosmos3 with GRPO in LIBERO-Spatial
+------------------------------------------
+
+Use ``libero_spatial_grpo_cosmos3`` to train the native Cosmos3 policy with
+LIBERO's physics and task-success rewards. Supply the unquantized policy export
+and the action statistics used to train its LIBERO action head.
+
+.. code-block:: bash
+
+   COSMOS3_GIT_REF=4ed6244506e00bb270ed17d4532897f2aaa7bc16 \
+     bash requirements/install.sh embodied --model cosmos3 --env libero
+   source .venv/bin/activate
+   export PYTHONPATH="$PWD" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+   python examples/embodiment/train_embodied_agent.py --config-name libero_spatial_grpo_cosmos3 \
+     actor.model.model_path=/shared/cosmos-policy \
+     env.train.action_stats_path=/shared/libero_native_frame_wise_relative_rot6d.json
+
+Each GRPO group starts from the same LIBERO task and initial state. The policy
+observes the external and wrist cameras together. The environment worker
+denormalizes each 10D action and converts its 6D rotation to axis-angle for
+LIBERO's 7D controller. The actor uses the saved native diffusion transitions
+to update the policy and syncs its weights to rollout. The default placement uses
+GPU 0 for the actor and GPU 1 for rollout and LIBERO rendering. Set
+``runner.val_check_interval`` to a positive number to evaluate during training.
+To change the suite for both training and evaluation, override
+``env.train.task_suite_name``, for example with ``libero_goal``.
+
 .. _cosmos3-simulator-comparison:
 
 Compare Cosmos3 and LIBERO Videos
 ----------------------------------------
+
+The comparison entry requires ``cosmos.share_weights=true`` so each comparison worker uses one model server for both roles. Independent role weights are supported by the closed-loop evaluation and training entries above.
 
 Compare the generated dynamics with LIBERO using ``examples/embodiment/compare_cosmos3_libero.py``. Within each task/reset pair, all branches start from the same LIBERO state after settling. The script gives Cosmos3 the exact camera canvas rendered by that reset, so the initial pixels match. A recorded LeRobot image cannot reconstruct the complete physical state; this comparison uses a live LIBERO reset.
 

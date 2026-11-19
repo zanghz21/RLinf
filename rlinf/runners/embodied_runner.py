@@ -20,7 +20,7 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Union
 
-from omegaconf.dictconfig import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.data.schema.embodied_trajectory import (
     select_trajectory_collector,
@@ -79,6 +79,15 @@ class EmbodiedRunner:
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
         )
+        self._initialize_cosmos_weights = (
+            not self.cfg.runner.get("only_eval", False)
+            and OmegaConf.select(self.cfg, "actor.model.model_type") == "cosmos3"
+            and OmegaConf.select(self.cfg, "actor.model.wovr.enabled", default=False)
+        )
+        self._sync_cosmos_simulator = self._initialize_cosmos_weights and bool(
+            OmegaConf.select(self.cfg, "env.train.share_weights", default=False)
+        )
+        self._rollout_weights_initialized = False
 
         # Step-gated profiling: ``cluster.profiling.steps`` lists the global step
         profiling_raw = self.cfg.cluster.get("profiling", None)
@@ -202,6 +211,20 @@ class EmbodiedRunner:
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
+        if getattr(self, "_sync_cosmos_simulator", False):
+            env_handle: Handle = self.env.sync_model_from_actor()
+            actor_handle = self.actor.sync_model_to_env()
+            actor_handle.wait()
+            env_handle.wait()
+        self._rollout_weights_initialized = True
+
+    def _should_sync_rollout_weights(self, step: int) -> bool:
+        # A resumed run may start between scheduled syncs. Cosmos rollout and
+        # shared simulators need the restored actor before their first generation.
+        return step % self.weight_sync_interval == 0 or (
+            getattr(self, "_initialize_cosmos_weights", False)
+            and not self._rollout_weights_initialized
+        )
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -509,7 +532,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if self._should_sync_rollout_weights(_step):
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
@@ -594,7 +617,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if self._should_sync_rollout_weights(_step):
                         self.update_rollout_weights()
                 env_handle: Handle = self.env.interact(
                     input_channel=self.env_channel,

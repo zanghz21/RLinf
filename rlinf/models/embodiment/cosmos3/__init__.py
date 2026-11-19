@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a Cosmos3 action-policy for RLinf SFT.
+"""Build Cosmos3 policies for RLinf SFT and native WoVR training.
 
 Builds cosmos's *training* config directly, then disables only its internal
 FSDP/CP/CFGP (via ``enable_inference_mode`` so AC + EMA stay on) -- RLinf's
@@ -146,14 +146,19 @@ def _load_base_weights(
 
 
 def get_model(cfg: DictConfig, torch_dtype=None):
-    """Build and warm-start a ``Cosmos3Policy`` for RLinf SFT.
+    """Select native WoVR with ``wovr.enabled`` or build the SFT policy.
 
     ``torch_dtype`` is accepted only for model-builder registry signature parity;
     cosmos sets precision from its own config, so it is unused here.
 
-    Returns a ``Cosmos3Policy`` wrapping a cosmos-FSDP-disabled ``OmniMoTModel``
-    with AC + EMA on, ready for RLinf ``FSDPModelManager`` to ``fully_shard``.
+    WoVR loads trained action heads from a native export. SFT builds its
+    model from the configured Cosmos experiment recipe.
     """
+    if cfg.get("wovr", {}).get("enabled", False):
+        from rlinf.models.embodiment.cosmos3.wovr_policy import Cosmos3WoVRPolicy
+
+        return Cosmos3WoVRPolicy.from_pretrained(cfg)
+
     import cosmos_framework.model.generator.omni_mot_model as omni_mot_model
     from cosmos_framework.configs.base.config import make_config
     from cosmos_framework.utils import distributed as cosmos_distributed

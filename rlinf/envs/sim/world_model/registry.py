@@ -40,6 +40,7 @@ _REGISTRY: dict[str, type] = {}
 _BUILTIN_MODULES: dict[str, str] = {
     "wan": "rlinf.envs.sim.world_model.backend.wan",
     "opensora": "rlinf.envs.sim.world_model.backend.opensora",
+    "cosmos3": "rlinf.envs.sim.world_model.backend.cosmos3",
 }
 
 #: Retired ``env_type`` spellings mapped to the backend they now select.

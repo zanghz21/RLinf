@@ -18,14 +18,13 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
-from diffsynth.models.reward_model import ResnetRewModel, TaskEmbedResnetRewModel
 from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
 from PIL import Image
 
 from rlinf.envs.sim.world_model.registry import register_backend
 from rlinf.utils.patcher import Patcher
 
-from . import FrameQueue, autocast
+from . import FrameQueue, autocast, load_wovr_reward_model, wovr_reward_instructions
 from .npu_patches import apply_npu_patches
 
 __all__ = ["WanBackend"]
@@ -60,23 +59,10 @@ class WanBackend:
 
     @staticmethod
     def load_reward_model(cfg):
-        if cfg.reward_model.type == "ResnetRewModel":
-            return ResnetRewModel(cfg.reward_model.from_pretrained)
-        if cfg.reward_model.type == "TaskEmbedResnetRewModel":
-            return TaskEmbedResnetRewModel(
-                checkpoint_path=cfg.reward_model.from_pretrained,
-                task_suite_name=cfg.task_suite_name,
-            )
-        raise ValueError(f"Unknown reward model type: {cfg.reward_model.type}")
+        return load_wovr_reward_model(cfg)
 
     def reward_instructions(self, env) -> Optional[list[str]]:
-        if env.cfg.reward_model.type != "TaskEmbedResnetRewModel":
-            return None
-        # One instruction per scored frame, so each description repeats over its chunk
-        instructions = []
-        for env_idx in range(env.num_envs):
-            instructions.extend([env.task_descriptions[env_idx]] * self.chunk)
-        return instructions
+        return wovr_reward_instructions(env)
 
     def _build_pipeline(self) -> WanVideoPipeline:
         Patcher.clear()

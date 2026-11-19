@@ -28,7 +28,13 @@ from typing import Any, ContextManager, Optional, Protocol, Sequence
 
 import torch
 
-__all__ = ["WorldModelBackend", "FrameQueue", "autocast"]
+__all__ = [
+    "WorldModelBackend",
+    "FrameQueue",
+    "autocast",
+    "load_wovr_reward_model",
+    "wovr_reward_instructions",
+]
 
 FrameQueue = Sequence[Sequence[torch.Tensor]]
 
@@ -38,6 +44,27 @@ def autocast(device: torch.device, dtype: torch.dtype) -> ContextManager:
     if device.type == "cpu":
         return nullcontext()
     return torch.amp.autocast(device_type=device.type, dtype=dtype)
+
+
+def load_wovr_reward_model(cfg: Any) -> torch.nn.Module:
+    """Load the existing WoVR visual success classifier from its checkpoint."""
+    from diffsynth.models.reward_model import ResnetRewModel, TaskEmbedResnetRewModel
+
+    if cfg.reward_model.type == "ResnetRewModel":
+        return ResnetRewModel(cfg.reward_model.from_pretrained)
+    if cfg.reward_model.type == "TaskEmbedResnetRewModel":
+        return TaskEmbedResnetRewModel(
+            checkpoint_path=cfg.reward_model.from_pretrained,
+            task_suite_name=cfg.task_suite_name,
+        )
+    raise ValueError(f"Unknown reward model type: {cfg.reward_model.type}")
+
+
+def wovr_reward_instructions(env: Any) -> Optional[list[str]]:
+    """Repeat each raw task once per frame for task-conditioned classifiers."""
+    if env.cfg.reward_model.type != "TaskEmbedResnetRewModel":
+        return None
+    return [task for task in env.task_descriptions for _ in range(env.chunk)]
 
 
 class WorldModelBackend(Protocol):

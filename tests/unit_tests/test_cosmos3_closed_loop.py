@@ -38,7 +38,6 @@ from rlinf.models.embodiment.cosmos3.closed_loop_io import (
 )
 from rlinf.models.embodiment.cosmos3.sglang_adapter import Cosmos3SGLangAdapter
 from rlinf.utils.http_client import InferenceHTTPClient
-from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWorker
 
 np = pytest.importorskip("numpy")
 Image = pytest.importorskip("PIL.Image")
@@ -198,13 +197,11 @@ class FakeSGLang:
             def do_GET(self):
                 owner.requests.append(("GET", self.path, None))
                 if self.path == "/server_info":
-                    from sglang.version import __version__
-
                     self.respond(
                         {
                             "model_path": owner.model_path,
                             "pipeline": "RLinfCosmos3Pipeline",
-                            "version": __version__,
+                            "version": "test",
                         }
                     )
                     return
@@ -569,6 +566,8 @@ def worker_config(run_config, tmp_path):
 def rollout_worker(cfg, url):
     """Exercise the real inference method without starting a scheduler cluster."""
     pytest.importorskip("sglang.multimodal_gen.runtime.entrypoints.action.protocol")
+    from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWorker
+
     worker = object.__new__(SGLangEmbodiedWorker)
     worker.sglang_adapter = Cosmos3SGLangAdapter(cfg, rank=0)
     worker.http_client = InferenceHTTPClient(url)
@@ -579,18 +578,35 @@ def rollout_worker(cfg, url):
 
 
 @pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("share_weights", [False, True])
 def test_workers_preserve_actions_and_feed_back_raw_images(
-    worker_config, serve, raw_frames, debug
+    worker_config, serve, raw_frames, debug, share_weights
 ):
     import torch
 
+    from examples.embodiment.eval_cosmos3_closed_loop import cosmos_servers
     from rlinf.envs import get_env_cls
     from rlinf.workers.env.env_worker import EnvWorker
 
     worker_config.env.eval.debug.save_artifacts = debug
     service = FakeSGLang(raw_frames)
+    service.model_path = worker_config.rollout.model.model_path
     url = serve(service)
-    rollout = rollout_worker(worker_config, url)
+    worker_config.rollout.sglang.launch_server = False
+    worker_config.rollout.sglang.server_urls = [url]
+    worker_config.cosmos.share_weights = share_weights
+    simulator = service
+    if not share_weights:
+        simulator = FakeSGLang(raw_frames)
+        simulator.model_path = service.model_path + "-simulator"
+        worker_config.cosmos.simulator.model_path = simulator.model_path
+        worker_config.cosmos.simulator.sglang.launch_server = False
+        worker_config.cosmos.simulator.sglang.server_urls = [serve(simulator)]
+    with cosmos_servers(worker_config, None, None) as (urls, metadata):
+        assert metadata["share_weights"] is share_weights
+        policy_url = urls["policy"][0]
+        simulator_url = urls["simulator"][0]
+    rollout = rollout_worker(worker_config, policy_url)
     env_cfg = worker_config.env.eval
     env_worker = object.__new__(EnvWorker)
     env_worker.cfg = worker_config
@@ -599,7 +615,7 @@ def test_workers_preserve_actions_and_feed_back_raw_images(
     env_worker._world_size = 1
     env_worker._worker_info = None
     env_worker.stage_num = 1
-    env_worker.set_sglang_server_urls([url])
+    env_worker.set_sglang_server_urls([simulator_url])
     env_worker.eval_env_list = env_worker._setup_env_and_wrappers(
         get_env_cls(env_cfg.env_type, env_cfg), env_cfg, num_envs_per_stage=1
     )
@@ -641,8 +657,11 @@ def test_workers_preserve_actions_and_feed_back_raw_images(
     ]
     assert len(policies) == 3
     assert not any(path.startswith("/v1/videos") for _, path, _ in service.requests)
-    dynamics = service.rollout_requests
+    dynamics = simulator.rollout_requests
     assert len(dynamics) == 3
+    if not share_weights:
+        assert not service.rollout_requests
+        assert not simulator.policy_outputs
     for cycle, (policy, request) in enumerate(zip(policies, dynamics, strict=True)):
         np.testing.assert_array_equal(
             request["extra_sampling_params"]["action"], service.policy_outputs[cycle]
@@ -719,6 +738,113 @@ def test_example_config_validates_without_starting_ray(worker_config):
     from examples.embodiment.eval_cosmos3_closed_loop import validate_closed_loop_cfg
 
     validate_closed_loop_cfg(worker_config)
+
+
+def test_role_server_configs_are_independent_and_leave_user_config_unchanged(
+    worker_config,
+):
+    from examples.embodiment.eval_cosmos3_closed_loop import get_cosmos_server_configs
+
+    shared = get_cosmos_server_configs(worker_config)
+    assert shared["policy"] is shared["simulator"]
+    worker_config.cosmos.share_weights = False
+    worker_config.cosmos.simulator.model_path = "/simulator/weights"
+    worker_config.cosmos.simulator.sglang.server = {"batching_max_size": 3}
+    before = OmegaConf.to_container(worker_config, resolve=False)
+    OmegaConf.set_readonly(worker_config, True)
+    configs = get_cosmos_server_configs(worker_config)
+    assert configs["policy"].server.model_path == worker_config.rollout.model.model_path
+    assert configs["simulator"].server.model_path == "/simulator/weights"
+    assert configs["policy"].server.batching_max_size == 1
+    assert configs["simulator"].server.batching_max_size == 3
+    assert configs["policy"].group_name != configs["simulator"].group_name
+    assert OmegaConf.to_container(worker_config, resolve=False) == before
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"cosmos.share_weights": "yes"}, "must be a boolean"),
+        ({"cosmos.share_weights": False}, "require cosmos.simulator.model_path"),
+        ({"cosmos.simulator.model_path": "/other"}, "Shared weights"),
+        (
+            {
+                "cosmos.share_weights": False,
+                "cosmos.simulator.model_path": "/other",
+                "cosmos.simulator.sglang.group_name": "SGLangServerGroup",
+            },
+            "distinct group_name",
+        ),
+        (
+            {
+                "cosmos.share_weights": False,
+                "cosmos.simulator.model_path": "/other",
+                "cosmos.simulator.sglang.server.model_path": "/wrong",
+            },
+            "simulator server.model_path",
+        ),
+        (
+            {
+                "cosmos.share_weights": False,
+                "cosmos.simulator.model_path": "/other",
+                "rollout.sglang.launch_server": False,
+                "rollout.sglang.server_urls": ["http://host:30000"],
+                "cosmos.simulator.sglang.launch_server": False,
+                "cosmos.simulator.sglang.server_urls": ["http://host:30000/"],
+            },
+            "distinct policy and simulator URLs",
+        ),
+    ],
+)
+def test_role_server_configs_reject_conflicts(worker_config, overrides, message):
+    from examples.embodiment.eval_cosmos3_closed_loop import get_cosmos_server_configs
+
+    for field, value in overrides.items():
+        OmegaConf.update(worker_config, field, value)
+    with pytest.raises(ValueError, match=message):
+        get_cosmos_server_configs(worker_config)
+
+
+def test_external_role_servers_validate_both_checkpoints_and_remain_running(
+    worker_config, serve
+):
+    from examples.embodiment.eval_cosmos3_closed_loop import cosmos_servers
+
+    policy, simulator = FakeSGLang(), FakeSGLang()
+    policy.model_path = worker_config.rollout.model.model_path
+    simulator.model_path = "/simulator/weights"
+    policy_url, simulator_url = serve(policy), serve(simulator)
+    worker_config.rollout.sglang.launch_server = False
+    worker_config.rollout.sglang.server_urls = [policy_url]
+    worker_config.cosmos.share_weights = False
+    worker_config.cosmos.simulator.model_path = simulator.model_path
+    worker_config.cosmos.simulator.sglang.launch_server = False
+    worker_config.cosmos.simulator.sglang.server_urls = [simulator_url]
+    with cosmos_servers(worker_config, None, None) as (urls, metadata):
+        assert urls == {"policy": [policy_url], "simulator": [simulator_url]}
+        assert metadata["policy"]["model_path"] == policy.model_path
+        assert metadata["simulator"]["model_path"] == simulator.model_path
+    simulator.model_path = "/wrong/checkpoint"
+    with pytest.raises(ValueError, match="simulator server checkpoint differs"):
+        with cosmos_servers(worker_config, None, None):
+            pytest.fail("Expected simulator checkpoint validation to fail")
+    for url in (policy_url, simulator_url):
+        client = Cosmos3Client(url, timeout_s=5)
+        try:
+            assert client.server_info()["model_path"]
+        finally:
+            client.close()
+
+
+def test_comparison_rejects_independent_role_servers(worker_config):
+    from examples.embodiment.eval_cosmos3_closed_loop import validate_closed_loop_cfg
+
+    worker_config.cosmos.share_weights = False
+    worker_config.cosmos.simulator.model_path = "/simulator/weights"
+    with pytest.raises(
+        ValueError, match="comparison requires cosmos.share_weights=true"
+    ):
+        validate_closed_loop_cfg(worker_config, single_server=False)
 
 
 @pytest.mark.parametrize(

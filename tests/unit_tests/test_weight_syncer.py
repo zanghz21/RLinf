@@ -18,7 +18,7 @@ import inspect
 import logging
 import unittest
 from collections import OrderedDict
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,6 +49,7 @@ from rlinf.hybrid_engines.weight_syncer.patch_syncer import (
 from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
 from rlinf.runners.async_ppo_embodied_runner import AsyncPPOEmbodiedRunner
 from rlinf.runners.async_weight_sync_mixin import AsyncWeightSyncMixin
+from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import AcceleratorType, Worker
 from rlinf.utils.env_helpers import SmoothInterveneController  # noqa: E402
 from rlinf.utils.utils import collect_param_names_need_sync
@@ -1657,6 +1658,178 @@ def test_weight_syncer_factory_rejects_unknown_type():
     cfg = OmegaConf.create({"type": "unknown"})
     with pytest.raises(ValueError, match="Unsupported weight syncer type"):
         WeightSyncer.create(cfg)
+
+
+@pytest.mark.parametrize("syncer_type", ["bucket", "patch"])
+def test_cosmos_shared_simulator_receives_actor_tensors(syncer_type):
+    """Exercise the actual actor/env methods and both framework wire formats."""
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    # Patch snapshots intentionally require an accelerator; bucket transport
+    # also exercises the actual worker methods on CPU-only test hosts.
+    device = _get_cuda_device() if syncer_type == "patch" else "cpu"
+    source = _make_model(device)
+    simulator = _make_model().requires_grad_(False)
+    config = OmegaConf.create(
+        {
+            "type": syncer_type,
+            "bucket": {"bucket_size": 32, "bucket_device": "cpu"},
+            "patch": {
+                "transport_device": "cpu",
+                "snapshot_device": "cpu",
+                "init_sync": {"enabled": True, "bucket_size": 32},
+            },
+        }
+    )
+    cfg = OmegaConf.create({"weight_syncer": config, "actor": {"group_name": "actor"}})
+    transport = _InMemoryDuplexTransport()
+    placement = SimpleNamespace(get_world_size=lambda component: 1)
+
+    class MemoryHandle:
+        def __init__(self, operation):
+            self.operation = operation
+
+        async def async_wait(self):
+            return await self.operation
+
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.cfg = cfg
+    actor._group_name = "actor"
+    actor._env_group_name = "env"
+    actor._component_placement = placement
+    actor._is_weight_sender = True
+    actor.enable_offload = False
+    actor.version = 7
+    actor.param_names_need_sync = list(source.state_dict())
+    actor.get_rollout_state_dict = source.state_dict
+
+    def actor_broadcast(data, **kwargs):
+        assert kwargs["groups"] == [("actor", 0), ("env", [0])]
+        return MemoryHandle(transport.sender_send(copy.deepcopy(data)))
+
+    actor.broadcast = actor_broadcast
+    actor.recv = lambda **kwargs: MemoryHandle(transport.sender_recv())
+
+    env = object.__new__(EnvWorker)
+    env.cfg = cfg
+    env._rank = 0
+    env._world_size = 1
+    env._group_name = "env"
+    env._component_placement = placement
+    env._sync_cosmos_simulator = True
+    env._shared_cosmos_model = simulator
+    # The same module services train/eval across pipeline stages.
+    env._shared_cosmos_backends = [
+        SimpleNamespace(model=simulator, on_weights_updated=MagicMock())
+        for _ in range(4)
+    ]
+
+    def env_broadcast(data, **kwargs):
+        assert data is None
+        assert kwargs["groups"] == [("actor", 0), ("env", [0])]
+        return MemoryHandle(transport.receiver_recv())
+
+    env.broadcast = env_broadcast
+    env.send = lambda data, **kwargs: MemoryHandle(transport.receiver_send(data))
+
+    async def synchronize():
+        await asyncio.gather(
+            inspect.unwrap(EmbodiedFSDPActor.sync_model_to_env)(actor),
+            inspect.unwrap(EnvWorker.sync_model_from_actor)(env),
+        )
+
+    async def exercise_updates():
+        await synchronize()
+        _assert_state_dict_equal_on_cpu(source.state_dict(), simulator.state_dict())
+        with torch.no_grad():
+            source.linear.weight.add_(2)
+            source.tensor3d.mul_(0.5)
+        actor.version = 8
+        await synchronize()
+        _assert_state_dict_equal_on_cpu(source.state_dict(), simulator.state_dict())
+
+    asyncio.run(exercise_updates())
+    assert source.linear.weight.data_ptr() != simulator.linear.weight.data_ptr()
+    assert all(not parameter.requires_grad for parameter in simulator.parameters())
+    for backend in env._shared_cosmos_backends:
+        assert [call.args[0] for call in backend.on_weights_updated.call_args_list] == [
+            7,
+            8,
+        ]
+
+
+def test_cosmos_independent_simulator_does_not_receive_actor_weights():
+    env = object.__new__(EnvWorker)
+    env._sync_cosmos_simulator = False
+    env.broadcast = MagicMock(side_effect=AssertionError("Unexpected weight receive"))
+    asyncio.run(inspect.unwrap(EnvWorker.sync_model_from_actor)(env))
+    env.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_cosmos_runner_preserves_rollout_sync_and_waits_for_simulator(shared):
+    events = []
+
+    class Handle:
+        def __init__(self, name):
+            self.name = name
+
+        def wait(self):
+            events.append(self.name)
+
+    runner = object.__new__(EmbodiedRunner)
+    runner._sync_cosmos_simulator = shared
+    runner._initialize_cosmos_weights = True
+    runner._rollout_weights_initialized = False
+    runner.weight_sync_interval = 4
+    runner.actor = SimpleNamespace(
+        sync_model_to_rollout=lambda: Handle("actor_to_rollout"),
+        sync_model_to_env=lambda: Handle("actor_to_env"),
+    )
+    runner.rollout = SimpleNamespace(
+        sync_model_from_actor=lambda: Handle("rollout_receive")
+    )
+    runner.env = SimpleNamespace(sync_model_from_actor=lambda: Handle("env_receive"))
+    assert runner._should_sync_rollout_weights(3)
+    runner.update_rollout_weights()
+    expected = ["actor_to_rollout", "rollout_receive"]
+    if shared:
+        expected.extend(["actor_to_env", "env_receive"])
+    assert events == expected
+    assert not runner._should_sync_rollout_weights(3)
+    assert runner._should_sync_rollout_weights(4)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_cosmos_env_stages_and_evaluation_share_only_in_shared_mode(shared):
+    env_cfg = OmegaConf.create(
+        {
+            "env_type": "world_model",
+            "backend": "cosmos3",
+            "share_weights": shared,
+            "video_cfg": {"save_video": False},
+        }
+    )
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create({"env": {"eval": env_cfg}})
+    worker._rank = 0
+    worker._world_size = 1
+    worker._worker_info = None
+    worker.stage_num = 2
+    worker._sync_cosmos_simulator = shared
+    worker._shared_cosmos_model = None
+    worker._shared_cosmos_backends = []
+
+    def make_env(*, shared_model=None, **kwargs):
+        return SimpleNamespace(
+            backend=SimpleNamespace(model=shared_model or _make_model())
+        )
+
+    train = worker._setup_env_and_wrappers(make_env, env_cfg, 1)
+    evaluation = worker._setup_env_and_wrappers(make_env, env_cfg, 1)
+    models = [env.backend.model for env in train + evaluation]
+    assert len({id(model) for model in models}) == (1 if shared else 4)
+    assert len(worker._shared_cosmos_backends) == (4 if shared else 0)
 
 
 # Both async runners must pick the overlap up from the mixin, not from their own

@@ -73,6 +73,51 @@ class WeightSyncer(ABC):
         del state_dict, recv, send
         self._receiver_initialized = True
 
+    async def receive_from_worker(
+        self,
+        worker: Worker,
+        model: torch.nn.Module,
+        *,
+        source_group: str,
+        source_rank: int,
+        source_world_size: int,
+        destination_ranks: list[int],
+        is_sender: bool,
+    ) -> int:
+        """Receive a publication and initialize its receiver handshake once.
+
+        The designated destination worker sends receiver metadata to every
+        source rank, including ranks participating in sharded tensor gathering.
+        """
+
+        async def recv():
+            return await worker.broadcast(
+                None,
+                groups=[
+                    (source_group, source_rank),
+                    (worker._group_name, destination_ranks),
+                ],
+                src=(source_group, source_rank),
+                async_op=True,
+                options=self.comm_options,
+            ).async_wait()
+
+        async def send(data):
+            if not is_sender:
+                return
+            for rank in range(source_world_size):
+                await worker.send(
+                    data,
+                    dst_group_name=source_group,
+                    dst_rank=rank,
+                    async_op=True,
+                    options=self.comm_options,
+                ).async_wait()
+
+        if not self.receiver_initialized():
+            await self.init_receiver(model.state_dict(), recv=recv, send=send)
+        return await self.apply(model, recv)
+
     @classmethod
     def create(cls, config: DictConfig) -> "WeightSyncer":
         assert config is not None, "Weight syncer config must be provided"

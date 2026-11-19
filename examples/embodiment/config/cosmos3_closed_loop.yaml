@@ -11,6 +11,18 @@ cluster:
   component_placement:
     env,rollout: 0
 
+cosmos:
+  share_weights: true
+  simulator:
+    # Required when share_weights=false; local serving also needs simulator placement.
+    model_path: null
+    sglang:
+      # Other server options inherit rollout.sglang.
+      launch_server: true
+      server_urls: []
+      group_name: Cosmos3SimulatorServerGroup
+      router_group_name: Cosmos3SimulatorRouterGroup
+
 runner:
   task_type: embodied_eval
   only_eval: true

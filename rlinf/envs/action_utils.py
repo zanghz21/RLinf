@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import lru_cache
+
 import numpy as np
 import torch
 
@@ -87,6 +89,21 @@ def prepare_actions_for_libero(
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions
+
+
+@lru_cache(maxsize=8)
+def _cosmos3_libero_converter(num_action_chunks, stats_path, normalization):
+    from rlinf.models.embodiment.cosmos3.libero_actions import (
+        Cosmos3LiberoActionConverter,
+    )
+
+    if normalization not in ("quantile_rot", "quantile", "meanstd", "minmax"):
+        raise ValueError(
+            f"Unsupported Cosmos3 LIBERO action_normalization {normalization!r}"
+        )
+    return Cosmos3LiberoActionConverter(
+        num_action_chunks, 10, normalization, stats_path
+    )
 
 
 def prepare_actions_for_isaaclab(
@@ -344,13 +361,40 @@ def prepare_actions(
         raw_chunk_actions = raw_chunk_actions.numpy()
 
     env_type = SupportedEnvType(env_type)
-    if env_type == SupportedEnvType.COSMOS3:
+    if env_type == SupportedEnvType.COSMOS3 or (
+        env_type == SupportedEnvType.WORLD_MODEL
+        and env_cfg is not None
+        and env_cfg.get("backend") == "cosmos3"
+    ):
         if SupportedModel(model_type) != SupportedModel.COSMOS3 or action_dim != 10:
             raise ValueError(
                 "Cosmos3 dynamics require native 10-D Cosmos3 policy actions"
             )
         return raw_chunk_actions
     if env_type == SupportedEnvType.LIBERO:
+        if SupportedModel(model_type) == SupportedModel.COSMOS3 and action_dim == 10:
+            # Keep the normalized policy samples in the rollout for GRPO replay.
+            stats_path = (
+                env_cfg.get("action_stats_path") if env_cfg is not None else None
+            )
+            if not stats_path:
+                raise ValueError(
+                    "Native Cosmos3 LIBERO actions require env.action_stats_path"
+                )
+            if raw_chunk_actions.ndim != 3 or raw_chunk_actions.shape[1:] != (
+                num_action_chunks,
+                10,
+            ):
+                raise ValueError(
+                    f"Expected native Cosmos3 actions [batch, {num_action_chunks}, 10], "
+                    f"got {raw_chunk_actions.shape}"
+                )
+            converter = _cosmos3_libero_converter(
+                num_action_chunks,
+                stats_path,
+                env_cfg.get("action_normalization", "quantile_rot"),
+            )
+            raw_chunk_actions = converter.native_actions_to_libero(raw_chunk_actions)
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,

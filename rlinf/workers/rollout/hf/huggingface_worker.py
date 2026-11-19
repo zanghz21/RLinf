@@ -521,6 +521,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.GR00T_N1D7,
             SupportedModel.ABOT_M0,
             SupportedModel.DREAMZERO,
+            SupportedModel.COSMOS3,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
             SupportedModel.MOLMOACT2,
@@ -645,39 +646,15 @@ class MultiStepRolloutWorker(Worker):
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
 
-        async def recv_func() -> Any:
-            return await self.broadcast(
-                None,
-                groups=[
-                    (self.actor_group_name, self.actor_weight_src_rank),
-                    (self._group_name, self._weight_sync_rollout_ranks),
-                ],
-                src=(self.actor_group_name, self.actor_weight_src_rank),
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        async def send_func(data: Any) -> None:
-            if not self._weight_sync_is_sender:
-                return
-            actor_world_size = self.placement.get_world_size("actor")
-            for actor_rank in range(actor_world_size):
-                await self.send(
-                    data,
-                    dst_group_name=self.actor_group_name,
-                    dst_rank=actor_rank,
-                    async_op=True,
-                    options=self._sync_weight_comm_options,
-                ).async_wait()
-
-        if not self.weight_syncer.receiver_initialized():
-            await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
-                recv=recv_func,
-                send=send_func,
-            )
-
-        applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
+        applied_version = await self.weight_syncer.receive_from_worker(
+            self,
+            self.hf_model,
+            source_group=self.actor_group_name,
+            source_rank=self.actor_weight_src_rank,
+            source_world_size=self.placement.get_world_size("actor"),
+            destination_ranks=self._weight_sync_rollout_ranks,
+            is_sender=self._weight_sync_is_sender,
+        )
         self.version = applied_version
         if self.finished_episodes is None:
             self.finished_episodes = (

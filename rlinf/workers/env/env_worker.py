@@ -32,6 +32,7 @@ from rlinf.envs import SupportedEnvType, get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
+from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.env_helpers import HistoryManager, SmoothInterveneController
 from rlinf.utils.nested_dict_process import (
@@ -53,6 +54,7 @@ class EnvWorker(Worker):
     _policy_input_split_fn = None
     collect_final_values = True
     _sglang_server_urls = None
+    _sync_cosmos_simulator = False
 
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -121,6 +123,11 @@ class EnvWorker(Worker):
         train_env_cfg = self.cfg.env.get("train", None)
         eval_env_cfg = self.cfg.env.get("eval", None)
         self.enable_train = not self.only_eval and train_env_cfg is not None
+        self._sync_cosmos_simulator = bool(
+            self.enable_train and train_env_cfg.get("share_weights", False)
+        )
+        self._shared_cosmos_model = None
+        self._shared_cosmos_backends = []
         self.enable_eval = (
             self.cfg.runner.get("val_check_interval", -1) > 0 or self.only_eval
         )
@@ -251,6 +258,32 @@ class EnvWorker(Worker):
 
         self._init_env()
 
+    @Worker.timer("env/sync_model_from_actor")
+    async def sync_model_from_actor(self) -> None:
+        """Apply actor weights to the shared Cosmos simulator before rollout.
+
+        Pipeline stages and evaluation environments share the local module but
+        retain their own backend sessions. Bootstrap/session state contains
+        observations rather than cached model activations and remains valid.
+        """
+        if not self._sync_cosmos_simulator:
+            return
+        if self._shared_cosmos_model is None:
+            raise RuntimeError("Initialize the Cosmos simulator before syncing weights")
+        if not hasattr(self, "_env_weight_syncer"):
+            self._env_weight_syncer = WeightSyncer.create(self.cfg.weight_syncer)
+        version = await self._env_weight_syncer.receive_from_worker(
+            self,
+            self._shared_cosmos_model,
+            source_group=self.cfg.actor.group_name,
+            source_rank=0,
+            source_world_size=self._component_placement.get_world_size("actor"),
+            destination_ranks=list(range(self._world_size)),
+            is_sender=self._rank == 0,
+        )
+        for backend in self._shared_cosmos_backends:
+            backend.on_weights_updated(version)
+
     def update_env_cfg(self):
         if self.enable_train:
             # train env
@@ -356,13 +389,29 @@ class EnvWorker(Worker):
         env_list = []
 
         for stage_id in range(self.stage_num):
+            shared_cosmos = self._sync_cosmos_simulator and env_cfg.get(
+                "share_weights", False
+            )
+            env_kwargs = (
+                {"shared_model": self._shared_cosmos_model} if shared_cosmos else {}
+            )
             env = env_cls(
                 cfg=env_cfg,
                 num_envs=num_envs_per_stage,
                 seed_offset=self._rank * self.stage_num + stage_id,
                 total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
+                **env_kwargs,
             )
+            if shared_cosmos:
+                backend = get_env_attr(env, "backend")
+                if self._shared_cosmos_model is None:
+                    self._shared_cosmos_model = backend.model
+                elif backend.model is not self._shared_cosmos_model:
+                    raise RuntimeError(
+                        "Shared Cosmos environments must reuse one model"
+                    )
+                self._shared_cosmos_backends.append(backend)
             if env_cfg.env_type == "cosmos3":
                 if not self._sglang_server_urls:
                     raise RuntimeError(

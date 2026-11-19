@@ -1,10 +1,10 @@
 # Cosmos3 Tools
 
-The policy/world-model loop uses RLinf's existing evaluation workers. Start with [`examples/embodiment/eval_cosmos3_closed_loop.py`](../../examples/embodiment/eval_cosmos3_closed_loop.py) and [`config/cosmos3_closed_loop.yaml`](../../examples/embodiment/config/cosmos3_closed_loop.yaml).
+Use [`eval_cosmos3_closed_loop.py`](../../examples/embodiment/eval_cosmos3_closed_loop.py) for SGLang inference and [`train_embodied_agent.py`](../../examples/embodiment/train_embodied_agent.py) for native WoVR training. Both entries use `cosmos.share_weights` to select shared or independent policy and simulator weights.
 
-`SGLangEmbodiedWorker` generates native normalized 10D actions. `EnvWorker` runs `Cosmos3Env`, which sends those exact actions to the same SGLang server for forward dynamics. `EmbodiedEvalRunner` feeds the final generated image back to the policy. This inference-only evaluation follows the existing rollout model configuration and does not launch an actor or perform training updates.
+`SGLangEmbodiedWorker` generates native normalized 10D actions. `EnvWorker` runs `Cosmos3Env`, which sends those exact actions to the simulator's SGLang server for forward dynamics. `EmbodiedEvalRunner` feeds the final generated image back to the policy. This inference-only evaluation follows the existing rollout model configuration. The native training workflow is described below.
 
-Both roles use `InferenceHTTPClient` for HTTP transport. `Cosmos3Client` retains only video-job submission, polling, and download orchestration. Each worker owns its client instance; they connect to the same model server. Video submission has no automatic retries.
+Both evaluation roles use `InferenceHTTPClient` for HTTP transport. `Cosmos3Client` requests decoded tensors from `/rollout/generate`; feedback uses raw frames without MP4 conversion. Each worker owns its client instance. Generation has no automatic retries.
 
 The default uses one environment, one rollout stage, and one GPU. It starts from LIBERO-Spatial episode 1261, frame 0, then runs three chunks of 16 actions. Only the initial external/wrist images and instruction come from the dataset. Useful behavior depends on the checkpoint; the base Nano checkpoint is used first to exercise the pipeline.
 
@@ -47,12 +47,34 @@ env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u AL
 
 `RAY_ADDRESS=local` creates an independent Ray session for this single-node test. Removing proxy variables lets the server health check connect directly. These settings belong to the launch command; the CUDA wrapper only configures library loading. For Ray temporary data on shared storage, set `RAY_TMPDIR` to a short path or short symlink to that storage, because Unix socket paths have a length limit.
 
-This launches one shared server, coordinates both workers, saves artifacts, and stops its server. A caller-owned server can be used with `rollout.sglang.launch_server=false` and `rollout.sglang.server_urls='[http://host:30000]'`; it is left running. External servers must use the same checkpoint, ordinary inference mode, and no action normalization statistics. The entry checks the advertised checkpoint path.
+By default, `cosmos.share_weights=true` launches one model instance for both roles from `rollout.model.model_path`. A caller-owned server can be used with `rollout.sglang.launch_server=false` and `rollout.sglang.server_urls='[http://host:30000]'`; it is left running. The entry checks the advertised checkpoint path. Use ordinary inference mode and leave action normalization statistics unset.
 
-Each run requires a new artifact directory. Under `<log_path>/artifacts`, inspect `config.json`, `server.json`, and `episode_000/`. Each `cycle_000/`-style directory retains the input canvas, `actions_native.npy`, dynamics request/response, predicted video, next image, and status. The episode's `closed_loop.mp4` omits repeated conditioning frames. Rewards are interface placeholders; metrics report generated length/chunk count, not task success.
+For independent weights, set `cosmos.share_weights=false`, choose `cosmos.simulator.model_path`, and add a `simulator` component placement for its server, for example GPU `1` while `env,rollout` uses GPU `0`. Other simulator serving settings inherit `rollout.sglang` and can be overridden under `cosmos.simulator.sglang`; checkpoint, launch mode, URLs, and worker names are independently configured. An external simulator uses `cosmos.simulator.sglang.launch_server=false` and its own `cosmos.simulator.sglang.server_urls`. Each role's checkpoint is checked separately. Cleanup stops only servers launched by the entry, including after failed warmup. Shared mode requires `cosmos.simulator.model_path=null` and empty simulator server URLs. The LIBERO comparison entry currently requires shared mode.
+
+Set `env.eval.debug.save_artifacts=true` to record a run, using a new artifact directory. Under `<log_path>/artifacts`, inspect `config.json`, `server.json`, and `episode_000/`. `server.json` identifies sharing mode and both role servers. Each `cycle_000/`-style directory retains the input canvas, `actions_native.npy`, dynamics request/response, predicted video, next image, and status. The episode's `closed_loop.mp4` omits repeated conditioning frames. Rewards are interface placeholders; metrics report generated length/chunk count, not task success. Artifact recording is disabled by default.
 
 For one cycle, override both `env.eval.max_episode_steps=16` and `env.eval.max_steps_per_rollout_epoch=16`. For submitted compute tasks, use the same entry, shared paths, and a fixed code snapshot. In a multi-node Ray allocation, use its cluster address instead of `RAY_ADDRESS=local`. Choose compatibility libraries on each execution node before starting Ray there; do not propagate a driver-570 override blindly to nodes with newer drivers. On a shared host, inspect and stop only your run's processes before reusing its GPU.
 
 CPU tests exercise real worker inference/step methods against a fake HTTP service, including exact action handoff and three-cycle image feedback. A real Nano run on an A800 with driver `570.172.08`, compatibility libraries `580.196.07`, Torch `2.13.0+cu130`, and SGLang `0.5.19` also completed three cycles: 48 action steps and a 49-frame stitched video. Artifact checks confirmed finite `(16, 10)` actions per cycle, exact action transfer, and exact image feedback between cycles. This validates inference and feedback wiring; task quality requires a separate evaluation.
 
-See the [English guide](../../docs/source-en/rst_source/evaluations/guides/cosmos3_sglang.rst) and [Chinese guide](../../docs/source-zh/rst_source/evaluations/guides/cosmos3_sglang.rst). Checkpoint conversion utilities remain in this toolkit directory.
+## Native WoVR training
+
+Run the standard embodied trainer with `cosmos3_wovr` after setting the Cosmos checkpoint, LeRobot keyframes and reward checkpoint in the [training configuration](../../examples/embodiment/config/cosmos3_wovr.yaml).
+
+```bash
+bash examples/embodiment/run_embodiment.sh cosmos3_wovr
+```
+
+The default configuration places the FSDP actor, rollout worker and world-model environment on GPUs 0, 1 and 2 respectively. Shared mode publishes actor weights to the rollout and simulator replicas. For a frozen independent simulator, set `cosmos.share_weights=false` and `cosmos.simulator.model_path`. Use `runner.resume_dir` to restore a standard embodied checkpoint.
+
+The [English guide](../../docs/source-en/rst_source/evaluations/guides/cosmos3_sglang.rst) and [Chinese guide](../../docs/source-zh/rst_source/evaluations/guides/cosmos3_sglang.rst) include the native SDK revision, asset requirements and commands for both weight modes.
+
+## GRPO in LIBERO-Spatial
+
+To use LIBERO physics and task-success rewards, set `actor.model.model_path` and `env.train.action_stats_path` in the [LIBERO training configuration](../../examples/embodiment/config/libero_spatial_grpo_cosmos3.yaml), then run:
+
+```bash
+bash examples/embodiment/run_embodiment.sh libero_spatial_grpo_cosmos3
+```
+
+The default placement uses GPU 0 for the actor and GPU 1 for rollout and LIBERO rendering. Install the native Cosmos SDK and the LIBERO environment with `requirements/install.sh embodied --model cosmos3 --env libero` using the SDK revision in the guides above.

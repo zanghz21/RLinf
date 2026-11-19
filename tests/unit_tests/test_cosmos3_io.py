@@ -102,6 +102,29 @@ def test_load_observation_rejects_missing_frame(lerobot_dataset):
         load_lerobot_observation(lerobot_dataset, 1261, 0)
 
 
+def test_wovr_keyframe_uses_closed_loop_pixels_and_raw_task(lerobot_dataset):
+    import torch
+    from omegaconf import OmegaConf
+
+    from rlinf.data.datasets.cosmos3_keyframes import Cosmos3KeyframeDataset
+
+    cfg = OmegaConf.create(
+        {
+            "root": str(lerobot_dataset),
+            "keyframes": [{"episode_index": 1261, "frame_index": 6}],
+        }
+    )
+    dataset = Cosmos3KeyframeDataset(cfg, [16, 32])
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["task"] == "put the bowl on the plate"
+    external, wrist, _ = load_lerobot_observation(lerobot_dataset, 1261, 6)
+    expected, _ = prepare_canvas(external, wrist, 32, 16)
+    image = sample["start_items"][0]["image"]
+    assert image.dtype == torch.float32
+    np.testing.assert_array_equal(image.permute(1, 2, 0).numpy() * 255, expected)
+
+
 def test_load_observation_decodes_dataset_relative_image_paths(lerobot_dataset):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -169,6 +192,44 @@ def test_native_actions_preserve_normalized_values_without_clipping():
     np.testing.assert_array_equal(
         validate_native_actions(values.tolist(), 2, 10), values
     )
+
+
+def test_libero_executes_seven_d_actions_and_preserves_cosmos_policy_samples(tmp_path):
+    import torch
+
+    from rlinf.envs.action_utils import prepare_actions
+
+    stats = tmp_path / "stats.json"
+    stats.write_text(
+        json.dumps(
+            {"global_raw": {"q01": [-2] * 3 + [-1] * 6 + [0], "q99": [2] * 3 + [1] * 7}}
+        )
+    )
+    native = torch.tensor(
+        [[[1, 0, -1, 0, 1, 0, -1, 0, 0, -1], [0, -1, 1, 1, 0, 0, 0, 1, 0, 1]]],
+        dtype=torch.float32,
+    )
+    replay = native.clone()
+    physical = prepare_actions(
+        native, "libero", "cosmos3", 2, 10, env_cfg={"action_stats_path": str(stats)}
+    )
+    expected = np.array([[[2, 0, -2, 0, 0, np.pi / 2, 1], [0, -2, 2, 0, 0, 0, -1]]])
+    np.testing.assert_allclose(physical, expected, atol=1e-6)
+    torch.testing.assert_close(native, replay)
+
+    # The SGLang rollout already returns continuous 7-D actions.
+    continuous = physical.copy()
+    continuous[..., -1] = [0, 1]
+    np.testing.assert_allclose(
+        prepare_actions(continuous, "libero", "cosmos3", 2, 7), expected, atol=1e-6
+    )
+
+
+def test_libero_native_actions_require_checkpoint_statistics():
+    from rlinf.envs.action_utils import prepare_actions
+
+    with pytest.raises(ValueError, match="action_stats_path"):
+        prepare_actions(np.zeros((1, 2, 10)), "libero", "cosmos3", 2, 10)
 
 
 @pytest.mark.parametrize("shape", [(1, 2, 10), (2, 64), (2, 7), (0, 10)])

@@ -173,6 +173,33 @@ def prepare_canvas(
     }
 
 
+def prepare_libero_canvases(
+    main_images: np.ndarray, wrist_images: np.ndarray, width: int, height: int
+) -> np.ndarray:
+    """Compose batched, already-upright RGB observations returned by LiberoEnv."""
+    import numpy as np
+    from PIL import Image
+
+    main, wrist = np.asarray(main_images), np.asarray(wrist_images)
+    if (
+        main.ndim != 4
+        or main.shape[-1] != 3
+        or main.shape != wrist.shape
+        or main.dtype != np.uint8
+        or wrist.dtype != np.uint8
+    ):
+        raise ValueError(
+            "Expected matching uint8 LIBERO cameras [batch,height,width,3]"
+        )
+    frames = []
+    for external, hand in zip(main, wrist, strict=True):
+        canvas, _ = prepare_canvas(
+            Image.fromarray(external), Image.fromarray(hand), width, height
+        )
+        frames.append(np.asarray(canvas))
+    return np.stack(frames)
+
+
 def augment_prompt(task: str) -> str:
     """Describe the same external-left/wrist-right canvas as the policy adapter."""
     prompt = task.strip()

@@ -5,6 +5,8 @@ Cosmos3 SGLang 评测
 
 如果还希望由 Cosmos3 预测下一次观测，使用 :ref:`cosmos3-learned-loop`。该流程从 LIBERO-Spatial 的记录图像开始，验证模型生成的观测能否持续反馈；下面的仿真评测流程则用于统计任务成功率。需要从相同初始状态对比两种 simulator，并交叉 replay 动作时，使用 :ref:`cosmos3-simulator-comparison`。
 
+需要在模型生成的环境中训练 Cosmos policy 时，使用 :ref:`cosmos3-wovr-training`。该入口使用原生 Cosmos SDK 和已训练的奖励模型。推理闭环与训练闭环均通过 ``cosmos.share_weights`` 选择共用权重或独立权重。
+
 工作原理
 ----------------------------------------
 
@@ -137,9 +139,9 @@ LIBERO 轨迹计数规则见 :ref:`libero-eval-config`。
 运行模型生成的观测闭环
 ----------------------------------------
 
-通过现有评测 worker，让 Cosmos3 同时生成动作和后续观测。``SGLangEmbodiedWorker`` 请求动作，``EnvWorker`` 运行 ``Cosmos3Env``，将归一化 10 维动作原样传给同一个 server 进行 forward prediction。``EmbodiedEvalRunner`` 将生成视频的最后一帧反馈给下一轮 policy。本流程使用 rollout 模型配置，只执行推理，不启动 actor 或训练更新。
+通过现有评测 worker，让 Cosmos3 同时生成动作和后续观测。``SGLangEmbodiedWorker`` 请求动作，``EnvWorker`` 运行 ``Cosmos3Env``，将归一化 10 维动作原样传给 simulator server 进行 forward prediction。``EmbodiedEvalRunner`` 将生成视频的最后一帧反馈给下一轮 policy。本流程使用 rollout 模型配置，只执行推理；训练使用下文的独立入口。
 
-policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosmos3Client`` 向同一个 server 的官方 ``POST /rollout/generate`` 接口发送仅推理请求（``rollout=false``）。server 通过 MessagePack 响应返回 safetensors 编码的已解码张量。RLinf 在内存中按 SGLang 的裁剪与截断规则，将浮点像素转换为 ``uint8`` RGB，再把最后一帧直接传给下一轮 policy。条件图像使用内存中的无损 PNG data URI，反馈链路不经过 MP4 编码和解码。
+policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosmos3Client`` 向 simulator 的官方 ``POST /rollout/generate`` 接口发送仅推理请求（``rollout=false``）。server 通过 MessagePack 响应返回 safetensors 编码的已解码张量。RLinf 在内存中按 SGLang 的裁剪与截断规则，将浮点像素转换为 ``uint8`` RGB，再把最后一帧直接传给下一轮 policy。条件图像使用内存中的无损 PNG data URI，反馈链路不经过 MP4 编码和解码。
 
 在 ``examples/embodiment/config/cosmos3_closed_loop.yaml`` 中配置 checkpoint 和 LeRobot 数据集路径。默认选择 LIBERO-Spatial episode ``1261``、frame ``0``、数据集 task index ``30``。输入拼接的外部相机与腕部相机图像，预测 16 个动作，再以 20 FPS 生成 17 帧视频。初始化只取一帧观测，因此单独记录数据集的 10 FPS 元数据。后续观测全部来自生成视频。
 
@@ -171,6 +173,24 @@ policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosm
 该命令为单节点 smoke test 创建独立的 Ray 会话，并在本次进程中取消代理设置，让 server 健康检查直接连接。CUDA wrapper 只配置动态库加载。将 Ray 临时数据放在共享存储时，应把 ``RAY_TMPDIR`` 设为较短的路径，或指向共享存储的短路径符号链接；Ray 使用的 Unix socket 路径有长度限制。
 
 默认配置在同一节点启动一个 server、一个 rollout worker 和一个 env worker。命令中的 48 个环境步对应三个包含 16 个动作的 chunk。每次 debug 运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://model-server:30000]'``。支持 HTTP 和 HTTPS 地址，server 可以部署在其他节点。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 必须支持 rollout 接口，使用普通推理模式，并保持动作归一化统计参数未设置。
+
+默认 ``cosmos.share_weights=true``，两个角色共用 ``rollout.model.model_path`` 对应的同一个模型实例。此时保持 ``cosmos.simulator.model_path=null``，simulator 的 server URL 列表也保持为空。需要独立权重时，在同一 YAML 中配置：
+
+.. code-block:: yaml
+
+   cosmos:
+     share_weights: false
+     simulator:
+       model_path: /path/to/simulator/model_diffusers
+   rollout:
+     model:
+       model_path: /path/to/policy/model_diffusers
+   cluster:
+     component_placement:
+       env,rollout: 0
+       simulator: 1
+
+该配置在 GPU 0 启动 policy server，在 GPU 1 启动 simulator server。simulator 的 checkpoint、启动方式、URL 和 worker 名称独立配置，其余服务参数继承 ``rollout.sglang``。可在 ``cosmos.simulator.sglang`` 下覆盖其他参数，例如 ``+cosmos.simulator.sglang.server.batching_max_size=2``。连接外部 simulator 时，设置 ``cosmos.simulator.sglang.launch_server=false`` 和 ``cosmos.simulator.sglang.server_urls='[http://simulator:30000]'``，此时不使用 simulator placement。两个角色分别选择本次启动或复用外部服务；独立模式下，外部服务的 URL 必须不同。入口逐一检查服务公布的 checkpoint，退出时只停止本次启动的服务，模型初始化失败时也会清理。debug 产物 ``server.json`` 记录 ``share_weights`` 及 ``policy``、``simulator`` 两个角色的服务信息。
 
 通过 ``env.eval.total_num_envs``，在一个 env worker 内运行多个模型环境。动作 shape 为 ``[B,T,10]``，观测 shape 为 ``[B,H,W,3]``。每个 chunk 并发提交 B 个独立 HTTP 请求，再按环境顺序接收结果；所有响应成功后，才一起更新观测与 episode 计数。如果一批中有请求失败，先等待其他客户端请求结束，再抛出异常，不自动重试生成。
 
@@ -205,10 +225,81 @@ debug 模式在 ``<log_path>/artifacts/`` 下记录输入与下一次观测的 P
 
 较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。默认示例使用单节点，HTTP 传输也支持独立部署的兼容 server。在各执行节点启动 Ray 之前，选择该节点适用的兼容库；不要将驱动 570 所用的库路径直接应用于使用更新驱动的节点。
 
+.. _cosmos3-wovr-training:
+
+在 Cosmos 模拟环境中训练 Cosmos 策略
+--------------------------------------
+
+``cosmos3_wovr`` 配置沿用 RLinf 的 embodied 训练入口。rollout worker 采样原生
+10 维动作，``WorldModelEnv`` 调用 Cosmos 预测后续图像，把末帧反馈给策略，并用冻结的奖励模型逐帧打分。
+FSDP actor 使用 RLinf 的 GRPO 优势估计和带裁剪的策略损失更新权重。默认部署为 actor、rollout
+和环境各分配一张 GPU。
+
+安装适配器使用的 Cosmos SDK 版本，准备带 LIBERO 动作头的未量化 Cosmos 权重、
+LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 ``config.json``
+也可通过 ``actor.model.native_config_path`` 单独指定。
+
+.. code-block:: bash
+
+   COSMOS3_GIT_REF=4ed6244506e00bb270ed17d4532897f2aaa7bc16 \
+     bash requirements/install.sh embodied --model cosmos3 --env libero
+   source .venv/bin/activate
+   export PYTHONPATH="$PWD" EMBODIED_PATH="$PWD/examples/embodiment"
+   python examples/embodiment/train_embodied_agent.py --config-name cosmos3_wovr \
+     actor.model.model_path=/shared/cosmos-policy \
+     env.train.dataset.root=/shared/lerobot/libero \
+     'env.train.dataset.keyframes=[{episode_index:1261,frame_index:0}]' \
+     env.train.reward_model.model_path=/shared/rewards/libero.pth
+
+从目标任务中选取尚未成功的关键帧。每个 GRPO 组从同一张图像和相同指令出发。
+奖励模型默认从双视角画面中裁出 160×160 的外部相机图像。``env.train.success_reward_threshold``
+决定首次成功的动作，actor 的损失掩码保留该动作并屏蔽后续动作。每个动作块随机选择一个去噪步骤，
+保存该步骤的输入、输出和采样时的对数概率。actor 重算同一步转移的对数概率，按十个动作通道求和，
+得到用于更新策略的条件转移概率比。
+
+默认 ``cosmos.share_weights=true``。每到权重同步点，actor 会在下一次采样前把权重发送给 rollout
+和 simulator。各 worker 持有自己的推理副本。要固定 simulator 权重，请在同一启动命令中追加以下覆盖项。
+若独立权重另有原生配置文件，可指定 ``cosmos.simulator.native_config_path``。
+
+.. code-block:: bash
+
+   cosmos.share_weights=false cosmos.simulator.model_path=/shared/cosmos-simulator
+
+``runner.save_interval`` 控制标准 embodied checkpoint 的保存间隔，可通过
+``runner.resume_dir=/shared/run/checkpoints/global_step_5`` 恢复训练。
+指标由 ``runner.logger`` 指定的后端记录。训练奖励表示模型预测的成功程度，LIBERO
+仿真中的任务成功率可通过评测流程测量。
+
+.. _cosmos3-libero-grpo:
+
+在 LIBERO-Spatial 中用 GRPO 训练 Cosmos3
+-----------------------------------------
+
+用 ``libero_spatial_grpo_cosmos3`` 运行原生 Cosmos3 策略，让 LIBERO 物理仿真器执行动作，
+并根据任务是否成功计算奖励。准备带 LIBERO 动作头的未量化 Cosmos 权重，以及训练该动作头时使用的归一化统计文件。
+
+.. code-block:: bash
+
+   COSMOS3_GIT_REF=4ed6244506e00bb270ed17d4532897f2aaa7bc16 \
+     bash requirements/install.sh embodied --model cosmos3 --env libero
+   source .venv/bin/activate
+   export PYTHONPATH="$PWD" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+   python examples/embodiment/train_embodied_agent.py --config-name libero_spatial_grpo_cosmos3 \
+     actor.model.model_path=/shared/cosmos-policy \
+     env.train.action_stats_path=/shared/libero_native_frame_wise_relative_rot6d.json
+
+每个 GRPO 组从同一个任务和初始状态出发。策略读取主相机和腕相机的拼图。
+环境 worker 对 10 维动作做反归一化，将 6 维旋转表示转成轴角，交给 LIBERO 的 7 维控制器执行。
+actor 用采样时保存的原生去噪转移更新策略，并将权重同步给 rollout。默认 actor 使用 GPU 0，
+rollout 和 LIBERO 渲染共用 GPU 1。将 ``runner.val_check_interval`` 设为正整数可在训练中定期评估。
+要同时切换训练和评估任务集，可设置 ``env.train.task_suite_name=libero_goal``。
+
 .. _cosmos3-simulator-comparison:
 
 对比 Cosmos3 与 LIBERO 视频
 ----------------------------------------
+
+对比入口要求 ``cosmos.share_weights=true``，每个 comparison worker 使用同一个模型 server 执行两个角色。独立权重请使用上文的闭环评测或训练入口。
 
 通过 ``examples/embodiment/compare_cosmos3_libero.py``，对比模型预测与 LIBERO 物理仿真的轨迹。每个 task/reset 组合中的所有分支使用同一 LIBERO 状态，并等待场景稳定。脚本把 LIBERO 此时渲染的相机拼图直接作为 Cosmos3 的初始观测，保证起点像素一致。LeRobot 记录图像无法还原完整的物理状态，因此这里使用实际 LIBERO reset。
 
