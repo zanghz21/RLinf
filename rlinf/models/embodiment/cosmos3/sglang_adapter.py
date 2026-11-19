@@ -280,26 +280,26 @@ class Cosmos3SGLangAdapter:
                 f"Cosmos3 action values have unexpected ndim={arr.ndim} "
                 f"(expected one [horizon, D] array per env); shape={arr.shape}"
             )
+        if arr.shape[0] == 0:
+            raise ValueError("Cosmos3 returned no action chunks to parse.")
         if self._action_output == "native":
             from rlinf.models.embodiment.cosmos3.closed_loop_io import (
                 validate_native_actions,
             )
 
-            chunks = [
-                validate_native_actions(
-                    chunk, self._num_action_chunks, self._raw_action_dim
-                )
-                for chunk in arr
-            ]
+            chunks = np.stack(
+                [
+                    validate_native_actions(
+                        chunk, self._num_action_chunks, self._raw_action_dim
+                    )
+                    for chunk in arr
+                ],
+                axis=0,
+            )
         else:
-            chunks = [self._action_to_env(arr[i]) for i in range(arr.shape[0])]
-        if not chunks:
-            raise ValueError("Cosmos3 returned no action chunks to parse.")
+            chunks = self.native_actions_to_libero(arr)
         actions = (
-            torch.tensor(np.stack(chunks, axis=0), dtype=torch.float32)
-            .detach()
-            .cpu()
-            .contiguous()
+            torch.tensor(chunks, dtype=torch.float32).detach().cpu().contiguous()
         )  # [N, num_action_chunks, action_dim]
         flat = actions.reshape(actions.shape[0], -1)
         info = {
@@ -308,6 +308,40 @@ class Cosmos3SGLangAdapter:
             "forward_inputs": {"action": flat.cpu()},
         }
         return actions, info
+
+    def native_actions_to_libero(
+        self, native_batch: np.ndarray | torch.Tensor
+    ) -> np.ndarray:
+        """Convert normalized Cosmos actions to continuous LIBERO actions.
+
+        Uses this adapter's normalization statistics. Padded action channels are
+        discarded, and each horizon is clipped or padded to num_action_chunks.
+        Gripper values remain continuous; environment preparation is separate.
+
+        Args:
+            native_batch: Actions with shape [batch, horizon, padded_action_dim].
+
+        Returns:
+            Float32 actions with shape [batch, num_action_chunks, 7].
+        """
+        if isinstance(native_batch, torch.Tensor):
+            native_batch = native_batch.detach().to(dtype=torch.float32).cpu().numpy()
+        actions = np.asarray(native_batch, dtype=np.float32)
+        if actions.ndim != 3:
+            raise ValueError(
+                "Cosmos3 native action batch must have shape [batch, horizon, D], "
+                f"got {actions.shape}"
+            )
+        if actions.shape[0] == 0:
+            raise ValueError(
+                "Cosmos3 native action batch must contain at least one env"
+            )
+        if actions.shape[-1] < self._raw_action_dim:
+            raise ValueError(
+                f"Cosmos3 native action width must be at least {self._raw_action_dim}, "
+                f"got {actions.shape[-1]}"
+            )
+        return np.stack([self._action_to_env(chunk) for chunk in actions], axis=0)
 
     @staticmethod
     def _extract_tasks(env_obs: dict) -> list[str]:

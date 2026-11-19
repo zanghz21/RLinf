@@ -158,7 +158,9 @@ class LiberoEnv(gym.Env):
         self._generator_ordered = np.random.default_rng(seed=0)
         self.start_idx = 0
 
-        self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
+        self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)(
+            task_order_index=int(cfg.get("task_order_index", 0))
+        )
 
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
@@ -794,7 +796,7 @@ class LiberoEnv(gym.Env):
         }
         return obs
 
-    def _reconfigure(self, reset_state_ids, env_idx):
+    def _reconfigure(self, reset_state_ids, env_idx, seed=None):
         reconfig_env_idx = []
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
             reset_state_ids
@@ -808,8 +810,8 @@ class LiberoEnv(gym.Env):
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
-        self.env.seed(self.seed * len(env_idx))
-        self.env.reset(id=env_idx)
+        self.env.seed(self.seed * len(env_idx) if seed is None else seed)
+        raw_obs = self.env.reset(id=env_idx)
         variant = os.environ.get(
             "LIBERO_TYPE",
             self.cfg.get("libero_variant", "standard")
@@ -818,13 +820,30 @@ class LiberoEnv(gym.Env):
         )
         if variant != "plus":
             init_state = self._get_reset_states(env_idx=env_idx)
-            self.env.set_init_state(init_state=init_state, id=env_idx)
+            raw_obs = self.env.set_init_state(init_state=init_state, id=env_idx)
+        return raw_obs
+
+    def get_reset_states(self) -> list[np.ndarray]:
+        """Return copies of the selected suite initialization states."""
+        return [np.asarray(state).copy() for state in self._get_reset_states(None)]
+
+    def get_sim_states(self) -> list[np.ndarray]:
+        """Return copies of the current physical states in environment order."""
+        return [np.asarray(state).copy() for state in self.env.get_sim_state()]
+
+    def close(self, force: bool = False) -> None:
+        """Release owned simulator processes, including interrupted requests."""
+        if getattr(self, "env", None) is not None:
+            self.env.close(force=force)
+            self.env = None
 
     def reset(
         self,
         env_idx: Optional[Union[int, list[int], np.ndarray]] = None,
         reset_state_ids=None,
+        seed: Optional[Union[int, list[int]]] = None,
     ):
+        """Reset selected fixtures, optionally supplying all environment seeds."""
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
@@ -836,16 +855,23 @@ class LiberoEnv(gym.Env):
                 pool = self.reset_state_ids_all[self.seed_offset]
                 self._eval_reset_pool = pool[pool >= 0].copy()
                 self.update_reset_state_ids()
-            reset_state_ids = (
-                self.reset_state_ids if self.use_fixed_reset_state_ids else None
-            )
+            if reset_state_ids is None:
+                reset_state_ids = (
+                    self.reset_state_ids if self.use_fixed_reset_state_ids else None
+                )
             self._is_start = False
 
         if reset_state_ids is None:
             num_reset_states = len(env_idx)
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
-        self._reconfigure(reset_state_ids, env_idx)
+        if (
+            seed is not None
+            and not isinstance(seed, int)
+            and len(seed) != self.num_envs
+        ):
+            raise ValueError(f"Expected {self.num_envs} environment seeds")
+        raw_obs = self._reconfigure(reset_state_ids, env_idx, seed=seed)
         # Preserve LIBERO's existing 15-step settling behavior unless a model
         # explicitly requests a different reset wait (FastWAM uses 30).
         num_steps_wait = int(self.cfg.get("num_steps_wait", 15))
@@ -908,6 +934,7 @@ class LiberoEnv(gym.Env):
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
         infos = list_of_dict_to_dict_of_list(info_lists)
+        infos["simulator_reward"] = to_tensor(np.asarray(_reward))
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
 

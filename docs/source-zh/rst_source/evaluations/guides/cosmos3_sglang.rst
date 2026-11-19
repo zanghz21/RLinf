@@ -3,7 +3,7 @@ Cosmos3 SGLang 评测
 
 用 SGLang 后端在 LIBERO 仿真器上评测 Cosmos3：模型放进独立的 SGLang server 进程，rollout worker 作为客户端发观测、收动作、送入仿真。适用于只做推理评测的场景。
 
-如果还希望由 Cosmos3 预测下一次观测，使用 :ref:`cosmos3-learned-loop`。该流程从 LIBERO-Spatial 的记录图像开始，验证模型生成的观测能否持续反馈；下面的仿真评测流程则用于统计任务成功率。
+如果还希望由 Cosmos3 预测下一次观测，使用 :ref:`cosmos3-learned-loop`。该流程从 LIBERO-Spatial 的记录图像开始，验证模型生成的观测能否持续反馈；下面的仿真评测流程则用于统计任务成功率。需要从相同初始状态对比两种 simulator，并交叉 replay 动作时，使用 :ref:`cosmos3-simulator-comparison`。
 
 工作原理
 ----------------------------------------
@@ -172,6 +172,18 @@ policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosm
 
 默认配置在同一节点启动一个 server、一个 rollout worker 和一个 env worker。命令中的 48 个环境步对应三个包含 16 个动作的 chunk。每次 debug 运行需要新的输出路径。单轮测试同时覆盖 ``env.eval.max_episode_steps=16`` 和 ``env.eval.max_steps_per_rollout_epoch=16``。复用兼容 server 时，设置 ``rollout.sglang.launch_server=false`` 和 ``rollout.sglang.server_urls='[http://model-server:30000]'``。支持 HTTP 和 HTTPS 地址，server 可以部署在其他节点。入口检查 checkpoint 路径，退出时保留外部管理的 server。外部 server 必须支持 rollout 接口，使用普通推理模式，并保持动作归一化统计参数未设置。
 
+通过 ``env.eval.total_num_envs``，在一个 env worker 内运行多个模型环境。动作 shape 为 ``[B,T,10]``，观测 shape 为 ``[B,H,W,3]``。每个 chunk 并发提交 B 个独立 HTTP 请求，再按环境顺序接收结果；所有响应成功后，才一起更新观测与 episode 计数。如果一批中有请求失败，先等待其他客户端请求结束，再抛出异常，不自动重试生成。
+
+需要不同初始图像时，将 ``env.eval.dataset.episode_indices`` 和 ``env.eval.dataset.frame_indices`` 分别设为长度 B 的列表。某一列表为 ``null`` 时，对应的单数配置 ``episode_index`` 或 ``frame_index`` 会广播到全部环境。例如，在模型观测闭环命令后追加：
+
+.. code-block:: bash
+
+   env.eval.total_num_envs=2 \
+     'env.eval.dataset.episode_indices=[1261,1262]' \
+     'env.eval.dataset.frame_indices=[0,0]'
+
+每个 simulator 请求仍只包含一个样本。``rollout.sglang.server.batching_max_size`` 控制 policy 的 batch 容量，在模型观测闭环配置中默认为 ``1``。simulator 的 HTTP 并发提交不等于 GPU batch forward，也不直接保证吞吐提升；dynamics 如何执行由未改动的 SGLang server 内部调度决定。
+
 默认 ``env.eval.debug.save_artifacts=false``，环境只在内存中保留当前观测，不累积轨迹帧，也不写入图像、视频或请求记录。指标只报告生成步数和 chunk 数；接口所需的占位 reward 张量不表示任务成功。
 
 需要检查某次运行时，开启 debug 产物：
@@ -185,13 +197,64 @@ policy 通过 ``InferenceHTTPClient`` 请求动作。forward dynamics 由 ``Cosm
        video_cfg:
          save_video: false
 
-debug 模式在 ``<log_path>/artifacts/`` 下记录输入与下一次观测的 PNG、预测原始帧、native 动作、请求元数据和每轮状态，并保存预览 MP4 与去除重复条件帧后的 ``closed_loop.mp4``。即使开启 debug，下一次观测也始终来自原始帧，预览视频的压缩不会改变反馈像素。保持 ``video_cfg.save_video=false``，由环境自身管理 debug 录制。
+debug 模式在 ``<log_path>/artifacts/`` 下记录输入与下一次观测的 PNG、预测原始帧、native 动作、请求元数据和每轮状态。多环境分别使用 ``episode_000/env_000/``、``episode_000/env_001/`` 等目录，单环境保留 ``episode_000/`` 布局，并保存预览 MP4 与去除重复条件帧后的 ``closed_loop.mp4``。即使开启 debug，下一次观测也始终来自原始帧，预览视频的压缩不会改变反馈像素。保持 ``video_cfg.save_video=false``，由环境自身管理 debug 录制。
 
 检查 dynamics 请求是否接收到 policy 原样输出的 native 动作，以及下一轮观测是否逐像素等于前一轮原始预测的最后一帧。debug 模式会为预览保留轨迹帧；只需要指标的运行应保持关闭。
 
 获得微调 checkpoint 之前，可用 Nano 基础模型验证连接。闭环跑通说明推理和反馈链路正常，任务表现仍需单独评测。
 
 较长实验可在提交的计算任务中调用同一入口，使用共享数据与输出路径，并固定代码快照。默认示例使用单节点，HTTP 传输也支持独立部署的兼容 server。在各执行节点启动 Ray 之前，选择该节点适用的兼容库；不要将驱动 570 所用的库路径直接应用于使用更新驱动的节点。
+
+.. _cosmos3-simulator-comparison:
+
+对比 Cosmos3 与 LIBERO 视频
+----------------------------------------
+
+通过 ``examples/embodiment/compare_cosmos3_libero.py``，对比模型预测与 LIBERO 物理仿真的轨迹。每个 task/reset 组合中的所有分支使用同一 LIBERO 状态，并等待场景稳定。脚本把 LIBERO 此时渲染的相机拼图直接作为 Cosmos3 的初始观测，保证起点像素一致。LeRobot 记录图像无法还原完整的物理状态，因此这里使用实际 LIBERO reset。
+
+沿用 ``cosmos3_closed_loop.yaml`` 中的 checkpoint，并指定其 SFT 使用的动作统计文件，运行三组对比：
+
+.. code-block:: bash
+
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl RAY_ADDRESS=local PYTHONPATH="$PWD" \
+     bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
+     examples/embodiment/compare_cosmos3_libero.py \
+     comparison.output_dir=/shared/cosmos3/comparison-001 \
+     comparison.action_stats_path=/path/to/cosmos-framework/cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json \
+     comparison.suite=libero_spatial 'comparison.task_ids=[0,6]' 'comparison.reset_ids=[0,1]' \
+     '~cluster.component_placement' '+cluster.component_placement={env:"0-1",rollout:"0-1"}' \
+     comparison.steps=240 comparison.num_envs=2 rollout.model.guidance_scale=1.5
+
+命令加载 ``examples/embodiment/config/cosmos3_libero_compare.yaml``，按 task 优先顺序列出四个组合：task 0 的 reset 0、1，以及 task 6 的 reset 0、1。RLinf 在 GPU 0、1 上按 environment placement 启动两个 comparison worker，按 rollout placement 启动两个模型 server；每个 comparison worker 固定使用同一个 server 执行 policy 和 dynamics。组合按每组最多 ``comparison.num_envs`` 个划分，再轮流分配给各个 comparison worker。此示例每个 worker 运行两个环境，尾组保留实际样本数。通过 ``comparison.suite``、``comparison.task_ids`` 和 ``comparison.reset_ids`` 选择 suite 及编号列表。列表须非空，包含不重复的非负整数。配置默认选择 task 0–9 和 reset 0–9，每个 worker 最多运行 10 个环境。task 6 的任务为“拾起饼干盒旁的黑碗，放到盘子上”。``comparison.steps`` 必须是 action chunk 长度的正整数倍。通过 ``comparison.settle_steps``、``comparison.reset_seed`` 和 ``comparison.camera_size`` 调整场景稳定步数、reset 随机种子与相机分辨率。通过 ``rollout.model.model_path`` 指定 checkpoint，通过 ``rollout.model.guidance_scale`` 和 ``env.eval.generation.guidance_scale`` 分别设置 policy 与 simulator guidance。修改去噪步数时，同时把 ``rollout.model.num_inference_steps`` 和 ``env.eval.generation.num_inference_steps`` 设为相同值。两边的帧数、画布大小、帧率与种子也须一致。environment 和 rollout 的 placement 必须指定相同的 worker 数量；单 GPU 时都设为 ``0``。单独的模型观测闭环评估入口仍限制为一对 worker。
+
+每个 task/reset 组合分别记录四条轨迹，生成三组对比视频：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 40 40
+
+   * - 视频
+     - Cosmos3（左侧）
+     - LIBERO（右侧）
+   * - ``01_independent_rollouts.mp4``
+     - Policy rollout
+     - Policy rollout
+   * - ``02_cosmos_actions.mp4``
+     - 原 policy rollout
+     - Replay Cosmos3 动作
+   * - ``03_libero_actions.mp4``
+     - Replay LIBERO 动作
+     - 原 policy rollout
+
+每组内的 policy 把相同 prompt 的观测合并到一个多图 HTTP 请求，最多包含 ``rollout.sglang.server.batching_max_size`` 个环境。对比配置默认将此容量设为 ``comparison.num_envs``，也可以单独覆盖以减小 policy batch。不同 prompt 分开请求，尾批保留实际样本数。两条独立 rollout 对应的 policy 请求使用相同的环境成员、顺序、prompt 与种子。
+
+Cosmos3 dynamics 仍按环境各发一个 HTTP 请求，并发等待结果；LIBERO 复用 RLinf 的向量化 ``LiberoEnv``，每个环境使用一个子进程，每个动作在所有环境执行后再推进下一个动作，replay 也按此方式推进。``comparison.num_envs`` 决定每个 worker 的环境数量上限，policy capacity 决定一个 policy 请求最多合并多少个兼容观测。simulator 的 HTTP 并发不代表 SGLang 内部对 dynamics 做了 GPU batching。replay 则全程使用来源轨迹保存的动作。每次 policy 响应同时保留归一化的原生 10 维动作，以及转换后可直接交给 LIBERO 的 7 维命令，其中包含 LIBERO 的夹爪约定。Cosmos3 replay 直接读取保留的原生动作，避免从 7 维命令反向重建。LIBERO controller 的裁剪与夹爪二值化会丢失部分信息，因此可执行命令只是原生动作的有损映射。
+
+每个相机拼图左侧为外部视角，右侧为腕部视角。默认 240 步视频包含共同的初始帧和每个动作之后的一帧，播放帧率为 20 FPS；chunk 连接处去除重复条件帧。闭环反馈始终使用内存中的原始帧，MP4 仅用于观看。
+
+每次运行选择新的输出目录。根目录的 ``summary.json`` 列出各个 task/reset 组合、分配的 worker、输出路径和完成状态，``config.yaml`` 保存解析后的配置。每个组合独占一个目录，例如 ``task_006/reset_000/``，其中保存三组视频、初始图像、suite 初始物理状态及稳定后的物理状态，以及记录检查结果和耗时的 ``manifest.json``。其下四个轨迹子目录分别包含 ``video.mp4``、``actions_native.npy``、``actions_libero.npy`` 和 ``metrics.json``。设置 ``comparison.save_raw_frames=true`` 可额外保存未压缩帧数组。耗时记录区分 policy 请求与 simulator 步进，其中包含渲染或 HTTP 开销。每个 simulator chunk 的 ``concurrent_batch_s`` 表示整组墙钟耗时，各环境存在重叠的 ``simulator_s`` 不能相加后当作整组耗时。``policy_batch`` 记录请求成员、样本位置、batch size 与 seed，尾批也按实际大小记录。同一个 policy 请求的延迟会重复写入各成员的 ``policy_s``，跨环境汇总时同样只应计算一次。LIBERO 在每个成员中记录整组向量环境的耗时，并标记 ``timing_scope=vector_chunk``，这项共享耗时也只能计算一次。这些记录适合结合视频观察，不应直接视为受控 GPU 吞吐量基准。
+
+复用兼容 server 时，设置 ``rollout.sglang.launch_server=false``，并按 rank 顺序为每个 comparison worker 提供一个 URL，例如 ``rollout.sglang.server_urls='[http://model-a:30000,http://model-b:30000]'``。脚本通过 ``/v1/actions/metadata`` 检查 server 是否支持配置的 policy 容量，将各 server 的响应与 worker 分配信息保存到 ``workers.json``。退出时保留外部管理的 server。
 
 常见问题
 ----------------------------------------

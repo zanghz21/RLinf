@@ -37,14 +37,13 @@ from rlinf.workers.rollout.sglang.sglang_embodied_worker import SGLangEmbodiedWo
 from rlinf.workers.rollout.sglang_server import launch_sglang_router_and_server
 
 
-def validate_closed_loop_cfg(cfg: DictConfig) -> None:
+def validate_closed_loop_cfg(cfg: DictConfig, *, single_server: bool = True) -> None:
     """Reject unsupported modes and mismatched interfaces before starting Ray."""
     expected = {
         "runner.task_type": "embodied_eval",
         "runner.only_eval": True,
         "env.eval.env_type": "cosmos3",
         "env.eval.is_eval": True,
-        "env.eval.total_num_envs": 1,
         "env.eval.group_size": 1,
         "env.eval.rollout_epoch": 1,
         "env.eval.auto_reset": False,
@@ -64,7 +63,6 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         "rollout.sglang.server.tp_size": 1,
         "rollout.sglang.server.cfg_parallel_degree": 1,
         "rollout.sglang.server.sp_degree": 1,
-        "rollout.sglang.server.batching_max_size": 1,
         "rollout.model.model_type": "cosmos3",
         "rollout.model.action_output": "native",
         "rollout.model.action_dim": 10,
@@ -80,6 +78,15 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         if actual != value:
             raise ValueError(f"{field} must be {value!r}, got {actual!r}")
     model, env, serving = cfg.rollout.model, cfg.env.eval, cfg.rollout.sglang
+    if (
+        type(serving.server.batching_max_size) is not int
+        or serving.server.batching_max_size <= 0
+    ):
+        raise ValueError(
+            "rollout.sglang.server.batching_max_size must be a positive integer"
+        )
+    if type(env.total_num_envs) is not int or env.total_num_envs <= 0:
+        raise ValueError("env.eval.total_num_envs must be a positive integer")
     pipeline_name = serving.server.pipeline_class_name
     if pipeline_name not in ("Cosmos3OmniDiffusersPipeline", "RLinfCosmos3Pipeline"):
         raise ValueError(f"Unsupported Cosmos3 pipeline: {pipeline_name!r}")
@@ -134,12 +141,15 @@ def validate_closed_loop_cfg(cfg: DictConfig) -> None:
         if urls:
             raise ValueError("Disable launch_server when supplying an external URL")
     elif (
-        len(urls) != 1
-        or urlparse(urls[0]).scheme not in ("http", "https")
-        or not urlparse(urls[0]).netloc
+        not urls
+        or (single_server and len(urls) != 1)
+        or any(
+            urlparse(url).scheme not in ("http", "https") or not urlparse(url).netloc
+            for url in urls
+        )
     ):
         raise ValueError(
-            "External mode requires exactly one absolute HTTP(S) server URL"
+            "External mode requires absolute HTTP(S) server URLs (one in closed-loop eval)"
         )
 
 

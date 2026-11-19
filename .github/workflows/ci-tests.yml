@@ -182,6 +182,10 @@ jobs:
               - 'rlinf/workers/env/env_worker.py'
               - 'examples/embodiment/eval_cosmos3_closed_loop.py'
               - 'examples/embodiment/config/cosmos3_closed_loop.yaml'
+              - 'examples/embodiment/compare_cosmos3_libero.py'
+              - 'examples/embodiment/cosmos3_comparison_worker.py'
+              - 'examples/embodiment/cosmos3_libero_env.py'
+              - 'examples/embodiment/config/cosmos3_libero_compare.yaml'
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the
               # real-world compatibility suite, maniskill offload, delay

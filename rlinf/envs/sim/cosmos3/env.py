@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from omegaconf import ListConfig
 from PIL import Image
 
 from rlinf.models.embodiment.cosmos3.closed_loop_client import (
@@ -40,10 +41,11 @@ from rlinf.models.embodiment.cosmos3.closed_loop_io import (
 
 
 class Cosmos3Env:
-    """Advance a LIBERO image fixture with native Cosmos actions.
+    """Advance LIBERO image fixtures with concurrent native-action requests.
 
     No reward model or proprioception is available. Zero reward tensors satisfy
     the worker interface; reported metrics contain only length and chunk count.
+    Environments advance together only after every simulator response is valid.
     """
 
     def __init__(
@@ -55,9 +57,11 @@ class Cosmos3Env:
         **kwargs: Any,
     ) -> None:
         self.cfg = cfg
+        if type(num_envs) is not int or num_envs <= 0:
+            raise ValueError("Cosmos3Env requires a positive integer num_envs")
+        if total_num_processes != 1:
+            raise ValueError("Cosmos3Env requires one process")
         self.num_envs = num_envs
-        if num_envs != 1 or total_num_processes != 1:
-            raise ValueError("Cosmos3Env requires one environment and one process")
         if cfg.get("auto_reset", False):
             raise ValueError("Cosmos3Env requires auto_reset=false")
         self.generation = dict(cfg.generation)
@@ -74,21 +78,40 @@ class Cosmos3Env:
             )
         if self.action_dim != 10:
             raise ValueError("Cosmos3Env requires native 10-dimensional actions")
+        self._episode_indices = self._dataset_indices("episode")
+        self._frame_indices = self._dataset_indices("frame")
         self._save_artifacts = bool(cfg.get("debug", {}).get("save_artifacts", False))
         self._artifact_root: Path | None = None
         if self._save_artifacts:
             self._artifact_root = Path(cfg.artifact_dir).resolve()
             self._artifact_root.mkdir(parents=True, exist_ok=False)
         self._client: Cosmos3Client | None = None
-        self._image: np.ndarray | None = None
-        self._rollout_dir: Path | None = None
-        self._frames: list[np.ndarray] = []
+        self._images: np.ndarray | None = None
+        self._rollout_dirs: list[Path] = []
+        self._frames: list[list[np.ndarray]] = []
         self._flushed_chunks = 0
         self._reset_index = 0
         self._steps = 0
         self._chunks = 0
-        self._prompt = ""
+        self._prompts: list[str] = []
         self.is_start = True
+
+    def _dataset_indices(self, name: str) -> list[int]:
+        """Resolve one fixture index per environment without silently truncating."""
+        dataset = self.cfg.dataset
+        values = dataset.get(f"{name}_indices")
+        if values is None:
+            values = [dataset.get(f"{name}_index")] * self.num_envs
+        if (
+            not isinstance(values, (list, ListConfig))
+            or len(values) != self.num_envs
+            or any(type(value) is not int or value < 0 for value in values)
+        ):
+            raise ValueError(
+                f"dataset.{name}_indices must contain {self.num_envs} nonnegative "
+                f"integers, or dataset.{name}_index must be a nonnegative integer"
+            )
+        return list(values)
 
     def set_sglang_server_urls(self, server_urls: list[str]) -> None:
         """Bind the same SGLang endpoint used by the rollout policy worker."""
@@ -102,43 +125,58 @@ class Cosmos3Env:
         )
 
     def _observation(self) -> dict[str, Any]:
-        assert self._image is not None
+        assert self._images is not None
         return {
-            "main_images": torch.from_numpy(self._image.copy()).unsqueeze(0),
+            "main_images": torch.from_numpy(self._images.copy()),
             "wrist_images": None,
             "states": None,
-            "task_descriptions": [self._prompt],
+            "task_descriptions": list(self._prompts),
         }
 
     def reset(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Load only the configured initial external and wrist images."""
+        """Load all initial views before replacing any environment's state."""
         if self._client is None:
             raise RuntimeError("Bind the shared SGLang endpoint before reset")
-        self.flush_video()
-        dataset = self.cfg.dataset
-        external, wrist, metadata = load_lerobot_observation(
-            Path(dataset.root), int(dataset.episode_index), int(dataset.frame_index)
-        )
-        canvas, layout = prepare_canvas(
-            external,
-            wrist,
-            int(self.generation["width"]),
-            int(self.generation["height"]),
-        )
-        self._image = np.array(canvas, copy=True)
-        self._prompt = augment_prompt(metadata["instruction"])
-        self._steps = self._chunks = self._flushed_chunks = 0
-        self._frames = [self._image.copy()] if self._save_artifacts else []
+        images, prompts, records = [], [], []
+        for episode_index, frame_index in zip(
+            self._episode_indices, self._frame_indices, strict=True
+        ):
+            external, wrist, metadata = load_lerobot_observation(
+                Path(self.cfg.dataset.root), episode_index, frame_index
+            )
+            canvas, layout = prepare_canvas(
+                external,
+                wrist,
+                int(self.generation["width"]),
+                int(self.generation["height"]),
+            )
+            images.append(np.array(canvas, copy=True))
+            prompt = augment_prompt(metadata["instruction"])
+            prompts.append(prompt)
+            records.append({"dataset": metadata, "layout": layout, "prompt": prompt})
+        next_images = np.stack(images)
+        rollout_dirs = []
         if self._artifact_root is not None:
-            self._rollout_dir = self._artifact_root / f"episode_{self._reset_index:03d}"
-            self._rollout_dir.mkdir(exist_ok=False)
-            Image.fromarray(self._image).save(
-                self._rollout_dir / "initial_observation.png"
-            )
-            self._write_json(
-                self._rollout_dir / "initial_observation.json",
-                {"dataset": metadata, "layout": layout, "prompt": self._prompt},
-            )
+            episode_dir = self._artifact_root / f"episode_{self._reset_index:03d}"
+            episode_dir.mkdir(exist_ok=False)
+            for index, (image, record) in enumerate(zip(images, records, strict=True)):
+                directory = (
+                    episode_dir
+                    if self.num_envs == 1
+                    else episode_dir / f"env_{index:03d}"
+                )
+                if self.num_envs > 1:
+                    directory.mkdir()
+                Image.fromarray(image).save(directory / "initial_observation.png")
+                self._write_json(directory / "initial_observation.json", record)
+                rollout_dirs.append(directory)
+        self.flush_video()
+        self._images, self._prompts = next_images, prompts
+        self._rollout_dirs = rollout_dirs
+        self._steps = self._chunks = self._flushed_chunks = 0
+        self._frames = (
+            [[image.copy()] for image in images] if self._save_artifacts else []
+        )
         self._reset_index += 1
         self.is_start = False
         return self._observation(), {}
@@ -148,59 +186,87 @@ class Cosmos3Env:
         path.write_text(json.dumps(value, indent=2, default=str) + "\n")
 
     def chunk_step(self, actions: Any) -> tuple:
-        """Condition forward dynamics on one unchanged native action chunk."""
-        if self._image is None or self._client is None:
+        """Dispatch one request per environment concurrently and advance together."""
+        if self._images is None or self._client is None:
             raise RuntimeError("Reset Cosmos3Env before stepping")
         if self._steps >= self.max_episode_steps:
             raise RuntimeError("The rollout horizon is complete; reset before stepping")
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
         batch = np.asarray(actions)
-        if batch.shape != (1, self.horizon, self.action_dim):
+        expected_actions = (self.num_envs, self.horizon, self.action_dim)
+        if batch.shape != expected_actions:
             raise ValueError(
-                f"Expected native actions [1, {self.horizon}, {self.action_dim}], got {batch.shape}"
+                f"Expected native actions {expected_actions}, got {batch.shape}"
             )
-        native = validate_native_actions(batch[0], self.horizon, self.action_dim)
-        payload = dynamics_request(self._prompt, self._image, self.generation, native)
-        cycle_dir = None
-        if self._rollout_dir is not None:
-            cycle_dir = self._rollout_dir / f"cycle_{self._chunks:03d}"
-            cycle_dir.mkdir()
-            Image.fromarray(self._image).save(cycle_dir / "observation.png")
-            np.save(cycle_dir / "actions_native.npy", native)
-            request_metadata = {
-                key: value for key, value in payload.items() if key != "image_path"
-            }
-            request_metadata["image"] = {
-                "transport": "memory",
-                "shape": list(self._image.shape),
-                "dtype": str(self._image.dtype),
-            }
-            self._write_json(cycle_dir / "dynamics_request.json", request_metadata)
+        native = [
+            validate_native_actions(chunk, self.horizon, self.action_dim)
+            for chunk in batch
+        ]
+        payloads = [
+            dynamics_request(prompt, image, self.generation, action)
+            for prompt, image, action in zip(
+                self._prompts, self._images, native, strict=True
+            )
+        ]
+        cycle_dirs = []
         started = time.monotonic()
         try:
-            frames, response = self._client.generate_frames(payload)
+            for index, directory in enumerate(self._rollout_dirs):
+                cycle_dir = directory / f"cycle_{self._chunks:03d}"
+                cycle_dir.mkdir()
+                cycle_dirs.append(cycle_dir)
+                Image.fromarray(self._images[index]).save(cycle_dir / "observation.png")
+                np.save(cycle_dir / "actions_native.npy", native[index])
+                request_metadata = {
+                    key: value
+                    for key, value in payloads[index].items()
+                    if key != "image_path"
+                }
+                request_metadata["image"] = {
+                    "transport": "memory",
+                    "shape": list(self._images[index].shape),
+                    "dtype": str(self._images.dtype),
+                }
+                self._write_json(cycle_dir / "dynamics_request.json", request_metadata)
+            results = self._client.generate_frames_batch(payloads)
+            if len(results) != self.num_envs:
+                raise ValueError(
+                    f"Expected {self.num_envs} Cosmos responses, got {len(results)}"
+                )
             expected = (
                 self.horizon + 1,
                 int(self.generation["height"]),
                 int(self.generation["width"]),
                 3,
             )
-            if frames.shape != expected or frames.dtype != np.uint8:
-                raise ValueError(
-                    f"Cosmos dynamics returned {frames.shape}/{frames.dtype}, expected {expected}/uint8"
-                )
-            if cycle_dir is not None:
-                response["frames_sha256"] = hashlib.sha256(
-                    memoryview(frames)
-                ).hexdigest()
+            for index, (frames, _) in enumerate(results):
+                if frames.shape != expected or frames.dtype != np.uint8:
+                    raise ValueError(
+                        f"Cosmos environment {index} returned {frames.shape}/{frames.dtype}, "
+                        f"expected {expected}/uint8"
+                    )
+            next_images = np.stack([frames[-1] for frames, _ in results])
+            next_frames = []
+            for index, cycle_dir in enumerate(cycle_dirs):
+                frames, response = results[index]
+                response = {
+                    **response,
+                    "frames_sha256": hashlib.sha256(memoryview(frames)).hexdigest(),
+                }
                 self._write_json(cycle_dir / "dynamics_response.json", response)
                 np.save(cycle_dir / "frames.npy", frames)
                 save_video(
                     cycle_dir / "prediction.mp4", frames, int(self.generation["fps"])
                 )
+                Image.fromarray(next_images[index]).save(
+                    cycle_dir / "next_observation.png"
+                )
+                next_frames.append(
+                    self._frames[index] + [frame.copy() for frame in frames[1:]]
+                )
         except BaseException as exc:
-            if cycle_dir is not None:
+            for cycle_dir in cycle_dirs:
                 self._write_json(
                     cycle_dir / "status.json",
                     {
@@ -210,42 +276,45 @@ class Cosmos3Env:
                     },
                 )
             raise
-        # Feedback uses the decoded RGB frames, never a saved preview video.
-        self._image = frames[-1].copy()
-        if cycle_dir is not None:
-            Image.fromarray(self._image).save(cycle_dir / "next_observation.png")
-            self._frames.extend(frame.copy() for frame in frames[1:])
+        # Every response and debug frame is ready before replacing the batch state.
+        self._images, self._frames = next_images, next_frames
+        self._steps += self.horizon
+        self._chunks += 1
+        for cycle_dir in cycle_dirs:
             self._write_json(
                 cycle_dir / "status.json",
                 {"status": "completed", "seconds": time.monotonic() - started},
             )
-        self._steps += self.horizon
-        self._chunks += 1
-        rewards = torch.zeros((1, self.horizon), dtype=torch.float32)
-        terminations = torch.zeros((1, self.horizon), dtype=torch.bool)
-        truncations = torch.zeros((1, self.horizon), dtype=torch.bool)
+        rewards = torch.zeros((self.num_envs, self.horizon), dtype=torch.float32)
+        terminations = torch.zeros((self.num_envs, self.horizon), dtype=torch.bool)
+        truncations = torch.zeros((self.num_envs, self.horizon), dtype=torch.bool)
         info: dict[str, Any] = {}
         if self._steps == self.max_episode_steps:
             truncations[:, -1] = True
             info["episode"] = {
-                "episode_len": torch.tensor([self._steps], dtype=torch.int64),
-                "generated_chunks": torch.tensor([self._chunks], dtype=torch.int64),
+                "episode_len": torch.full(
+                    (self.num_envs,), self._steps, dtype=torch.int64
+                ),
+                "generated_chunks": torch.full(
+                    (self.num_envs,), self._chunks, dtype=torch.int64
+                ),
             }
             self.flush_video()
         return [self._observation()], rewards, terminations, truncations, [info]
 
     def flush_video(self) -> None:
-        """Save a debug preview once per completed chunk, without feedback."""
-        if self._rollout_dir is not None and self._chunks > self._flushed_chunks:
-            save_video(
-                self._rollout_dir / "closed_loop.mp4",
-                np.stack(self._frames),
-                int(self.generation["fps"]),
-            )
+        """Save each environment's debug preview once per completed chunk."""
+        if self._rollout_dirs and self._chunks > self._flushed_chunks:
+            for directory, frames in zip(self._rollout_dirs, self._frames, strict=True):
+                save_video(
+                    directory / "closed_loop.mp4",
+                    np.stack(frames),
+                    int(self.generation["fps"]),
+                )
             self._flushed_chunks = self._chunks
 
     def update_reset_state_ids(self) -> None:
-        """Keep the configured dataset fixture for subsequent evaluations."""
+        """Keep the configured dataset fixtures for subsequent evaluations."""
 
     def close(self) -> None:
         """Release the client without stopping the shared model server."""

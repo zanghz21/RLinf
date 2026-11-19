@@ -3,7 +3,7 @@ Cosmos3 SGLang Evaluation
 
 Evaluate Cosmos3 on the LIBERO simulator using the SGLang backend: the model runs in a standalone SGLang server process, and rollout workers act as clients that send observations, receive action commands, and feed them into the simulation. Suitable for inference-only evaluation scenarios.
 
-To check a pipeline in which Cosmos3 also predicts the next observation, use :ref:`cosmos3-learned-loop`. That workflow starts from a recorded LIBERO-Spatial image and tests generated feedback; simulator task-success evaluation uses the workflow below.
+To check a pipeline in which Cosmos3 also predicts the next observation, use :ref:`cosmos3-learned-loop`. That workflow starts from a recorded LIBERO-Spatial image and tests generated feedback; simulator task-success evaluation uses the workflow below. For matched initial states and action replay videos, use :ref:`cosmos3-simulator-comparison`.
 
 How It Works
 ----------------------------------------
@@ -184,6 +184,18 @@ This command creates an independent Ray session for a single-node smoke test and
 
 The default configuration starts one server, one rollout worker, and one environment worker on the same node. The command's 48 environment steps are three chunks of 16 actions. Use a new output path for every debug run. For one cycle, override both ``env.eval.max_episode_steps=16`` and ``env.eval.max_steps_per_rollout_epoch=16``. To reuse a compatible server, set ``rollout.sglang.launch_server=false`` and ``rollout.sglang.server_urls='[http://model-server:30000]'``. HTTP and HTTPS server URLs are supported; the server can run on another node. The entry checks its checkpoint path and leaves externally owned servers running. External servers must support the rollout endpoint, use ordinary inference, and leave action normalization statistics unset.
 
+Set ``env.eval.total_num_envs`` to run multiple learned environments in one environment worker. Actions have shape ``[B,T,10]`` and observations have shape ``[B,H,W,3]``. Each chunk dispatches B independent HTTP requests concurrently, then keeps the responses in environment order. Observations and episode counters advance only after every response succeeds. A failed batch waits for the other client requests to finish and raises without retrying generation.
+
+To select distinct starting images, set ``env.eval.dataset.episode_indices`` and ``env.eval.dataset.frame_indices`` to lists of length B. When either list is ``null``, the corresponding scalar ``episode_index`` or ``frame_index`` is repeated for all environments. For example, append these overrides to the learned-loop command:
+
+.. code-block:: bash
+
+   env.eval.total_num_envs=2 \
+     'env.eval.dataset.episode_indices=[1261,1262]' \
+     'env.eval.dataset.frame_indices=[0,0]'
+
+Each simulator request still contains one sample. ``rollout.sglang.server.batching_max_size`` controls policy batch capacity and defaults to ``1`` in the learned-loop configuration. Concurrent simulator HTTP submission does not imply a batched GPU forward pass or a throughput gain; scheduling inside the unchanged SGLang server determines dynamics execution.
+
 By default, ``env.eval.debug.save_artifacts=false``: the environment keeps the current observation in memory and does not accumulate trajectory frames or write images, videos, or request records. Metrics report generated length and chunk count; placeholder reward tensors do not measure task success.
 
 To inspect a run, enable debug artifacts:
@@ -197,13 +209,64 @@ To inspect a run, enable debug artifacts:
        video_cfg:
          save_video: false
 
-Debug mode records the input and next-observation PNGs, raw predicted frames, native actions, request metadata, and per-cycle status under ``<log_path>/artifacts/``. It also saves preview MP4s and ``closed_loop.mp4``, joining the trajectory without repeated conditioning frames. The next observation always comes from the raw frames, including in debug mode; preview compression cannot change feedback pixels. Keep ``video_cfg.save_video=false`` because this environment owns its debug recording.
+Debug mode records the input and next-observation PNGs, raw predicted frames, native actions, request metadata, and per-cycle status under ``<log_path>/artifacts/``. Multiple environments use separate ``episode_000/env_000/``, ``episode_000/env_001/`` directories; single-environment runs retain the ``episode_000/`` layout. It also saves preview MP4s and ``closed_loop.mp4``, joining the trajectory without repeated conditioning frames. The next observation always comes from the raw frames, including in debug mode; preview compression cannot change feedback pixels. Keep ``video_cfg.save_video=false`` because this environment owns its debug recording.
 
 Check that each dynamics request receives the policy's unchanged native actions and that the next cycle's observation exactly matches the preceding raw prediction's final frame. Debug mode retains trajectory frames for the preview; leave it disabled for runs that only need metrics.
 
 A base Nano checkpoint can exercise this connection before a tuned checkpoint is available. Completing the loop verifies inference and feedback wiring; task quality requires a separate evaluation.
 
 Use the same entry inside submitted compute tasks with shared asset/output paths and an immutable code snapshot. The default is a single-node example; HTTP transport also permits a separately hosted compatible server. Select compatibility libraries for each execution node before starting Ray; a driver-570 override must not be applied blindly to newer-driver nodes.
+
+.. _cosmos3-simulator-comparison:
+
+Compare Cosmos3 and LIBERO Videos
+----------------------------------------
+
+Compare the generated dynamics with LIBERO using ``examples/embodiment/compare_cosmos3_libero.py``. Within each task/reset pair, all branches start from the same LIBERO state after settling. The script gives Cosmos3 the exact camera canvas rendered by that reset, so the initial pixels match. A recorded LeRobot image cannot reconstruct the complete physical state; this comparison uses a live LIBERO reset.
+
+Run the three comparisons with the checkpoint from ``cosmos3_closed_loop.yaml`` and the action statistics used during its SFT:
+
+.. code-block:: bash
+
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl RAY_ADDRESS=local PYTHONPATH="$PWD" \
+     bash examples/embodiment/run_with_cuda_compat.sh ../.venv/bin/python \
+     examples/embodiment/compare_cosmos3_libero.py \
+     comparison.output_dir=/shared/cosmos3/comparison-001 \
+     comparison.action_stats_path=/path/to/cosmos-framework/cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json \
+     comparison.suite=libero_spatial 'comparison.task_ids=[0,6]' 'comparison.reset_ids=[0,1]' \
+     '~cluster.component_placement' '+cluster.component_placement={env:"0-1",rollout:"0-1"}' \
+     comparison.steps=240 comparison.num_envs=2 rollout.model.guidance_scale=1.5
+
+The command loads ``examples/embodiment/config/cosmos3_libero_compare.yaml`` and enumerates four task/reset combinations in task-major order: task 0 with resets 0 and 1, then task 6 with resets 0 and 1. RLinf launches two comparison workers using the environment placement and two model servers using the rollout placement, on GPUs 0 and 1. Each comparison worker keeps a fixed server for policy and dynamics. Cases are divided into groups of at most ``comparison.num_envs`` and assigned to comparison workers in round-robin order. Here each worker runs two environments; an incomplete last group retains its actual size. Select the suite and lists with ``comparison.suite``, ``comparison.task_ids``, and ``comparison.reset_ids``. Each list must be nonempty and contain distinct nonnegative integers. The configuration defaults select tasks 0–9 and resets 0–9, with up to 10 environments per worker. Task 6's instruction is “pick up the black bowl next to the cookie box and place it on the plate.” Keep ``comparison.steps`` a positive multiple of the action chunk length. Use ``comparison.settle_steps``, ``comparison.reset_seed``, and ``comparison.camera_size`` to configure settling, reset randomness, and camera resolution. Select the checkpoint with ``rollout.model.model_path``, policy guidance with ``rollout.model.guidance_scale``, and simulator guidance with ``env.eval.generation.guidance_scale``. To change denoising steps, set both ``rollout.model.num_inference_steps`` and ``env.eval.generation.num_inference_steps`` to the same value. Policy and dynamics must also agree on frame count, canvas size, frame rates, and seed. The environment and rollout placements must select the same number of workers. For a single GPU, set both placements to ``0``; the separate learned-loop evaluation entry remains limited to one worker pair.
+
+For each task/reset pair, the script records four trajectories and pairs them into three videos:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 40 40
+
+   * - Video
+     - Cosmos3 (Left)
+     - LIBERO (Right)
+   * - ``01_independent_rollouts.mp4``
+     - Policy rollout
+     - Policy rollout
+   * - ``02_cosmos_actions.mp4``
+     - Original policy rollout
+     - Replay Cosmos3 actions
+   * - ``03_libero_actions.mp4``
+     - Replay LIBERO actions
+     - Original policy rollout
+
+Within each group, policy inference combines environments with the same prompt into one multi-image HTTP request, up to ``rollout.sglang.server.batching_max_size``. The comparison configuration defaults this capacity to ``comparison.num_envs``; override it independently to use smaller policy batches. Mixed prompts form separate requests, and a final partial batch keeps its actual size. Both independent rollouts use the same environment membership, order, prompts, and seed for corresponding policy calls.
+
+Cosmos3 dynamics still submit one HTTP request per environment concurrently. LIBERO uses RLinf's vectorized ``LiberoEnv`` with one subprocess per environment and advances each action across the vector before the next action, including during replay. ``comparison.num_envs`` sets the per-worker environment limit, while the policy capacity sets how many compatible observations share one policy request. Simulator HTTP concurrency does not imply batched dynamics execution inside SGLang. Replay branches use the source rollout's saved actions throughout. Each policy response is retained as normalized native 10-D actions for Cosmos3 and as converted 7-D commands for LIBERO, including LIBERO's gripper convention. The Cosmos3 replay uses the retained native actions directly, avoiding a reconstruction from 7-D commands. LIBERO's controller clipping and gripper binarization make its executable commands a lossy projection of the native actions.
+
+Camera canvases show the external view on the left and wrist view on the right. The default 240-step run contains the shared initial frame plus one frame per action, at 20 FPS. Chunk boundaries omit repeated conditioning frames. Feedback always uses raw frames in memory; the saved MP4s are for viewing.
+
+Use a new output directory for each run. The root ``summary.json`` lists the task/reset cases, assigned workers, output paths, and completion status; ``config.yaml`` records the resolved configuration. Each case has its own directory, such as ``task_006/reset_000/``, containing the three videos, initial pixels, suite and settled physical states, and a ``manifest.json`` with checks and timing summaries. Its four trajectory subdirectories contain ``video.mp4``, ``actions_native.npy``, ``actions_libero.npy``, and ``metrics.json``. Set ``comparison.save_raw_frames=true`` to retain uncompressed frame arrays. Timing records separate policy calls from simulator steps and include rendering or HTTP overhead. For each simulator chunk, ``concurrent_batch_s`` measures the whole group; overlapping per-environment ``simulator_s`` values must not be summed as group wall time. ``policy_batch`` records the request membership, position, batch size, and seed, including partial batches. Shared policy-request latency is repeated in each member's ``policy_s`` and must also be counted only once when aggregating across environments. LIBERO records its vector-wide duration for each member with ``timing_scope=vector_chunk``; count this shared duration only once as well. For throughput comparisons, use them alongside the videos rather than as a controlled GPU throughput benchmark.
+
+To reuse compatible servers, set ``rollout.sglang.launch_server=false`` and provide one URL per comparison worker, in rank order, such as ``rollout.sglang.server_urls='[http://model-a:30000,http://model-b:30000]'``. The script checks ``/v1/actions/metadata`` against the configured policy capacity and saves each server's response and worker assignment in ``workers.json``. It leaves externally managed servers running.
 
 FAQ
 ----------------------------------------

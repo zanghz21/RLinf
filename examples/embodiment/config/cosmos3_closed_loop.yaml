@@ -47,6 +47,8 @@ env:
       root: /mnt/public/hongzhi/datasets/physical-intelligence/libero
       episode_index: 1261
       frame_index: 0
+      episode_indices: null
+      frame_indices: null
     generation:
       domain_name: libero
       raw_action_dim: 10

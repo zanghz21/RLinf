@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import multiprocessing
+import time
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -261,10 +262,56 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
-        def worker_fn(fn: Callable[[], gym.Env]) -> ReconfigureSubprocEnvWorker:
-            return ReconfigureSubprocEnvWorker(fn, share_memory=False)
+        started_workers = []
 
-        BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
+        def worker_fn(fn: Callable[[], gym.Env]) -> ReconfigureSubprocEnvWorker:
+            worker = ReconfigureSubprocEnvWorker(fn, share_memory=False)
+            started_workers.append(worker)
+            return worker
+
+        try:
+            BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
+        except BaseException:
+            self.workers, self.is_closed = started_workers, False
+            self.close(force=True)
+            raise
+
+    def close(self, force: bool = False) -> None:
+        """Close owned processes within a bounded wait, even after a failed RPC."""
+        if self.is_closed:
+            return
+        self.is_closed = True
+        try:
+            for worker in self.workers:
+                worker.is_closed = True
+                if not worker.process.is_alive():
+                    continue
+                if force:
+                    worker.process.terminate()
+                else:
+                    try:
+                        worker.parent_remote.send(["close", None])
+                    except (BrokenPipeError, EOFError, OSError):
+                        worker.process.terminate()
+            deadline = time.monotonic() + (2.0 if force else 5.0)
+            for worker in self.workers:
+                worker.process.join(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            # A child may be blocked sending frames, so do not wait for a reply.
+            for worker in self.workers:
+                if worker.process.is_alive():
+                    worker.process.terminate()
+            deadline = time.monotonic() + 2.0
+            for worker in self.workers:
+                worker.process.join(timeout=max(0.0, deadline - time.monotonic()))
+            for worker in self.workers:
+                if worker.process.is_alive():
+                    worker.process.kill()
+            deadline = time.monotonic() + 2.0
+            for worker in self.workers:
+                worker.process.join(timeout=max(0.0, deadline - time.monotonic()))
+                worker.parent_remote.close()
+                worker.child_remote.close()
 
     def reconfigure_env_fns(self, env_fns, id=None):
         self._assert_is_not_closed()

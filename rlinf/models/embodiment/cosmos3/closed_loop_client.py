@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -88,6 +89,37 @@ class Cosmos3Client:
         ) as response:
             return response.json()
 
+    def generate_frames_batch(
+        self, payloads: list[dict]
+    ) -> list[tuple[np.ndarray, dict]]:
+        """Dispatch independent single-sample requests concurrently, in input order.
+
+        All requests are submitted before awaiting results. On failure, wait for
+        the other client calls to finish before raising; never retry generation.
+        The HTTP client owns one session per requesting thread.
+        """
+        if self._closed:
+            raise RuntimeError("The Cosmos3 client is closed")
+        if not payloads:
+            raise ValueError("Expected at least one Cosmos3 dynamics request")
+        if len(payloads) == 1:
+            return [self.generate_frames(payloads[0])]
+        with ThreadPoolExecutor(
+            max_workers=len(payloads), thread_name_prefix="cosmos3-dynamics"
+        ) as executor:
+            futures = [
+                executor.submit(self.generate_frames, payload) for payload in payloads
+            ]
+            results = []
+            for index, future in enumerate(futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Cosmos3 dynamics request for environment {index} failed"
+                    ) from exc
+            return results
+
     def generate_frames(self, payload: dict) -> tuple[np.ndarray, dict]:
         """Decode raw HTTP tensors to uint8 RGB [T,H,W,3], without video codecs."""
         import msgpack
@@ -145,9 +177,12 @@ class Cosmos3Client:
                 f"Expected finite floating-point or uint8 RGB frames, got {frames.dtype}"
             )
         frames = np.ascontiguousarray(frames)
+        finished = time.monotonic()
         return frames, {
             "request_id": result["request_id"],
-            "elapsed_s": time.monotonic() - started,
+            "elapsed_s": finished - started,
+            "started_at_monotonic_s": started,
+            "finished_at_monotonic_s": finished,
             "generation_time_s": result.get("inference_time_s"),
             "raw_shape": list(raw.shape),
             "raw_dtype": str(raw.dtype),

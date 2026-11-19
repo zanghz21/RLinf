@@ -1,0 +1,31 @@
+defaults:
+  - cosmos3_closed_loop
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+comparison:
+  output_dir: ../results/cosmos3_libero_compare
+  suite: libero_spatial
+  task_order_index: 0
+  task_ids: [0,1,2,3,4,5,6,7,8,9]
+  reset_ids: [0,1,2,3,4,5,6,7,8,9]
+  reset_seed: 1140
+  steps: 240
+  num_envs: 10
+  settle_steps: 15
+  camera_size: 256
+  action_stats_path: /mnt/public/hongzhi/cosmos-sft/cosmos-framework/cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json
+  save_raw_frames: false
+
+env:
+  eval:
+    generation:
+      guidance_scale: 5.0
+
+rollout:
+  sglang:
+    server:
+      batching_max_size: ${comparison.num_envs}
