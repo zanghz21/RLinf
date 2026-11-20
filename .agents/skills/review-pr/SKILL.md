@@ -1,133 +1,84 @@
 ---
 name: review-pr
-description: Reviews a pull request from a PR URL by directly fetching the URL content (no `gh` dependency) and verifies compliance with CONTRIBUTING.md. Use when the user asks for a PR review, to review changes before merge, or to check contribution guidelines.
+description: Review or explain an RLinf pull request, trace behavior changes against its baseline, assess algorithm and architecture choices, and draft evidence-backed review comments. Use for a PR URL or a PR number with repository context.
 ---
 
-# Review PR (From PR URL)
+# Review PR
 
-Reviews the changes in a specific GitHub pull request. **The primary focus is code correctness, clean abstractions and code reuse, and eliminating unnecessary changes that deviate from the existing codebase.** PR formatting, commit conventions, and user-facing documentation are checked but should not dominate the review. See [AGENTS.md](../../../AGENTS.md) and [CONTRIBUTING.md](../../../CONTRIBUTING.md) for the design and contribution rules referenced below.
+Help the reviewer understand what changes, verify the behavior, and identify actionable issues. Prioritize correctness and responsibility boundaries; check contribution requirements without letting metadata dominate. Apply [AGENTS.md](../../../AGENTS.md), [CONTRIBUTING.md](../../../CONTRIBUTING.md), and the voice rules in [docs/STYLE_GUIDE.md](../../../docs/STYLE_GUIDE.md).
 
-## 1. Input: PR URL
+## Match the request
 
-Require a PR URL (for example: `https://github.com/RLinf/RLinf/pull/123`).
+- For a full review, explain the change briefly, then report findings by severity.
+- For a question about one component, trace that component and its relevant callers. Keep the answer within the question's scope.
+- For a before/after comparison, distinguish behavior changes from moves, renames, and extracted abstractions.
+- For comment drafting, preserve the user's concern and requested tone, verify factual claims, and label suggestions that can be deferred. Drafting does not authorize posting.
 
-## 2. Fetch PR data and the main branch
+Infer the repository and PR number from the conversation when unambiguous. Ask only for missing information that prevents the requested work.
 
-Fetch PR details directly from the URL:
+## Establish the versions
 
-- Open/fetch the PR page itself for title, description, and metadata.
-- Fetch unified diff via URL forms:
-  - `<PR_URL>.diff` (preferred)
-  - `<PR_URL>.patch` (fallback)
-- If needed, fetch related pages directly from URL for comments/checks.
+Use supplied, complete evidence when it identifies the reviewed revisions. Otherwise fetch PR metadata, the current diff, and relevant review discussions through the available GitHub API, browser, or CLI; no `gh` dependency is required. A PR description may describe an earlier revision. Record the head SHA and base repository/branch, and check that downloaded files and diffs correspond to that head. Refresh this information when reviewing subsequent updates or when the user requests the latest state.
 
-**All cross-references must be against `origin/main`, not the local working tree.** The current checkout may be on an unrelated branch or contain WIP changes; Glob/Grep over the working tree does not show the upstream state. Before any cross-reference lookup:
+Keep these three views separate:
 
-- Run `git fetch origin main` to refresh.
-- Read files via `git show origin/main:<path>` (or browse `https://github.com/RLinf/RLinf/blob/main/<path>`).
-- Use `git log origin/main..<pr-head>` to scope what the PR actually adds.
-- Never treat Glob/Grep results over the working tree as "current state of the project" — they reflect whatever branch is checked out, not main.
+| View | Purpose |
+|---|---|
+| PR merge-base | The before state for attributing changes to this PR |
+| Pinned PR head | The after state, including unchanged callers and dependencies |
+| Current upstream target branch | Current conventions, reusable helpers, and integration conflicts |
 
-If the PR page is private and URL fetch is blocked, report that access is unavailable and ask the user to provide exported diff/details.
+Resolve the base remote from PR metadata; `origin` may be a personal fork, and the target branch may not be `main`. When working from Git, fetch missing refs and compute `git merge-base <base-ref> <head-sha>`. Use `git diff <merge-base> <head-sha>` for the changes and `git show <sha>:<path>` for complete files. If the target branch has advanced, label its differences separately rather than attributing them to the PR.
 
-## 3. Review priorities
+Use an isolated checkout or revision-qualified reads so the user's working branch stays intact. Search the pinned head for consumers of new code and the baseline for old behavior. Do not treat an unrelated local checkout or a concatenation of main and the diff as the PR's runtime tree.
 
-Findings are ordered by severity. Categories are listed in priority order — most of the review should be on (a) and (b); (c)–(e) are checked but should not pad the output.
+If access is incomplete, identify which evidence is unavailable and which conclusions remain possible. Continue with available evidence; request an exported diff or missing source only when needed. Do not claim a complete review from a truncated diff.
 
-### (a) Correctness, bugs, and edge cases — primary
+## Reconstruct behavior before judging it
 
-For every changed function, branch, and config path, look for:
+Map the affected path from configuration and construction through the caller, implementation, and downstream consumer. For a large PR, organize by behavior or responsibility rather than file order.
 
-- **Logic bugs**: off-by-one, inverted conditions, wrong operator/default, swapped args, mutated shared state, missing await/sync.
-- **Edge cases**: empty/None/NaN, single-element batches, zero-size tensors, world-size=1, first/last iter, eval-only paths, resume-from-checkpoint, multi-node vs single-node paths.
-- **Concurrency / distributed**: collectives that must run on every rank, device placement, non-deterministic ordering across workers, blocking calls in async paths, races on Ray actors / channels.
-- **Resource & lifecycle**: GPU memory leaks (uncleared tensors, missing `enable_offload`), file handles, Ray actor lifetime, missed cleanup on exceptions, double-init.
-- **Numerical**: dtype mismatches (fp16/bf16/fp32), in-place ops on grad-required tensors, unsafe casts, accumulator precision, loss-mask correctness.
-- **Error handling**: silent `except`, exceptions on hot paths, missing input validation at boundaries; conversely, *over*-validation of internally-trusted state.
-- **Refactor regressions**: read both the `origin/main` version and the new version side-by-side; partial refactors often change semantics by accident.
+- Read the old and new implementations together with their call sites. Resolve inherited methods, overrides, omitted arguments, default values, configuration overrides, and train/eval branches. A method name, `.eval()`, or `no_grad()` does not establish whether custom sampling, mutation, or updates occur.
+- Follow values to their effect: tensor shapes and masks, action selection and execution, worker messages, replay storage, loss inputs, checkpoint state, or cleanup. An interface existing in one file does not prove it is reached in a supported run.
+- Check relevant modes and alternate implementations: training/evaluation, sync/async, supported environments/backends, warmup, resets, termination, and resume. Focus on paths affected by the change, with concrete inputs that expose a difference.
+- Distinguish a default preset from an optional capability. For routing or takeover logic, establish precedence, fallbacks, disabled/shadow modes, and which action is executed versus recorded for learning.
+- Before calling code unused, inspect factories, registries, inherited hooks, serialization, configuration, and external extension contracts. Zero direct text matches is a lead, not proof of dead code.
 
-Cite file:line in the diff and the matching `origin/main:file:line` when relevant.
+When the PR changes a learning objective, sampling rule, or update schedule, or the user asks whether an algorithm is standard, read [Algorithm semantics](reference.md#algorithm-semantics). For conditional docs, installation, and CI checks, use the relevant sections of [reference.md](reference.md); do not expand a focused question into an unrelated audit.
 
-### (b) Design, code reuse, and unnecessary changes vs `origin/main` — primary
+## Evaluate correctness and architecture
 
-The PR must match how RLinf already does things and follow the [Design and review principles in `AGENTS.md`](../../../AGENTS.md#design-and-review-principles). Mismatches, bloated workarounds, and dead boilerplate are design defects, not style nits.
+Review correctness through the affected contract: masks and numerical behavior, rank participation and synchronization, message ordering, state ownership, resource lifecycle, and error handling. Describe a reachable trigger and its consequence. A minimal reproducer or calculation is useful when the source trace alone leaves uncertainty.
 
-- **Compare against the *newest* idiomatic sibling in `origin/main`** — comparable model under `rlinf/models/embodiment/`, env under `rlinf/envs/`, runner under `rlinf/runners/`, worker under `rlinf/workers/`, advantage/loss/reward under `rlinf/algorithms/`. Check `git log` on siblings so you compare against current conventions rather than legacy boilerplate.
-- **Clean, explicit abstractions**:
-  - Prefer small abstractions with one responsibility and one stable name (`AGENTS.md`). Flag parallel vocabularies, pass-through wrapper classes/functions that hide ownership, and dynamic machinery where a direct constructor, method, or existing registry (`register_model`, `register_advantage`, `register_policy_loss`, `register_reward`, `get_env_cls()`) suffices.
-  - Design invalid states out of the API: explicit ownership, lifecycle order, and idempotent cleanup; keep the common local path direct and use the same API in local and remote configurations.
-  - Embodied policies must inherit `BasePolicy` and implement the documented forwards (`default_forward`, `predict_action_batch`, plus algorithm-specific); workers must subclass `Worker`, implement `initialize`, use `self.log_info` / `log_warning` / `log_error`, and launch via `create_group(...).launch(...)`.
-- **Code reuse over duplication**:
-  - Check whether new logic duplicates helpers or abstractions that already exist anywhere in the stack — `rlinf/utils/` (placement, checkpoint, distributed, data-iter, logging), `rlinf/models/embodiment/` (shared transforms, image parsing, action packing), `rlinf/envs/` (`prepare_actions`, wrappers), `rlinf/data/` (dataset writers/loaders), or `requirements/install.sh` helpers (`clone_or_reuse_repo`, `install_lerobot`, `install_flash_attn`). Always cite the existing helper with `origin/main:file:line` and propose reusing or extending it.
-- **Unnecessary changes, dead code, and bloat**:
-  - **Dead / unreferenced code**: grep `origin/main` + the PR diff for every newly added function, method, class, dataclass field, and config key. Flag anything with zero callers or consumers (e.g. copy-pasted legacy helpers like `make_*_example()`, `generate_observations()`, unused dataclass fields, or defensive branches for shapes/types that the caller pipeline never produces).
-  - **Redundant YAML config keys**: new YAML must start from a current sibling in `examples/`, keep all values static, and treat user-settable fields as read-only in code. When a YAML file inherits a base config via Hydra `defaults` (e.g. `model/pi0_5@actor.model`), flag blocks that re-declare unchanged default keys instead of overriding only task-specific fields.
-  - **Over-engineered install / Docker / CI changes**:
-    - In `requirements/install.sh`, flag bespoke subshells, inline `pyproject.toml` patching, or per-env `TORCH_VERSION` overrides when a small `case` branch calling shared helpers (`install_<env>_env`) or a pinned fork under `github.com/RLinf/<repo>` can express it cleanly (see [install-check](../install-check/SKILL.md)).
-    - In `docker/Dockerfile` and `.github/workflows/docker-build.yml`, check whether comparable targets on `origin/main` actually build Docker images (e.g. real-world hardware envs like `yam`, `so101`, `piper`, `dosw1`, `gim_arm`, `xsquare_turtle2` intentionally do not).
-    - In `.github/workflows/ci-tests.yml` and e2e workflows, flag single-file path filter entries that are already covered by existing directory globs (`rlinf/models/embodiment/**`, `evaluations/**`, `examples/sft/**`, etc.) and flag e2e steps that duplicate coverage already running in another workflow.
-  - **Test layout bloat**: `tests/unit_tests/` has one file per component (`test_models.py`, `test_worker.py`, `test_robotics.py`, etc.). Flag standalone test files named after a single model, env, symptom, or function, and flag mock-heavy tests that only prove mocks were called (`AGENTS.md` § *Tests*).
-  - **No hardcoded paths/hacks**: machine-specific paths, sleep-based sync, monkey-patches → propose a config/env-driven version.
+For design and reuse, compare with a relevant current upstream sibling and verify compatibility at the PR head:
 
-### (c) Code ↔ docs consistency — required when code OR docs change
+- Identify the responsibility being added: network structure, policy composition, learning objective, rollout coordination, replay management, or environment adaptation. Judge placement and dependencies by that responsibility, not the class name or directory alone.
+- Before proposing reuse, compare input/output contracts, shapes, action distributions, parameter ownership, and lifecycle. Check which helpers are already reused. Prefer composition or a shared smaller helper when inheriting a whole implementation would import incompatible behavior.
+- Test a claim of generality against an actual alternative component. Trace factory selection, type checks, callbacks, and required observation/action fields. Separate task-specific geometry or hardware handling from generic routing or learning decisions; explain the concrete coupling that prevents reuse.
+- Trace inherited behavior before criticizing a worker's parent class. Identify algorithm-specific assumptions that leak through it; distinguish a runtime problem from an architectural cleanup that can wait.
 
-Both directions matter, and EN/ZH parity must be checked explicitly:
+Classify each concern before reporting it:
 
-- **If this PR changes documentation**, follow the [docs-check skill](../docs-check/SKILL.md) to drive this review: it cross-checks docs against code and against each other (commands, config keys, paths, model/env names) and enforces EN↔ZH parity.
-- **Docs → code**: every config key, CLI flag, env var, file path, function/class name, and supported model/env name mentioned in changed docs must exist in `origin/main` + this PR. Verify with `git show origin/main:rlinf/...`. Stale references = finding.
-- **Code → docs**: when this PR adds, removes, or renames a public-facing config key, model, env, runner, script, env var, or supported feature, the corresponding doc page **must be updated in the same PR**. If missing, list the exact doc files (EN and ZH) that need edits.
-- **Example-config model paths ↔ docs**: for changed example configs under `examples/embodiment/config/*.yaml`, every model-weight path field (`model_path`, `lora_path`, `backbone_model_path`, `wan_wm_hf_ckpt_path`) must satisfy all three:
-  1. **Form**: it is `/path/to/<repo-name>` where the trailing path component equals the repo in its `# https://huggingface.co/<org>/<repo>` comment (the docs convention is `hf download <org>/<repo> --local-dir <repo>`, so basename == repo name). Flag stale/placeholder basenames (`RLinf-Pi0-SFT`, `model`, `openpi`, …) and a missing leading slash.
-  2. **Exists**: each distinct referenced repo resolves on Hugging Face — `curl -sL -o /dev/null -w '%{http_code}' https://huggingface.co/api/models/<org>/<repo>` returns `200` (use `/api/datasets/` for datasets). Flag 401/404. Also flag *redirecting* names: if the API's returned `id` differs from the requested name, the repo was renamed — point at the canonical `id` (a `200` via redirect is still a stale reference).
-  3. **Matches the docs' per-variant model**: the repo equals the one the corresponding env recipe page prescribes for that exact environment + task suite + model family — not just any existing repo. Cross-check the recipe doc's model table/download block (e.g. LIBERO spatial/object/goal + π₀ → `RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT`, LIBERO-10/Long + π₀ → `RLinf-Pi0-LIBERO-Long-SFT`, any LIBERO suite + π₀.₅ → `RLinf-Pi05-LIBERO-SFT`, GR00T N1.5 per-suite `RLinf-Gr00t-SFT-{Spatial,Object,Goal,10}`). Watch for base-vs-adapter mixups (`model_path` = full base model, `lora_path` = LoRA adapter) and casing drift vs the doc/canonical name. Intentional user-supplied placeholders (e.g. DAgger `student_model`/`expert_model`, "any pi05 checkpoint") are not findings — confirm against the recipe page before flagging.
-- **EN ↔ ZH parity** (do this explicitly, even when only one language was touched): paired pages under `docs/source-en/` and `docs/source-zh/` must agree on setup commands, paths, env vars, config keys, supported models/envs/algorithms, capability claims, reported numbers (metrics, table values, dataset sizes, trial counts), and section structure/order. If only one side is updated, name the matching file that also needs the change.
-- **Sibling style**: cross-check with sibling pages in the same area (e.g. `opensora.rst`) for section naming/order, code-block conventions, table/link style.
-- Each docs finding must include a concrete suggested wording / structure fix and exact file references.
+| Classification | Evidence needed |
+|---|---|
+| PR-introduced bug/regression | Changed behavior, reachable trigger, violated contract, and impact |
+| Pre-existing issue | Evidence at the merge-base; explain if this PR broadens its impact |
+| Deliberate behavior change | Source/history or author statement establishing intent; evaluate correctness separately |
+| Design suggestion | Concrete ownership, reuse, or extension cost; state whether it blocks the PR |
+| Open question | Specific missing evidence and what would resolve it |
 
-### (d) Tests and CI integration
+Code establishes implemented behavior. Comments, docs, commits, and author replies provide evidence of intent. Tests establish only the properties they exercise. A test written to assert a new behavior, or a successful training smoke test, does not by itself establish algorithmic correctness. Do not invent rationale from names such as "ablation" or from the fact that code already exists. Correct earlier conclusions explicitly if a deeper trace changes them.
 
-- **User-facing changes** must have **tests** (unit or e2e). Reviewer must be able to validate reproducibility.
-- **If this PR changes the install script** (`requirements/install.sh`, `requirements/embodied/`, or `docker/Dockerfile`), follow the [install-check skill](../install-check/SKILL.md) to review the changes: reuse of common utilities, system deps kept in `sys_deps.sh`, pinned/forked git deps, no ad-hoc `pyproject.toml`/core-dep hacks, and a matching Dockerfile build stage for every new model/env.
-- **Dependencies / CI**: new env/model needs install-script update, Docker stage, and CI/e2e coverage — cross-check with the [add-install-docker-ci-e2e skill](../add-install-docker-ci-e2e/SKILL.md).
-- New CI-relevant YAML must be referenced in the e2e test matrix.
-- Large/new dependencies (docker, models, datasets) → maintainer ping noted.
+## Validate and present the result
 
-### (e) Style, commit & PR metadata — secondary
+Run checks proportionate to the findings and available environment. Prefer focused existing tests or a small reproducer; do not install a full GPU/robot stack just to answer a source question. Report what ran, what it established, and any material untested path. Missing hardware is a validation limit, not evidence of a bug.
 
-Mention only if there are real issues; do not pad the review.
+For a full review, identify the PR and reviewed revision, explain its purpose and main changes, then list actionable findings in severity order. Keep pre-existing debt, non-blocking suggestions, and unresolved questions distinguishable from PR-introduced bugs. Do not manufacture findings to fill categories.
 
-- Google Python Style; passes `pre-commit run --all-files`.
-- Public classes/methods have Google-style docstrings; type hints on parameters; return type when not deducible.
-- Assertions/exceptions have meaningful messages (no empty or `xxx != yyy` restatements).
-- `logging` / `self.log_*` not `print`.
-- **License header (newly-added files)**: every file *added* by this PR must carry the standard RLinf header (`# Copyright <YEAR> The RLinf Authors.`), and `<YEAR>` must equal the current calendar year. Determine the current year (e.g. `date +%Y`), list added files with `git diff --name-status origin/main...<pr-head>` (status `A`), and flag any new file whose header is missing or whose copyright year is not the current year. Files vendored from third parties keep their upstream copyright line — apply this only to the RLinf Authors header.
-- Every commit `Signed-off-by`; messages follow Conventional Commits `<type>(<scope>): <description>`.
-- PR title in Conventional Commits format; PR Description and Checklist sections filled; testing results if performance/stability is affected.
+Each finding should explain the expected and actual behavior in plain language, the triggering conditions, and the practical impact. Include a verified file/line link and enough of the code trace to make the conclusion checkable. Show short inline snippets when defaults or multiple calls are central to the issue; scale the walkthrough to its complexity. Suggest a concrete fix direction without prescribing an unnecessary redesign.
 
-## 4. Explain the PR first
+For an unfamiliar subsystem or a requested comparison, use a table with **area, before, after, and behavioral impact**, followed by the relevant call flow. Explain the role before introducing a class name. Mark moves and extractions as such instead of presenting old capabilities as new features.
 
-Before listing issues, start with a brief explanation of the PR:
+For algorithm comparisons, keep **reference algorithm, pre-PR implementation, and PR implementation** separate. For an English review comment, put the concrete concern first, provide the evidence, and ask for a specific change or explanation. Preserve uncertainty and non-blocking status; do not turn a question into an asserted bug.
 
-- What problem it tries to solve.
-- Main change categories (e.g., packaging, docs, CI, refactor).
-- Potential impact/risk areas.
-
-Keep this concise (3-6 bullets), then move to findings.
-
-## 5. Output format
-
-- Open with the PR URL and the brief explanation from section 4.
-- List **findings**, ordered by severity (highest first). Present every finding with **both** a plain-language explanation and a step-by-step code walkthrough with inline code snippets so reviewers can immediately understand the issue without having to look up line numbers in another tab:
-  - **Plain-language explanation (for context)**: start by explaining the problem in everyday engineering terms for a reviewer unfamiliar with the module's internals — what the code or test is *trying* to do, what actually happens instead, and why that causes a bug or regression in practice, without burying the core idea in variable names.
-  - **Step-by-step code trace with inline snippets (for verification)**: directly show the key code snippet(s) from the PR (and from `origin/main` when cross-checking) inline, and walk through how the execution flows through that snippet to produce the bug. Do not force reviewers to chase line numbers (`at line 639... then at line 654...`) without showing the code itself.
-  - Structure each finding as:
-    - `Severity` + `Area/File`: short, plain-English title of the problem.
-    - `Why this is a problem`: plain-language explanation of expected vs. actual behavior and real-world impact, accessible to a reader with little background in that module.
-    - `Code walkthrough`: quote the key code snippet(s) directly in fenced code blocks (with file/line header for reference) and trace step by step how inputs/values flow through those lines to cause the issue.
-    - `Suggested fix`: concrete code change to resolve it.
-- The bulk of findings should be from categories (a) and (b). If you find none in those categories, say so explicitly — do not fabricate.
-- Group docs (c) findings together; tests/CI (d) together; style/PR-metadata (e) at the end.
-- Explicitly label findings discovered via **main-branch cross-check** (not only direct diff lines).
-- Do not include findings that simply restate that the PR description is well-formed; only flag *problems*.
-
-For a concise checklist, see [reference.md](reference.md).
+Use links to the pinned revision for source evidence or verified lines in the current PR diff. Cite the merge-base for historical claims, current upstream for convention checks, and primary sources for algorithm claims. End with relevant validation limits rather than an exhaustive checklist.
