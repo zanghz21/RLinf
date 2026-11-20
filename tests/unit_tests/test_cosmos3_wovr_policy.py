@@ -164,7 +164,7 @@ def test_rollout_tensor_records_replay_with_live_gradients(policy, image):
     inputs = result["forward_inputs"]
     assert actions.shape == (2, 4, 10)
     assert result["prev_logprobs"].shape == (2, 4, 10)
-    assert result["prev_values"].shape == (2, 1)
+    assert result["prev_values"] is None
     assert all(isinstance(value, torch.Tensor) for value in inputs.values())
     assert all(not value.requires_grad for value in inputs.values())
     assert not policy.training

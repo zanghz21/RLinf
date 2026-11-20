@@ -35,6 +35,7 @@ from test_cosmos3_wovr_policy import policy as policy
 from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
 
 from rlinf.config import validate_cfg
+from rlinf.data.schema.embodied_types import Trajectory, TrajectoryStep
 from rlinf.hybrid_engines.fsdp.optim import FP32MasterAdamW
 from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
 from rlinf.scheduler import Worker
@@ -143,16 +144,18 @@ def train_actor(cfg, policy_model, records, rewards, dones, monkeypatch):
     monkeypatch.setattr(
         Worker.torch_platform, "is_available", lambda: False, raising=False
     )
-    batch = {
-        "rewards": torch.stack(rewards),
-        "dones": torch.stack(dones),
-        "prev_logprobs": torch.stack([r["prev_logprobs"] for r in records]),
-        "prev_values": torch.zeros(3, 4, 1),
-        "forward_inputs": {
-            name: torch.stack([record["forward_inputs"][name] for record in records])
-            for name in records[0]["forward_inputs"]
-        },
-    }
+    steps = [
+        TrajectoryStep(
+            rewards=reward,
+            dones=done,
+            prev_logprobs=record["prev_logprobs"],
+            prev_values=record["prev_values"],
+            forward_inputs=record["forward_inputs"],
+        )
+        for record, reward, done in zip(records, rewards, dones[1:], strict=True)
+    ]
+    steps[0].initial_dones = dones[0]
+    batch = Trajectory.to_batch([Trajectory.from_steps(steps)])
     actor.rollout_batch = actor._process_received_rollout_batch(batch)
     rollout_metrics = inspect.unwrap(actor.compute_advantages_and_returns)(actor)
     assert torch.count_nonzero(actor.rollout_batch["advantages"]) > 0

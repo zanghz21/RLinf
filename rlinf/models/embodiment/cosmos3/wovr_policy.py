@@ -649,7 +649,7 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         actions = torch.stack(actions)
         return actions, {
             "prev_logprobs": torch.stack(logprobs),
-            "prev_values": torch.zeros((batch_size, 1), dtype=torch.float32),
+            "prev_values": None,
             "forward_inputs": {
                 "image": images.clone(),
                 "prompt_bytes": prompt_bytes,
