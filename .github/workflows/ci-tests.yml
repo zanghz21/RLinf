@@ -183,7 +183,6 @@ jobs:
               - 'examples/embodiment/eval_cosmos3_closed_loop.py'
               - 'examples/embodiment/config/cosmos3_closed_loop.yaml'
               - 'examples/embodiment/config/cosmos3_wovr.yaml'
-              - 'examples/embodiment/config/training/cosmos3_grpo.yaml'
               - 'examples/embodiment/config/libero_spatial_grpo_cosmos3.yaml'
               - 'rlinf/data/datasets/cosmos3_keyframes.py'
               - 'rlinf/runners/embodied_runner.py'
