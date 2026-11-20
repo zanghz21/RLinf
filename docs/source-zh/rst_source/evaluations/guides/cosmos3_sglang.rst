@@ -257,6 +257,25 @@ LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 
 保存该步骤的输入、输出和采样时的对数概率。actor 重算同一步转移的对数概率，按十个动作通道求和，
 得到用于更新策略的条件转移概率比。
 
+.. _cosmos3-grpo-trainable-parameters:
+
+两套 Cosmos3 GRPO 配置默认只训练扩散 Transformer（DiT）内部的生成专家，包括生成分支
+的最终归一化层，以及 Edge 模型中生成侧的 key 归一化层。如需同时训练 DiT 外的模块，
+可按需在启动命令末尾添加以下独立选项。
+
+* ``actor.model.train_action_input_projection=true`` 训练动作输入投影
+  （``action2llm``），将带噪动作映射到 Transformer 的隐藏空间。
+* ``actor.model.train_action_output_projection=true`` 训练动作输出投影
+  （``llm2action``），将隐藏状态映射为动作的去噪速度。
+* ``actor.model.train_action_modality_embedding=true`` 训练动作模态嵌入
+  （``action_modality_embed``）。
+* ``actor.model.train_time_embedder=true`` 训练扩散时间嵌入（``time_embedder``）。
+
+例如，要只训练动作输出投影，可设置
+``actor.model.train_dit_backbone=false actor.model.train_action_output_projection=true``。
+两套配置都将以上四个模块的开关显式设为 ``false``。即使名称匹配
+``actor.model.keys_to_select``，也需要打开对应开关才会训练该模块。
+
 默认 ``cosmos.share_weights=true``。每到权重同步点，actor 会在下一次采样前把权重发送给 rollout
 和 simulator。各 worker 持有自己的推理副本。要固定 simulator 权重，请在同一启动命令中追加以下覆盖项。
 若独立权重另有原生配置文件，可指定 ``cosmos.simulator.native_config_path``。
@@ -267,6 +286,8 @@ LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 
 
 ``runner.save_interval`` 控制标准 embodied checkpoint 的保存间隔，可通过
 ``runner.resume_dir=/shared/run/checkpoints/global_step_5`` 恢复训练。
+恢复之前只训练动作头的优化器 checkpoint 时，需打开三个动作模块开关，并设置
+``actor.model.train_dit_backbone=false``。
 指标由 ``runner.logger`` 指定的后端记录。训练奖励表示模型预测的成功程度，LIBERO
 仿真中的任务成功率可通过评测流程测量。
 
@@ -277,6 +298,8 @@ LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 
 
 用 ``libero_spatial_grpo_cosmos3`` 运行原生 Cosmos3 策略，让 LIBERO 物理仿真器执行动作，
 并根据任务是否成功计算奖励。准备带 LIBERO 动作头的未量化 Cosmos 权重，以及训练该动作头时使用的归一化统计文件。
+该配置同样默认只训练 DiT 生成专家，可用相同的
+:ref:`可训练参数选项 <cosmos3-grpo-trainable-parameters>` 调整训练范围。
 
 .. code-block:: bash
 

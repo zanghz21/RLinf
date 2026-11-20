@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,6 +28,64 @@ import torch
 from torch import nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+
+_MODULE_TRAIN_FLAGS = {
+    "action2llm": "train_action_input_projection",
+    "llm2action": "train_action_output_projection",
+    "action_modality_embed": "train_action_modality_embedding",
+    "time_embedder": "train_time_embedder",
+}
+
+
+def _enable_policy_gradients(net: nn.Module, model_cfg: Mapping[str, Any]) -> None:
+    """Select the generation transformer and independently configured modules."""
+    keys = model_cfg.get("keys_to_select", [])
+    if (
+        not isinstance(keys, Sequence)
+        or isinstance(keys, str)
+        or any(not isinstance(key, str) or not key for key in keys)
+    ):
+        raise ValueError(
+            "keys_to_select must be a list of nonempty parameter substrings"
+        )
+    for flag in ("train_dit_backbone", *_MODULE_TRAIN_FLAGS.values()):
+        if flag in model_cfg and not isinstance(model_cfg[flag], bool):
+            raise ValueError(f"{flag} must be a boolean")
+
+    train_dit = model_cfg.get("train_dit_backbone", True)
+    missing_modules = {
+        module for module, flag in _MODULE_TRAIN_FLAGS.items() if model_cfg.get(flag)
+    }
+    matched_keys = found_expert = has_trainable = False
+    for name, parameter in net.named_parameters():
+        selected = any(key in name for key in keys)
+        matched_keys |= selected
+        module = name.partition(".")[0]
+        # Edge has an additional understanding-key norm used by generation.
+        if module == "language_model" and (
+            "moe_gen" in name or "k_norm_und_for_gen" in name
+        ):
+            enabled = train_dit
+            found_expert |= "moe_gen" in name
+        else:
+            missing_modules.discard(module)
+            flag = _MODULE_TRAIN_FLAGS.get(module)
+            enabled = model_cfg.get(flag, selected) if flag else selected
+        parameter.requires_grad_(enabled)
+        has_trainable |= enabled
+
+    if keys and not matched_keys:
+        raise ValueError(f"No Cosmos network parameters match keys_to_select={keys}")
+    if train_dit and not found_expert:
+        raise ValueError(
+            "No Cosmos DiT generation expert parameters found in the checkpoint"
+        )
+    if missing_modules:
+        raise ValueError(f"Missing requested Cosmos modules: {sorted(missing_modules)}")
+    if not has_trainable:
+        raise ValueError(
+            "No trainable Cosmos parameters selected; enable a training group or set keys_to_select"
+        )
 
 
 class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
@@ -193,7 +252,9 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         ``model_path`` is a local native/HF or diffusers checkpoint directory.
         It must include Cosmos's native ``config.json``; ``native_config_path``
         can point at that file separately for diffusers-only weight exports.
-        ``keys_to_select`` chooses trainable network parameter substrings.
+        ``train_dit_backbone`` enables the diffusion expert by default.
+        The action projections, modality embedding and time embedding have independent
+        train flags. Explicit flags take precedence over ``keys_to_select``.
         ``for_simulation`` freezes all weights and also accepts causal dynamics
         models; native action conditioning still requires ``action_gen=true``.
         """
@@ -218,22 +279,6 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         config = Cosmos3OmniConfig.from_json_file(str(config_path))
         if not config.model:
             raise ValueError(f"Expected a native Cosmos model config in {config_path}")
-        keys = (
-            []
-            if for_simulation
-            else list(
-                model_cfg.get(
-                    "keys_to_select",
-                    ["action2llm", "llm2action", "action_modality_embed"],
-                )
-            )
-        )
-        if not for_simulation and (
-            not keys or any(not isinstance(key, str) or not key for key in keys)
-        ):
-            raise ValueError(
-                "keys_to_select must contain nonempty parameter substrings"
-            )
         requested_device = model_cfg.get("device")
         device = (
             torch.device(requested_device)
@@ -264,15 +309,8 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
 
         _promote_scalar_params_to_1d(omni)
         omni.requires_grad_(False)
-        selected = []
-        for name, parameter in omni.net.named_parameters():
-            if any(key in name for key in keys):
-                parameter.requires_grad_(True)
-                selected.append(name)
-        if not for_simulation and not selected:
-            raise ValueError(
-                f"No Cosmos network parameters match keys_to_select={keys}"
-            )
+        if not for_simulation:
+            _enable_policy_gradients(omni.net, model_cfg)
         options = {
             key: model_cfg[key]
             for key in (

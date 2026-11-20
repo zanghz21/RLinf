@@ -275,6 +275,27 @@ transition index and records its input, output and behavior log probabilities.
 The actor replays that transition and sums log probabilities across the ten
 action channels. The optimized ratio is the conditional transition density.
 
+.. _cosmos3-grpo-trainable-parameters:
+
+By default, both Cosmos3 GRPO recipes train only the generation expert inside the
+diffusion transformer (DiT), including its final normalization and the generation-side
+key normalization on Edge. Append any of the following overrides to also train
+modules outside the DiT.
+
+* ``actor.model.train_action_input_projection=true`` trains the projection from
+  noisy actions into the transformer's hidden space (``action2llm``).
+* ``actor.model.train_action_output_projection=true`` trains the projection from
+  hidden states to action velocity (``llm2action``).
+* ``actor.model.train_action_modality_embedding=true`` trains the action modality
+  embedding (``action_modality_embed``).
+* ``actor.model.train_time_embedder=true`` trains the diffusion time embedding
+  (``time_embedder``).
+
+For example, to train only the action output projection, set
+``actor.model.train_dit_backbone=false actor.model.train_action_output_projection=true``.
+Both recipes explicitly disable the four modules above, even when a name matches
+``actor.model.keys_to_select``. Turn on the corresponding switch to include one.
+
 With ``cosmos.share_weights=true``, the actor publishes updated weights to both the
 rollout and simulator workers before the next scheduled rollout. The simulator
 holds its own inference replica. To train against a fixed simulator, append the
@@ -287,9 +308,11 @@ also set ``cosmos.simulator.native_config_path``.
 
 The usual embodied checkpoint settings apply. Set ``runner.save_interval`` to the
 desired number of iterations and resume with
-``runner.resume_dir=/shared/run/checkpoints/global_step_5``. Training metrics
-are available through ``runner.logger``. The reward measures predicted success in
-the learned simulator. Use the LIBERO evaluation for physical-simulator success.
+``runner.resume_dir=/shared/run/checkpoints/global_step_5``. To resume an
+action-head-only optimizer checkpoint, enable the three action switches and set
+``actor.model.train_dit_backbone=false``. Training metrics are available through
+``runner.logger``. The reward measures predicted success in the learned simulator.
+Use the LIBERO evaluation for physical-simulator success.
 
 .. _cosmos3-libero-grpo:
 
@@ -299,6 +322,9 @@ Train Cosmos3 with GRPO in LIBERO-Spatial
 Use ``libero_spatial_grpo_cosmos3`` to train the native Cosmos3 policy with
 LIBERO's physics and task-success rewards. Supply the unquantized policy export
 and the action statistics used to train its LIBERO action head.
+This recipe uses the same :ref:`trainable parameter options
+<cosmos3-grpo-trainable-parameters>` and trains only the DiT generation expert
+by default.
 
 .. code-block:: bash
 

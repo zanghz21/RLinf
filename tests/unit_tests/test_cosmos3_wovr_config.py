@@ -53,6 +53,11 @@ def test_embodied_config_routes_cosmos_weights(wovr_recipe, shared):
     assert cfg.algorithm.adv_type == "grpo"
     assert cfg.algorithm.loss_type == "actor"
     assert cfg.actor.training_backend == "fsdp"
+    assert cfg.actor.model.train_dit_backbone is True
+    assert cfg.actor.model.train_action_input_projection is False
+    assert cfg.actor.model.train_action_output_projection is False
+    assert cfg.actor.model.train_action_modality_embedding is False
+    assert cfg.actor.model.train_time_embedder is False
     assert cfg.env.train.backend == "cosmos3"
     assert cfg.env.train.share_weights is shared
     assert cfg.rollout.model.model_path == "policy"
@@ -90,10 +95,13 @@ def test_native_libero_grpo_recipe(wovr_recipe):
             "actor.model.model_path=policy",
             "env.train.action_stats_path=stats.json",
             "runner.val_check_interval=1",
+            "actor.model.train_action_output_projection=true",
             config_name="libero_spatial_grpo_cosmos3",
         )
     )
     assert cfg.actor.model.wovr.enabled and cfg.actor.model.action_dim == 10
+    assert cfg.actor.model.train_dit_backbone is True
+    assert cfg.actor.model.train_action_output_projection is True
     assert cfg.rollout.model.model_path == "policy"
     assert cfg.algorithm.adv_type == "grpo"
     assert cfg.env.train.use_fixed_reset_state_ids

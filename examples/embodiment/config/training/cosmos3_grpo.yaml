@@ -62,7 +62,13 @@ actor:
     guidance_scale: 1.5
     noise_std: 0.1
     shift: 5.0
-    keys_to_select: [action2llm, llm2action, action_modality_embed]
+    # By default GRPO updates only the transformer generation expert.
+    train_dit_backbone: true
+    train_action_input_projection: false  # action2llm
+    train_action_output_projection: false  # llm2action
+    train_action_modality_embedding: false  # action_modality_embed
+    train_time_embedder: false
+    keys_to_select: []
   optim:
     lr: 1.0e-5
     use_fp32_master_params: true

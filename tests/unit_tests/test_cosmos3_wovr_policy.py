@@ -362,9 +362,8 @@ def test_checkpoint_vae_and_patch_geometry_are_validated(native_sdk, image):
         policy.predict_action_batch(observations(image))
 
 
-def test_loader_preserves_weights_and_selects_trainable_heads(
-    monkeypatch, tmp_path, native_sdk, image
-):
+@pytest.fixture
+def native_loader(monkeypatch, tmp_path):
     config_file = tmp_path / "config.json"
     config_file.write_text(json.dumps({"model": {"config": {}}}))
     loaded = TinyOmni()
@@ -411,10 +410,18 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
 
     monkeypatch.setattr(Worker.torch_platform, "device", device_context)
     monkeypatch.setattr(Worker.torch_platform, "current_device", lambda: 3)
+    return loaded, calls, contexts
+
+
+def test_loader_preserves_weights_and_selects_trainable_heads(
+    native_loader, tmp_path, native_sdk, image
+):
     from omegaconf import OmegaConf
 
     from rlinf.models import get_model
+    from rlinf.scheduler import Worker
 
+    loaded, calls, contexts = native_loader
     model_cfg = OmegaConf.create(
         {
             "model_type": "cosmos3",
@@ -424,6 +431,7 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
             "wovr": {"enabled": True},
             "model_path": str(tmp_path),
             "keys_to_select": ["weight"],
+            "train_dit_backbone": False,
         }
     )
     policy = get_model(model_cfg)
@@ -437,12 +445,15 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
     assert calls[0][1]["parallelism_config"].data_parallel_replicate_degree == -1
     assert model_cfg.wovr.enabled
     assert not calls[0][1]["compile_config"].enabled
+    with pytest.raises(ValueError, match="DiT"):
+        Cosmos3WoVRPolicy.from_pretrained({**model_cfg, "train_dit_backbone": True})
     with pytest.raises(ValueError, match="No Cosmos network parameters"):
         Cosmos3WoVRPolicy.from_pretrained(
             {
                 "model_path": str(tmp_path),
                 "device": Worker.torch_device_type,
                 "keys_to_select": ["missing"],
+                "train_dit_backbone": False,
             }
         )
     loaded.config.video_temporal_causal = True
@@ -460,9 +471,7 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
     with pytest.raises(ValueError, match="simulator-only"):
         simulator.predict_action_batch(observations(image))
     with pytest.raises(ValueError, match="bidirectional"):
-        Cosmos3WoVRPolicy.from_pretrained(
-            {"model_path": str(tmp_path), "keys_to_select": ["weight"]}
-        )
+        Cosmos3WoVRPolicy.from_pretrained(model_cfg)
     loaded.config.action_gen = False
     with pytest.raises(ValueError, match="action-conditioned simulation"):
         Cosmos3WoVRPolicy.from_pretrained(
@@ -471,3 +480,108 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
     (tmp_path / "hf_quant_config.json").write_text("{}")
     with pytest.raises(ValueError, match="unquantized"):
         Cosmos3WoVRPolicy.from_pretrained({"model_path": str(tmp_path)})
+
+
+@pytest.fixture
+def native_parameter_groups(native_loader):
+    omni, _, _ = native_loader
+    net = omni.net
+    net.action2llm = nn.Linear(2, 4)
+    net.llm2action = nn.Linear(4, 2)
+    net.action_modality_embed = nn.Parameter(torch.zeros(4))
+    net.time_embedder = nn.Linear(1, 4)
+    net.vae2llm = nn.Linear(2, 4)
+    net.llm2vae = nn.Linear(4, 2)
+    attention = nn.ModuleDict(
+        {
+            "q_proj": nn.Linear(4, 4),
+            "q_proj_moe_gen": nn.Linear(4, 4),
+            "k_norm_und_for_gen": nn.LayerNorm(4, bias=False),
+        }
+    )
+    net.language_model = nn.Module()
+    net.language_model.model = nn.Module()
+    net.language_model.model.layers = nn.ModuleList(
+        [nn.ModuleDict({"self_attn": attention})]
+    )
+    omni.tokenizer_vision_gen = nn.Linear(2, 2)
+    layer = "net.language_model.model.layers.0.self_attn"
+    return {
+        "dit": {
+            f"{layer}.q_proj_moe_gen.weight",
+            f"{layer}.q_proj_moe_gen.bias",
+            f"{layer}.k_norm_und_for_gen.weight",
+        },
+        "input": {"net.action2llm.weight", "net.action2llm.bias"},
+        "output": {"net.llm2action.weight", "net.llm2action.bias"},
+        "modality": {"net.action_modality_embed"},
+        "time": {"net.time_embedder.weight", "net.time_embedder.bias"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_groups"),
+    [
+        ({}, ["dit"]),
+        ({"train_action_input_projection": True}, ["dit", "input"]),
+        ({"train_action_output_projection": True}, ["dit", "output"]),
+        ({"train_action_modality_embedding": True}, ["dit", "modality"]),
+        ({"train_time_embedder": True}, ["dit", "time"]),
+        (
+            {
+                "train_dit_backbone": False,
+                "train_action_input_projection": True,
+                "train_action_output_projection": True,
+                "train_action_modality_embedding": True,
+            },
+            ["input", "output", "modality"],
+        ),
+        (
+            {
+                "keys_to_select": ["action2llm", "llm2action", "moe_gen"],
+                "train_dit_backbone": False,
+                "train_action_input_projection": False,
+            },
+            ["output"],
+        ),
+    ],
+)
+def test_loader_selects_only_requested_policy_parameters(
+    native_parameter_groups, tmp_path, overrides, expected_groups
+):
+    policy = Cosmos3WoVRPolicy.from_pretrained(
+        {"model_path": str(tmp_path), **overrides}
+    )
+    expected = set().union(*(native_parameter_groups[name] for name in expected_groups))
+    trainable = {name for name, p in policy.omni.named_parameters() if p.requires_grad}
+    assert trainable == expected
+
+
+def test_loader_rejects_empty_actor_selection_but_freezes_simulator(
+    native_parameter_groups, tmp_path
+):
+    cfg = {"model_path": str(tmp_path), "train_dit_backbone": False}
+    with pytest.raises(ValueError, match="No trainable Cosmos parameters"):
+        Cosmos3WoVRPolicy.from_pretrained(cfg)
+    with pytest.raises(ValueError, match="keys_to_select"):
+        Cosmos3WoVRPolicy.from_pretrained(
+            {"model_path": str(tmp_path), "keys_to_select": ["missing"]}
+        )
+    simulator = Cosmos3WoVRPolicy.from_pretrained(
+        {**cfg, "train_dit_backbone": True, "train_action_output_projection": True},
+        for_simulation=True,
+    )
+    assert all(not p.requires_grad for p in simulator.parameters())
+
+
+def test_loader_rejects_missing_requested_action_projection(
+    native_parameter_groups, native_loader, tmp_path
+):
+    omni, _, _ = native_loader
+    del omni.net.llm2action
+    with pytest.raises(
+        ValueError, match="Missing requested Cosmos modules.*llm2action"
+    ):
+        Cosmos3WoVRPolicy.from_pretrained(
+            {"model_path": str(tmp_path), "train_action_output_projection": True}
+        )
