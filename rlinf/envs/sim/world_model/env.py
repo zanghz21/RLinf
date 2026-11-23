@@ -690,7 +690,7 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def chunk_step(self, policy_output_action):
-        """Advance one action chunk: [num_envs, chunk, action_dim]."""
+        """Advance one execution chunk from a batch of action plans."""
         self.onload()
         previously_done = self._episode_done.clone()
         previous_steps = self._elapsed_steps.clone()

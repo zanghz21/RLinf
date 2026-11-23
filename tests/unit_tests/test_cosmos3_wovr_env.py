@@ -304,6 +304,35 @@ def test_first_success_masks_suffix_and_stops_future_simulation(config, simulato
     assert trunc[1, -1]
 
 
+def test_world_model_executes_and_scores_only_the_planned_prefix(config, request):
+    request.getfixturevalue("native_sdk")
+    config.chunk = 5
+    config.num_frames = 17
+    config.max_episode_steps = 10
+    config.model_cfg = {"action_horizon": 16, "num_action_chunks": 5}
+    omni = PixelOmni()
+    omni.tokenizer_vision_gen = SimpleNamespace(temporal_compression_factor=4)
+    simulator = Cosmos3WoVRPolicy(omni, action_horizon=16, num_action_chunks=5)
+    env = make_env(config, simulator)
+    env.reset()
+    plan = torch.full((2, 16, 10), 255.0)
+    # Only the unexecuted suffix would cross the success threshold.
+    plan[:, :5, 0] = torch.arange(1, 6) * 10
+    controls = prepare_actions(plan, "world_model", "cosmos3", 5, 10, env_cfg=config)
+    obs, rewards, term, trunc, infos = env.chunk_step(controls)
+    assert not term.any() and not trunc.any()
+    torch.testing.assert_close(rewards, plan[:, :5, 0] / 255)
+    assert torch.all(obs[-1]["main_images"][:, 0, 0, 0] == 50)
+    assert infos[-1]["episode"]["episode_len"].tolist() == [5, 5]
+    assert len(omni.batches) == 2
+    for i, batch in enumerate(omni.batches):
+        assert batch["sequence_plan"][0].video_length == 17
+        torch.testing.assert_close(batch["action"][0][0][:, :10], plan[i])
+
+    env.chunk_step(controls)
+    assert torch.all(omni.batches[-1]["video"][0][0][:, 0] == 50)
+
+
 def test_relative_rewards_end_at_first_success(config, simulator):
     config.use_rel_reward = True
     env = make_env(config, simulator)

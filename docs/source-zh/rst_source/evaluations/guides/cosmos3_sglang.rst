@@ -311,10 +311,16 @@ LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 
      actor.model.model_path=/shared/cosmos-policy \
      env.train.action_stats_path=/shared/libero_native_frame_wise_relative_rot6d.json
 
-每个 GRPO 组从同一个任务和初始状态出发。策略读取主相机和腕相机的拼图。
+每个 GRPO 组从同一个任务和初始状态出发。原生策略与 Cosmos 官方 LIBERO 服务一样使用
+``wam``，以主相机和腕相机的当前拼图为条件，对未来视频潜变量和动作联合去噪。
+设置 ``actor.model.action_horizon=16 actor.model.num_action_chunks=5`` 后，策略每次预测
+16 步，环境执行前 5 步，再根据新观测重新预测。预测长度需能被视频 VAE 的时间压缩因子整除。
+使用 Cosmos 模拟器时，前向动力学接收完整预测动作，环境推进到实际执行的最后一帧。
+GRPO 在十个动作通道上加入探索噪声。actor 回放时使用采样步骤保存的视频和动作潜变量，
+只对实际交给环境的动作前缀重算条件对数概率。
 环境 worker 对 10 维动作做反归一化，将 6 维旋转表示转成轴角，交给 LIBERO 的 7 维控制器执行。
-actor 用采样时保存的原生去噪转移更新策略，并将权重同步给 rollout。默认 actor 使用 GPU 0，
-rollout 和 LIBERO 渲染共用 GPU 1。将 ``runner.val_check_interval`` 设为正整数可在训练中定期评估。
+actor 更新后将权重同步给 rollout。actor、rollout 和 LIBERO 渲染使用的 GPU 由
+``cluster.component_placement`` 指定。将 ``runner.val_check_interval`` 设为正整数可在训练中定期评估。
 要同时切换训练和评估任务集，可设置 ``env.train.task_suite_name=libero_goal``。
 
 .. _cosmos3-simulator-comparison:

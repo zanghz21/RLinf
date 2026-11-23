@@ -575,7 +575,11 @@ class EnvWorker(Worker):
             ),
         )
         chunk_step_payload = {
-            "chunk_actions": exec_actions,
+            # The Cosmos simulator consumed the full plan to predict frames,
+            # but the trajectory records only the actions it advanced.
+            "chunk_actions": exec_actions[:, : self.model_cfg.num_action_chunks]
+            if self.cfg.env.train.get("backend") == "cosmos3"
+            else exec_actions,
             "obs_list": obs_list,
             "terminations": chunk_terminations,
             "truncations": chunk_truncations,

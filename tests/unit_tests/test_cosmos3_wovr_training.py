@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from test_cosmos3_closed_loop import comparison_vendor as comparison_vendor
 from test_cosmos3_wovr_config import wovr_recipe as wovr_recipe
 from test_cosmos3_wovr_env import config as config
@@ -31,7 +32,9 @@ from test_cosmos3_wovr_env import external_runtime as external_runtime
 from test_cosmos3_wovr_env import make_env
 from test_cosmos3_wovr_env import simulator as simulator
 from test_cosmos3_wovr_policy import native_sdk as native_sdk
+from test_cosmos3_wovr_policy import observations
 from test_cosmos3_wovr_policy import policy as policy
+from test_cosmos3_wovr_policy import prefix_policy as prefix_policy
 from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
 
 from rlinf.config import validate_cfg
@@ -69,6 +72,7 @@ def test_world_model_rollout_trains_standard_fsdp_actor(
     recipe = request.getfixturevalue("wovr_recipe")
     cfg = validate_cfg(
         recipe(
+            "actor.model.action_horizon=4",
             "actor.model.num_action_chunks=4",
             "actor.micro_batch_size=8",
             "actor.global_batch_size=8",
@@ -179,19 +183,63 @@ def train_actor(cfg, policy_model, records, rewards, dones, monkeypatch):
     return actor
 
 
+def make_rollout(cfg, policy_model):
+    rollout = object.__new__(MultiStepRolloutWorker)
+    rollout.cfg = cfg
+    rollout.hf_model = policy_model
+    rollout.model_cfg = cfg.actor.model
+    rollout.algorithm_cfg = cfg.algorithm
+    rollout._train_sampling_params = {}
+    rollout._eval_sampling_params = {}
+    rollout.enable_dagger = False
+    rollout.expert_model = None
+    return rollout
+
+
+@pytest.mark.parametrize("world_model_mode", ["train", "eval"])
+def test_rollout_sends_complete_plan_to_learned_simulator(world_model_mode, request):
+    cfg = request.getfixturevalue("wovr_recipe")("actor.model.num_action_chunks=5")
+    libero_mode = "eval" if world_model_mode == "train" else "train"
+    OmegaConf.update(
+        cfg.env,
+        world_model_mode,
+        {"env_type": "world_model", "backend": "cosmos3"},
+        merge=False,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg.env, libero_mode, {"env_type": "libero"}, merge=False, force_add=True
+    )
+    rollout = make_rollout(cfg, request.getfixturevalue("prefix_policy"))
+    obs = observations(np.zeros((16, 32, 3), dtype=np.uint8), batch_size=1)
+    predict = inspect.unwrap(MultiStepRolloutWorker.predict)
+    torch.manual_seed(41)
+    plan, learned = predict(rollout, obs, world_model_mode)
+    torch.manual_seed(41)
+    executed, physical = predict(rollout, obs, libero_mode)
+    assert plan.shape == (1, 16, 10) and executed.shape == (1, 5, 10)
+    torch.testing.assert_close(executed, plan[:, :5])
+    torch.testing.assert_close(learned["forward_inputs"]["action"], executed.flatten(1))
+    torch.testing.assert_close(learned["prev_logprobs"], physical["prev_logprobs"])
+
+
 def test_libero_rollout_trains_standard_fsdp_actor(
     request, single_rank_gloo, monkeypatch, tmp_path
 ):
-    policy_model = request.getfixturevalue("policy")
+    policy_model = request.getfixturevalue("prefix_policy")
     stats = tmp_path / "action_stats.json"
     stats.write_text(json.dumps({"global_raw": {"q01": [-1] * 10, "q99": [1] * 10}}))
     cfg = validate_cfg(
         request.getfixturevalue("wovr_recipe")(
-            "actor.model.num_action_chunks=4",
+            "algorithm.group_size=4",
+            "env.train.total_num_envs=4",
+            "env.train.rollout_epoch=1",
+            "actor.model.action_horizon=16",
+            "actor.model.num_action_chunks=5",
             "actor.micro_batch_size=8",
             "actor.global_batch_size=8",
-            "env.train.max_episode_steps=8",
-            "env.train.max_steps_per_rollout_epoch=8",
+            "env.train.max_episode_steps=10",
+            "env.train.max_steps_per_rollout_epoch=10",
             "+env.train.num_steps_wait=0",
             f"env.train.action_stats_path={json.dumps(stats.as_posix())}",
             config_name="libero_spatial_grpo_cosmos3",
@@ -240,20 +288,14 @@ def test_libero_rollout_trains_standard_fsdp_actor(
         return frames, successes.astype(float), successes.copy(), [{} for _ in frames]
 
     vector_env.step.side_effect = step
-    rollout = object.__new__(MultiStepRolloutWorker)
-    rollout.hf_model = policy_model
-    rollout.model_cfg = cfg.actor.model
-    rollout.algorithm_cfg = cfg.algorithm
-    rollout._train_sampling_params = {}
-    rollout.enable_dagger = False
-    rollout.expert_model = None
+    rollout = make_rollout(cfg, policy_model)
     worker = object.__new__(EnvWorker)
     worker.cfg = cfg
     worker.model_cfg = cfg.actor.model
     worker.env_list = [env]
     worker.enable_online_lerobot = worker.use_external_reward_model = False
     records, rewards = [], []
-    dones = [torch.zeros(4, 4, dtype=torch.bool)]
+    dones = [torch.zeros(4, 5, dtype=torch.bool)]
     torch.manual_seed(41)
     for _ in range(2):
         actions, record = inspect.unwrap(MultiStepRolloutWorker.predict)(rollout, obs)
@@ -264,7 +306,7 @@ def test_libero_rollout_trains_standard_fsdp_actor(
         output, _, payload = inspect.unwrap(EnvWorker.env_interact_step)(
             worker, actions, 0
         )
-        assert payload["chunk_actions"].shape == (4, 4, 7)
+        assert payload["chunk_actions"].shape == (4, 5, 7)
         torch.testing.assert_close(
             record["forward_inputs"]["action"], sampled.flatten(1)
         )
@@ -277,6 +319,6 @@ def test_libero_rollout_trains_standard_fsdp_actor(
         rewards.append(output.transition.rewards)
         dones.append(output.transition.dones)
         obs = output.obs
-    assert steps == 8
+    assert steps == 10
     np.testing.assert_allclose(torch.stack(rewards).sum((0, 2)), successes)
     train_actor(cfg, policy_model, records, rewards, dones, monkeypatch)

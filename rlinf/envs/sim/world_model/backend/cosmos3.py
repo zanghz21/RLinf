@@ -59,17 +59,23 @@ class Cosmos3Backend:
             raise ValueError("Cosmos chunk and condition_frame_length must be positive")
         if len(self.image_size) != 2 or any(int(size) <= 0 for size in self.image_size):
             raise ValueError("Cosmos image_size must contain positive [height, width]")
-        if cfg.num_frames != self.chunk + 1:
-            raise ValueError(
-                "Cosmos num_frames must equal chunk + one conditioning image"
-            )
         if cfg.get("action_dim", 10) != 10:
             raise ValueError("Cosmos dynamics require native normalized 10D actions")
         if type(cfg.get("share_weights", False)) is not bool:
             raise ValueError("Cosmos share_weights must be a boolean")
         model_cfg = OmegaConf.to_container(cfg.model_cfg, resolve=True)
-        if model_cfg.get("num_action_chunks", self.chunk) != self.chunk:
+        if model_cfg.setdefault("num_action_chunks", self.chunk) != self.chunk:
             raise ValueError("Cosmos model_cfg.num_action_chunks must equal env.chunk")
+        self.action_horizon = model_cfg.get("action_horizon")
+        if self.action_horizon is None:
+            self.action_horizon = self.chunk
+        if self.chunk > self.action_horizon:
+            raise ValueError("Cosmos env.chunk must be at most action_horizon")
+        if cfg.get("num_frames") not in (None, self.action_horizon + 1):
+            raise ValueError(
+                "Cosmos num_frames must equal the predicted chunk length "
+                "(action_horizon) + one conditioning image"
+            )
         if "device" in model_cfg and torch.device(model_cfg["device"]) != device:
             raise ValueError(
                 "Cosmos model_cfg.device must match the environment placement"
@@ -204,7 +210,7 @@ class Cosmos3Backend:
         """Advance slots atomically and return new frames [B,3,chunk,H,W] in [-1,1]."""
         ids = [int(env_id) for env_id in env_ids]
         actions = torch.as_tensor(actions).detach().float().cpu()
-        expected = (len(ids), self.chunk, 10)
+        expected = (len(ids), self.action_horizon, 10)
         if tuple(actions.shape) != expected or not torch.isfinite(actions).all():
             raise ValueError(
                 f"Expected finite native actions {expected}, got {actions.shape}"
@@ -232,12 +238,14 @@ class Cosmos3Backend:
             frames = self.model.generate_dynamics(
                 session["image"], session["prompt"], actions[row], seed
             )
-            expected_frames = (self.chunk + 1, *self.image_size, 3)
+            expected_frames = (self.action_horizon + 1, *self.image_size, 3)
             if frames.dtype != np.uint8 or frames.shape != expected_frames:
                 raise ValueError(
                     f"Expected Cosmos RGB uint8 frames {expected_frames}, got {frames.shape}/{frames.dtype}"
                 )
-            videos.append(frames[1:].copy())
+            # The full predicted plan conditions dynamics. Reward and the next
+            # policy observation use only the portion the environment executes.
+            videos.append(frames[1 : self.chunk + 1].copy())
         for env_id, video in zip(ids, videos, strict=True):
             self._sessions[env_id]["image"] = video[-1].copy()
             self._sessions[env_id]["step"] += 1

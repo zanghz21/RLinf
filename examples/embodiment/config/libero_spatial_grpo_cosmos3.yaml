@@ -1,8 +1,8 @@
 defaults:
-  - /hybrid_engines/fsdp@actor.fsdp_config
-  - /weight_syncer: bucket_syncer
   - env/libero_spatial@env.train
   - env/libero_spatial@env.eval
+  - /hybrid_engines/fsdp@actor.fsdp_config
+  - /weight_syncer: bucket_syncer
   - override hydra/job_logging: stdout
   - _self_
 
@@ -10,117 +10,74 @@ hydra:
   run:
     dir: .
   output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 0
-    rollout,env: 1
+    actor: all
+    rollout,env: all
 
 runner:
   task_type: embodied
   logger:
-    log_path: ../results
+    log_path: "../results"
     project_name: rlinf
     experiment_name: libero_spatial_grpo_cosmos3
-    logger_backends: [tensorboard]
+    logger_backends: ["tensorboard"]
   max_epochs: 100
   max_steps: -1
-  only_eval: false
+
+  only_eval: False
   val_check_interval: -1
-  save_interval: 5
-  resume_dir: null
-  ckpt_path: null
+  save_interval: -1
+
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
-  adv_type: grpo
-  loss_type: actor
-  group_size: 4
-  update_epoch: 2
-  normalize_advantages: true
+  normalize_advantages: True
+  kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
+  group_size: 8
+  reward_coef: 1.0
   reward_type: action_level
   logprob_type: action_level
   entropy_type: action_level
-  loss_agg_func: token-mean
-  clip_ratio_low: 0.2
-  clip_ratio_high: 0.2
+  update_epoch: 1
+  adv_type: grpo
+  loss_type: actor
+  loss_agg_func: "token-mean" 
+  kl_beta: 0.0
   entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
 
-actor:
-  group_name: ActorGroup
-  training_backend: fsdp
-  seed: 1140
-  micro_batch_size: 1
-  global_batch_size: 4
-  model:
-    model_type: cosmos3
-    wovr:
-      enabled: true
-    model_path: /path/to/cosmos3-libero-native
-    native_config_path: null
-    precision: bf16
-    is_lora: false
-    num_action_chunks: 16
-    action_dim: 10
-    raw_action_dim: ${.action_dim}
-    num_inference_steps: 30
-    image_size: [192, 320]
-    fps: 20
-    guidance_scale: 1.5
-    noise_std: 0.1
-    shift: 5.0
-    # By default GRPO updates only the transformer generation expert.
-    train_dit_backbone: true
-    train_action_input_projection: false  # action2llm
-    train_action_output_projection: false  # llm2action
-    train_action_modality_embedding: false  # action_modality_embed
-    train_time_embedder: false
-    keys_to_select: []
-  optim:
-    lr: 1.0e-5
-    use_fp32_master_params: true
-    adam_beta1: 0.9
-    adam_beta2: 0.999
-    adam_eps: 1.0e-8
-    weight_decay: 0.0
-    clip_grad: 1.0
-  fsdp_config:
-    strategy: fsdp
-    sharding_strategy: no_shard
-    use_orig_params: true
-    mixed_precision:
-      param_dtype: bf16
-      reduce_dtype: bf16
-      buffer_dtype: bf16
-      cast_forward_inputs: false
-      cast_root_forward_inputs: false
+  gamma: 0.99
+  gae_lambda: 0.95
 
-rollout:
-  group_name: RolloutGroup
-  generation_backend: huggingface
-  pipeline_stage_num: 1
-  collect_final_values: false
-  sampling_params:
-    do_sample: true
-  model:
-    model_path: ${actor.model.model_path}
-
+  filter_rewards: True
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
 env:
-  group_name: EnvGroup
+  group_name: "EnvGroup"
+
+  # Override the default values in env/libero_spatial
   train:
-    total_num_envs: 4
+    rollout_epoch: 4
+    total_num_envs: 128
     group_size: ${algorithm.group_size}
-    rollout_epoch: 1
     seed: ${actor.seed}
     reset_gripper_open: false
-    action_stats_path: /path/to/libero_native_frame_wise_relative_rot6d.json
+    action_stats_path: /mnt/public/hongzhi/cosmos-sft/cosmos-framework/cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json
     action_normalization: quantile_rot
     video_cfg:
       save_video: false
   eval:
     task_suite_name: ${env.train.task_suite_name}
     total_num_envs: ${env.train.total_num_envs}
-    rollout_epoch: 1
+    
     auto_reset: true
     ignore_terminations: true
     is_eval: true
@@ -132,8 +89,68 @@ env:
       save_video: false
       video_base_dir: ${runner.logger.log_path}/video/eval
 
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: true
+  pipeline_stage_num: 1
+  collect_final_values: false
+  sampling_params:
+    do_sample: true
+  model:
+    model_path: ${actor.model.model_path}
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  seed: 1140
+  micro_batch_size: 16
+  global_batch_size: 1024
+  model:
+    model_type: cosmos3
+    wovr:
+      enabled: true
+    model_path: /mnt/public/hongzhi/cosmos-simulator-policy/exports/edge-20261113-115839/global_step_2000/model_hf
+    native_config_path: null
+    precision: bf16
+    is_lora: false
+    action_horizon: 16  # Actions predicted per WAM sample.
+    num_action_chunks: 5
+    action_dim: 10
+    raw_action_dim: ${.action_dim}
+    num_inference_steps: 4
+    image_size: [192, 320]
+    fps: 20
+    guidance_scale: 1.0 # 1.5
+    noise_std: 0.1
+    shift: 10.0
+    # By default GRPO updates only the transformer generation expert.
+    train_dit_backbone: true
+    train_action_input_projection: false  # action2llm
+    train_action_output_projection: false  # llm2action
+    train_action_modality_embedding: false  # action_modality_embed
+    train_time_embedder: false
+    keys_to_select: []
+  optim:
+    lr: 1.0e-6
+    use_fp32_master_params: true
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.01
+    clip_grad: 1.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: null
+      cast_forward_inputs: false
+      cast_root_forward_inputs: false
+
 reward:
-  use_reward_model: false
+  use_reward_model: False
 
 critic:
-  use_critic_model: false
+  use_critic_model: False

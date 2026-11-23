@@ -59,7 +59,8 @@ actor:
     native_config_path: null
     precision: bf16
     is_lora: false
-    num_action_chunks: 16
+    action_horizon: 16  # Actions predicted per WAM sample.
+    num_action_chunks: 16  # Leading actions executed before the next observation.
     action_dim: 10
     raw_action_dim: ${.action_dim}
     num_inference_steps: 30
@@ -118,7 +119,7 @@ env:
     wm_env_type: libero
     action_dim: ${actor.model.action_dim}
     chunk: ${actor.model.num_action_chunks}
-    num_frames: 17
+    num_frames: null  # Defaults to action_horizon + one conditioning frame.
     image_size: [192, 320]
     condition_frame_length: 1
     seed: ${actor.seed}

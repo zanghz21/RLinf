@@ -534,6 +534,14 @@ class MultiStepRolloutWorker(Worker):
             else:
                 kwargs = {"mode": mode}
 
+        if model_type == SupportedModel.COSMOS3:
+            env_cfg = self.cfg.env[mode]
+            if (
+                env_cfg.env_type == "world_model"
+                and env_cfg.get("backend") == "cosmos3"
+            ):
+                kwargs["return_full_horizon"] = True
+
         if model_type in [
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,

@@ -336,12 +336,19 @@ by default.
      actor.model.model_path=/shared/cosmos-policy \
      env.train.action_stats_path=/shared/libero_native_frame_wise_relative_rot6d.json
 
-Each GRPO group starts from the same LIBERO task and initial state. The policy
-observes the external and wrist cameras together. The environment worker
-denormalizes each 10D action and converts its 6D rotation to axis-angle for
-LIBERO's 7D controller. The actor uses the saved native diffusion transitions
-to update the policy and syncs its weights to rollout. The default placement uses
-GPU 0 for the actor and GPU 1 for rollout and LIBERO rendering. Set
+Each GRPO group starts from the same LIBERO task and initial state. As in the
+Cosmos LIBERO policy server, the native policy uses ``wam`` to jointly denoise
+future video latents and actions, conditioning on the current two-camera image.
+Set ``actor.model.action_horizon=16 actor.model.num_action_chunks=5`` to predict
+16 actions, execute the first five, and replan from the new observation.
+The prediction horizon must be divisible by the video VAE's temporal compression factor.
+With the Cosmos simulator, forward dynamics receives the full plan and the environment
+advances to the last executed frame. GRPO adds exploration noise to the ten action
+channels and scores the executed prefix using the saved video and action latents.
+The environment worker denormalizes each 10D action and converts its 6D rotation
+to axis-angle for LIBERO's 7D controller. The actor syncs its updated weights
+to rollout. GPU assignment for the actor, rollout, and LIBERO rendering follows
+``cluster.component_placement``. Set
 ``runner.val_check_interval`` to a positive number to evaluate during training.
 To change the suite for both training and evaluation, override
 ``env.train.task_suite_name``, for example with ``libero_goal``.

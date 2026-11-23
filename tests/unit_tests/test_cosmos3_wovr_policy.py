@@ -51,13 +51,22 @@ class TinyOmni(nn.Module):
     def _prepare_inference_data(self, data_batch, seed, has_negative_prompt):
         self.batches.append(data_batch)
         assert not has_negative_prompt
-        assert data_batch["video"][0][0].shape[1] == 1
+        video = data_batch["video"][0][0]
         actions = data_batch["action"][0][0]
-        vision = torch.tensor([data_batch["video"][0][0].float().mean(), 0.25])
+        plan = data_batch["sequence_plan"][0]
+        assert data_batch["mode"] == [plan.mode] == ["wam"]
+        assert plan.video_length == video.shape[1] == actions.shape[0] + 1
+        assert plan.action_length == actions.shape[0]
+        # Two channels, each with a conditioned observation and a future latent.
+        vision = torch.tensor([video[:, 0].float().mean(), 0.0, 0.25, 0.0])
+        vision_mask = torch.tensor([1.0, 0.0, 1.0, 0.0])
         generator = torch.Generator().manual_seed(seed[0])
+        initial_vision = vision + (1 - vision_mask) * torch.randn(
+            4, generator=generator
+        )
         initial_action = torch.randn(actions.shape, generator=generator)
         initial_action[:, 10:] = 0
-        initial = torch.cat([vision, initial_action.flatten()])
+        initial = torch.cat([initial_vision, initial_action.flatten()])
         return (
             data_batch["sequence_plan"],
             SimpleNamespace(x0_tokens_action=[actions]),
@@ -65,7 +74,7 @@ class TinyOmni(nn.Module):
             [[0]],
             [initial],
             [torch.cat([vision, torch.zeros(actions.numel())])],
-            [torch.cat([torch.ones(2), torch.zeros(actions.numel())])],
+            [torch.cat([vision_mask, torch.zeros(actions.numel())])],
             True,
         )
 
@@ -82,12 +91,19 @@ class TinyOmni(nn.Module):
     ):
         assert has_noisy_actions
         assert timestep.shape == (1, 1)
-        assert sequence_plans[0].mode == "policy"
-        action = noise_x[0][2:].reshape_as(gen_data_clean.x0_tokens_action[0])
+        assert sequence_plans[0].mode == "wam"
+        vision = noise_x[0][:4].reshape(2, 2)
+        action = noise_x[0][4:].reshape_as(gen_data_clean.x0_tokens_action[0])
         assert torch.count_nonzero(action[:, 10:]) == 0
-        velocity = net(action[:, :10].to(net.weight.dtype)) + text_tokens[0][0] * 0.03
+        velocity = (
+            net(action[:, :10].to(net.weight.dtype))
+            + vision[:, 1].mean() * 0.3
+            + text_tokens[0][0] * 0.03
+        )
         padded = torch.nn.functional.pad(velocity, (0, 2))
-        return [torch.cat([torch.zeros(2), padded.flatten()])]
+        video_velocity = torch.zeros_like(vision)
+        video_velocity[:, 1] = vision[:, 1] + action[:, :10].mean()
+        return [torch.cat([video_velocity.flatten(), padded.flatten()])]
 
     def generate_samples_from_batch(self, batch, **kwargs):
         self.batches.append(batch)
@@ -124,7 +140,7 @@ def native_sdk(monkeypatch):
         caption_key = "ai_caption"
 
         def __call__(self, value):
-            assert value["video_num_frames"] == 5
+            assert value["video_num_frames"] == value["video"].shape[1]
             return value
 
     modules["json_formatter"] = {"ActionPromptJsonFormatter": Formatter}
@@ -138,6 +154,15 @@ def native_sdk(monkeypatch):
 def policy(native_sdk):
     return Cosmos3WoVRPolicy(
         TinyOmni(), num_action_chunks=4, num_inference_steps=3, noise_std=0.2
+    )
+
+
+@pytest.fixture
+def prefix_policy(native_sdk):
+    omni = TinyOmni()
+    omni.tokenizer_vision_gen = SimpleNamespace(temporal_compression_factor=4)
+    return Cosmos3WoVRPolicy(
+        omni, action_horizon=16, num_action_chunks=5, num_inference_steps=3
     )
 
 
@@ -211,6 +236,66 @@ def test_libero_both_cameras_are_used_for_sampling_and_replay(native_sdk):
     obs["wrist_images"] = wrist[:1]
     with pytest.raises(ValueError, match="matching uint8 LIBERO cameras"):
         policy.predict_action_batch(obs)
+
+
+def test_execution_prefix_matches_full_plan_and_replays(prefix_policy, image):
+    full_policy = Cosmos3WoVRPolicy(
+        prefix_policy.omni,
+        action_horizon=16,
+        num_action_chunks=16,
+        num_inference_steps=3,
+    )
+    obs = observations(image, batch_size=1)
+    torch.manual_seed(41)
+    full_actions, full_record = full_policy.predict_action_batch(obs)
+    torch.manual_seed(41)
+    actions, record = prefix_policy.predict_action_batch(obs)
+
+    assert full_actions.shape == (1, 16, 10)
+    assert prefix_policy.omni.batches[-1]["sequence_plan"][0].video_length == 17
+    torch.testing.assert_close(actions, full_actions[:, :5])
+    torch.testing.assert_close(record["forward_inputs"]["action"], actions.flatten(1))
+    torch.testing.assert_close(
+        record["prev_logprobs"], full_record["prev_logprobs"][:, :5]
+    )
+    torch.testing.assert_close(
+        record["forward_inputs"]["state_before"],
+        full_record["forward_inputs"]["state_before"],
+    )
+    replay = prefix_policy(
+        forward_inputs=record["forward_inputs"], compute_entropy=True
+    )
+    torch.testing.assert_close(replay["logprobs"], record["prev_logprobs"])
+    assert replay["entropy"].shape == (1, 5, 10)
+
+
+def test_wam_denoises_future_video_and_replays_its_selected_state(
+    policy, image, monkeypatch
+):
+    policy.guidance_scale = 1
+    states = []
+    get_velocity = policy.omni._get_velocity
+
+    def record_velocity(**kwargs):
+        states.append(kwargs["noise_x"][0].detach().clone())
+        return get_velocity(**kwargs)
+
+    monkeypatch.setattr(policy.omni, "_get_velocity", record_velocity)
+    _, rollout = policy.predict_action_batch(observations(image, batch_size=1))
+    assert len(states) == policy.num_inference_steps
+    vision = torch.stack(states)[:, :4].reshape(-1, 2, 2)
+    observed = vision[:, :, 0]
+    torch.testing.assert_close(observed, observed[0].expand_as(observed))
+    assert not torch.equal(vision[0, :, 1], vision[-1, :, 1])
+
+    inputs = rollout["forward_inputs"]
+    replay = policy(forward_inputs=inputs)
+    torch.testing.assert_close(states[-1], states[inputs["denoise_index"].item()])
+    torch.testing.assert_close(replay["logprobs"], rollout["prev_logprobs"])
+    # Changing only the saved future video must change action likelihoods.
+    inputs["state_before"][0, 1] += 1
+    changed = policy(forward_inputs=inputs)
+    assert not torch.allclose(changed["logprobs"], rollout["prev_logprobs"])
 
 
 def test_standard_grpo_update_and_weight_publication(policy, image):
@@ -357,6 +442,10 @@ def test_checkpoint_vae_and_patch_geometry_are_validated(native_sdk, image):
     omni.config.diffusion_expert_config = SimpleNamespace(patch_spatial=2)
     with pytest.raises(ValueError, match="temporal factor 4"):
         Cosmos3WoVRPolicy(omni, num_action_chunks=2)
+    with pytest.raises(ValueError, match="action_horizon"):
+        Cosmos3WoVRPolicy(omni, action_horizon=4, num_action_chunks=5)
+    with pytest.raises(ValueError, match="temporal factor 4"):
+        Cosmos3WoVRPolicy(omni, action_horizon=5, num_action_chunks=4)
     policy = Cosmos3WoVRPolicy(omni, num_action_chunks=4)
     with pytest.raises(ValueError, match="multiples of 32"):
         policy.predict_action_batch(observations(image))
