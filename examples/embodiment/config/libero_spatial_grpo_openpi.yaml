@@ -34,7 +34,7 @@ runner:
   save_interval: 40
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  ckpt_path: /mnt/public/hongzhi/flow-cps-test/RLinf/logs/20261113-13:33:35-libero_sft_openpi/test_openpi/checkpoints/global_step_2000/actor/model_state_dict/full_weights.pt  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   normalize_advantages: True
@@ -97,7 +97,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path: /mnt/public/hongzhi/models/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     precision: ${actor.model.precision}
 
 actor:
@@ -110,7 +110,7 @@ actor:
 
   # Override the default values in model/pi0
   model:
-    model_path: "/path/to/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    model_path: /mnt/public/hongzhi/models/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     num_action_chunks: 5 # interface for the env
 
   optim:

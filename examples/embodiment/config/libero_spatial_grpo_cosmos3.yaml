@@ -41,17 +41,17 @@ algorithm:
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
   reward_coef: 1.0
-  reward_type: action_level
-  logprob_type: action_level
-  entropy_type: action_level
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
   update_epoch: 1
   adv_type: grpo
   loss_type: actor
   loss_agg_func: "token-mean" 
   kl_beta: 0.0
   entropy_bonus: 0
-  clip_ratio_high: 0.2
-  clip_ratio_low: 0.2
+  clip_ratio_high: 0.1
+  clip_ratio_low: 0.1
   clip_ratio_c: 3.0
 
   gamma: 0.99
@@ -68,12 +68,11 @@ env:
     rollout_epoch: 4
     total_num_envs: 128
     group_size: ${algorithm.group_size}
-    seed: ${actor.seed}
-    reset_gripper_open: false
+    # seed: ${actor.seed}
     action_stats_path: /mnt/public/hongzhi/cosmos-sft/cosmos-framework/cosmos_framework/data/generator/action/normalizer_stats/libero_native_frame_wise_relative_rot6d.json
     action_normalization: quantile_rot
     video_cfg:
-      save_video: false
+      save_video: true
   eval:
     task_suite_name: ${env.train.task_suite_name}
     total_num_envs: ${env.train.total_num_envs}
@@ -103,21 +102,21 @@ actor:
   group_name: ActorGroup
   training_backend: fsdp
   seed: 1140
-  micro_batch_size: 16
-  global_batch_size: 1024
+  micro_batch_size: 40
+  global_batch_size: 640
   model:
     model_type: cosmos3
     wovr:
       enabled: true
-      lora_enabled: false  # True trains only generation Q/K/V/O adapters; false uses the train_* flags.
+      lora_enabled: true  # True trains only generation Q/K/V/O adapters; false uses the train_* flags.
       lora_rank: 16
       lora_alpha: 32
-    model_path: /mnt/public/hongzhi/cosmos-simulator-policy/exports/edge-20261113-115839/global_step_2000/model_hf
+    model_path: /mnt/public/hongzhi/cosmos-simulator-policy/exports/edge-20261113-115839/global_step_3000/model_hf
     native_config_path: null
     precision: bf16
     is_lora: false
     action_horizon: 16  # Actions predicted per WAM sample.
-    num_action_chunks: 5
+    num_action_chunks: 16
     action_dim: 10
     raw_action_dim: ${.action_dim}
     num_inference_steps: 4
@@ -125,8 +124,8 @@ actor:
     image_size: [192, 320]
     fps: 20
     guidance_scale: 1.0 # 1.5
-    noise_std: 0.1
-    shift: 10.0
+    noise_std: 0.3
+    shift: 1
     # By default GRPO updates only the transformer generation expert.
     train_dit_backbone: true
     train_action_input_projection: false  # action2llm
@@ -135,10 +134,10 @@ actor:
     train_time_embedder: false
     keys_to_select: []
   optim:
-    lr: 1.0e-6
+    lr: 5e-5 # 5.0e-6
     use_fp32_master_params: true
     adam_beta1: 0.9
-    adam_beta2: 0.999
+    adam_beta2: 0.95
     adam_eps: 1.0e-8
     weight_decay: 0.01
     clip_grad: 1.0
