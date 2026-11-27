@@ -35,6 +35,61 @@ _MODULE_TRAIN_FLAGS = {
     "action_modality_embed": "train_action_modality_embedding",
     "time_embedder": "train_time_embedder",
 }
+_LORA_PROJECTIONS = (
+    "q_proj_moe_gen",
+    "k_proj_moe_gen",
+    "v_proj_moe_gen",
+    "o_proj_moe_gen",
+)
+
+
+def _configure_wovr_lora(net: nn.Module, wovr_cfg: Mapping[str, Any]) -> None:
+    """Attach native Cosmos adapters to the loaded, still-unsharded WAM backbone."""
+    from cosmos_framework.utils.generator.lora import (
+        LoraInjectedLinear,
+        init_lora_weights_post_materialization,
+    )
+
+    rank = wovr_cfg.get("lora_rank", 16)
+    alpha = wovr_cfg.get("lora_alpha", 32)
+    for name, value in (("lora_rank", rank), ("lora_alpha", alpha)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    attention_layers = [
+        module
+        for module in net.language_model.modules()
+        if any(hasattr(module, name) for name in _LORA_PROJECTIONS)
+    ]
+    if not attention_layers:
+        raise ValueError("No generation Q/K/V/O projections in this Cosmos backbone")
+
+    net.requires_grad_(False)
+    for attention in attention_layers:
+        for name in _LORA_PROJECTIONS:
+            layer = getattr(attention, name, None)
+            if not isinstance(layer, nn.Linear):
+                raise ValueError(
+                    f"Expected a linear Cosmos generation projection {name}"
+                )
+            if isinstance(layer, LoraInjectedLinear):
+                if (
+                    layer.lora_A.out_features != rank
+                    or layer._lora_scale != alpha / rank
+                ):
+                    raise ValueError(
+                        f"Checkpoint LoRA rank or alpha differs for {name}"
+                    )
+            else:
+                # The native loader requires all checkpoint keys. Attach after loading
+                # and materialize only A/B: to_empty on the wrapper would erase W.
+                layer = LoraInjectedLinear(layer, rank, alpha)
+                layer.lora_A.to_empty(device=layer.weight.device)
+                layer.lora_B.to_empty(device=layer.weight.device)
+                init_lora_weights_post_materialization(layer)
+                setattr(attention, name, layer)
+            layer.lora_A.requires_grad_(True)
+            layer.lora_B.requires_grad_(True)
 
 
 def _enable_policy_gradients(net: nn.Module, model_cfg: Mapping[str, Any]) -> None:
@@ -317,7 +372,12 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
 
         _promote_scalar_params_to_1d(omni)
         omni.requires_grad_(False)
-        if not for_simulation:
+        wovr_cfg = model_cfg.get("wovr", {})
+        if wovr_cfg.get("lora_enabled", False):
+            if model_cfg.get("is_lora", False):
+                raise ValueError("Choose native wovr.lora_enabled or generic is_lora")
+            _configure_wovr_lora(omni.net, wovr_cfg)
+        elif not for_simulation:
             _enable_policy_gradients(omni.net, model_cfg)
         options = {
             key: model_cfg[key]

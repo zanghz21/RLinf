@@ -55,6 +55,9 @@ actor:
     model_type: cosmos3
     wovr:
       enabled: true
+      lora_enabled: false  # True trains only generation Q/K/V/O adapters; false uses the train_* flags.
+      lora_rank: 16
+      lora_alpha: 32
     model_path: /path/to/cosmos3-libero-native
     native_config_path: null
     precision: bf16

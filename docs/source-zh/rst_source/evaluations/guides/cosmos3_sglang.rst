@@ -276,6 +276,12 @@ LeRobot v2 数据集和训练好的 RLinf ResNet 奖励权重。原生模型的 
 两套配置都将以上四个模块的开关显式设为 ``false``。即使名称匹配
 ``actor.model.keys_to_select``，也需要打开对应开关才会训练该模块。
 
+设置 ``actor.model.wovr.lora_enabled=true``，只训练生成专家查询、键、值和输出投影上的
+Cosmos 原生 LoRA 适配器。该模式冻结基础权重和动作头，优先于 ``train_*`` 开关。
+通用 PEFT 开关保留为 ``actor.model.is_lora=false``。默认使用
+``actor.model.wovr.lora_rank=16`` 和 ``actor.model.wovr.lora_alpha=32``。
+恢复 RLinf checkpoint 时，使用与保存时相同的训练模式、rank 和 alpha。
+
 默认 ``cosmos.share_weights=true``。每到权重同步点，actor 会在下一次采样前把权重发送给 rollout
 和 simulator。各 worker 持有自己的推理副本。要固定 simulator 权重，请在同一启动命令中追加以下覆盖项。
 若独立权重另有原生配置文件，可指定 ``cosmos.simulator.native_config_path``。

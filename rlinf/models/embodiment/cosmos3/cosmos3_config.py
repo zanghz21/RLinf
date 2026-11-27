@@ -40,9 +40,16 @@ logger = get_logger()
 
 def configure_native_rl_envs(cfg: DictConfig, policy: DictConfig) -> None:
     """Validate native action routing and resolve any Cosmos dynamics replicas."""
-    if cfg.runner.get("resume_dir") and cfg.weight_syncer.type == "patch":
-        # Rollout starts from the base export. Establish the restored actor as
-        # its first patch baseline before sending incremental updates.
+    native_lora = policy.wovr.get("lora_enabled", False)
+    if type(native_lora) is not bool:
+        raise ValueError("wovr.lora_enabled must be a boolean")
+    if native_lora and policy.get("is_lora", False):
+        raise ValueError("Choose native wovr.lora_enabled or generic is_lora")
+    if (
+        cfg.runner.get("resume_dir") or native_lora
+    ) and cfg.weight_syncer.type == "patch":
+        # Restored weights and newly initialized LoRA adapters both need an
+        # identical starting point on actor and rollout before incremental patches.
         cfg.weight_syncer.patch.init_sync.enabled = True
         cfg.weight_syncer.patch.init_sync.prefixes = None
     simulators = []
@@ -81,6 +88,8 @@ def configure_native_rl_envs(cfg: DictConfig, policy: DictConfig) -> None:
     model = OmegaConf.create(OmegaConf.to_container(policy, resolve=True))
     if not shared:
         model.model_path = simulator_path
+        if native_lora:
+            model.wovr.lora_enabled = False
         # A separate export can supply its own config.json next to the weights.
         model.native_config_path = native_config
     for env in simulators:

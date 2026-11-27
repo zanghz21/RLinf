@@ -296,6 +296,14 @@ For example, to train only the action output projection, set
 Both recipes explicitly disable the four modules above, even when a name matches
 ``actor.model.keys_to_select``. Turn on the corresponding switch to include one.
 
+Set ``actor.model.wovr.lora_enabled=true`` to train only native Cosmos LoRA
+adapters on the generation expert's query, key, value and output projections.
+This mode freezes the base weights and action heads and takes precedence over
+the ``train_*`` flags. Keep the generic PEFT switch ``actor.model.is_lora=false``.
+The defaults are ``actor.model.wovr.lora_rank=16`` and
+``actor.model.wovr.lora_alpha=32``. Use the same mode, rank and alpha when
+resuming from an RLinf checkpoint.
+
 With ``cosmos.share_weights=true``, the actor publishes updated weights to both the
 rollout and simulator workers before the next scheduled rollout. The simulator
 holds its own inference replica. To train against a fixed simulator, append the

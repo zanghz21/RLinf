@@ -24,7 +24,7 @@ from torch.distributed.fsdp import (
 )
 from torch.optim import Optimizer
 
-from rlinf.hybrid_engines.fsdp import FSDP, CPUOffload
+from rlinf.hybrid_engines.fsdp import FSDP, CPUOffload, ShardingStrategy
 from rlinf.hybrid_engines.fsdp.compat import apply_buffer_dtype_compatibility
 from rlinf.hybrid_engines.fsdp.mixed_precision import (
     build_mixed_precision,
@@ -179,8 +179,16 @@ class FSDPStrategy(FSDPStrategyBase):
 
         cpu_offload = CPUOffload(offload_params=self.cfg.fsdp_config.cpu_offload)
 
+        ignored_states = None
+        if self.cfg.model.get("wovr", {}).get("lora_enabled", False) and (
+            sharding_strategy == ShardingStrategy.NO_SHARD or self.world_size == 1
+        ):
+            # NO_SHARD already replicates the frozen base. Keeping it outside
+            # flat parameters preserves its state-dict entries after backward.
+            ignored_states = [p for p in model.parameters() if not p.requires_grad]
         fsdp_model = FSDP(
             module=model,
+            ignored_states=ignored_states,
             param_init_fn=init_fn,
             auto_wrap_policy=auto_wrap_policy,
             device_id=int(os.environ["LOCAL_RANK"]),

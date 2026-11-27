@@ -109,6 +109,9 @@ actor:
     model_type: cosmos3
     wovr:
       enabled: true
+      lora_enabled: false  # True trains only generation Q/K/V/O adapters; false uses the train_* flags.
+      lora_rank: 16
+      lora_alpha: 32
     model_path: /mnt/public/hongzhi/cosmos-simulator-policy/exports/edge-20261113-115839/global_step_2000/model_hf
     native_config_path: null
     precision: bf16

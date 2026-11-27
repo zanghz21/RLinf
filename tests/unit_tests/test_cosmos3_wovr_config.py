@@ -42,6 +42,7 @@ def test_embodied_config_routes_cosmos_weights(wovr_recipe, shared):
     overrides = [
         "actor.model.model_path=policy",
         "actor.model.native_config_path=policy.json",
+        "actor.model.wovr.lora_enabled=true",
     ]
     if not shared:
         overrides += [
@@ -60,6 +61,7 @@ def test_embodied_config_routes_cosmos_weights(wovr_recipe, shared):
     assert cfg.actor.model.train_time_embedder is False
     assert cfg.env.train.backend == "cosmos3"
     assert cfg.env.train.share_weights is shared
+    assert cfg.env.train.model_cfg.wovr.lora_enabled is shared
     assert cfg.rollout.model.model_path == "policy"
     assert cfg.env.train.model_cfg.model_path == ("policy" if shared else "dynamics")
     assert cfg.env.train.model_cfg.native_config_path == (
@@ -95,11 +97,13 @@ def test_native_libero_grpo_recipe(wovr_recipe):
             "actor.model.model_path=policy",
             "env.train.action_stats_path=stats.json",
             "runner.val_check_interval=1",
+            "actor.model.wovr.lora_enabled=false",
             "actor.model.train_action_output_projection=true",
             config_name="libero_spatial_grpo_cosmos3",
         )
     )
     assert cfg.actor.model.wovr.enabled and cfg.actor.model.action_dim == 10
+    assert not cfg.actor.model.wovr.lora_enabled
     assert cfg.actor.model.train_dit_backbone is True
     assert cfg.actor.model.train_action_output_projection is True
     assert cfg.rollout.model.model_path == "policy"
@@ -122,6 +126,10 @@ def test_native_libero_grpo_recipe(wovr_recipe):
     [
         ("actor.model.action_dim=7", "10D policy actions"),
         ("env.train.action_stats_path=null", "env.train.action_stats_path"),
+        (
+            "actor.model.wovr.lora_enabled=invalid",
+            "wovr.lora_enabled must be a boolean",
+        ),
     ],
 )
 def test_invalid_native_libero_config(wovr_recipe, override, message):
@@ -129,10 +137,17 @@ def test_invalid_native_libero_config(wovr_recipe, override, message):
         validate_cfg(wovr_recipe(override, config_name="libero_spatial_grpo_cosmos3"))
 
 
-def test_resumed_native_libero_rollout_starts_from_the_full_actor(wovr_recipe):
+@pytest.mark.parametrize(
+    "override",
+    [
+        "runner.resume_dir=/run/checkpoints/global_step_3",
+        "actor.model.wovr.lora_enabled=true",
+    ],
+)
+def test_native_libero_rollout_starts_from_the_full_actor(wovr_recipe, override):
     cfg = validate_cfg(
         wovr_recipe(
-            "runner.resume_dir=/run/checkpoints/global_step_3",
+            override,
             "weight_syncer=patch_syncer",
             "weight_syncer.patch.init_sync.enabled=false",
             "weight_syncer.patch.init_sync.prefixes=[value_head]",

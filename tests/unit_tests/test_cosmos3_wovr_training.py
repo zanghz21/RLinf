@@ -35,6 +35,7 @@ from test_cosmos3_wovr_policy import native_sdk as native_sdk
 from test_cosmos3_wovr_policy import observations
 from test_cosmos3_wovr_policy import policy as policy
 from test_cosmos3_wovr_policy import prefix_policy as prefix_policy
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
 
 from rlinf.config import validate_cfg
@@ -61,6 +62,50 @@ def single_rank_gloo(tmp_path):
         yield
     finally:
         dist.destroy_process_group()
+
+
+def test_no_shard_actor_preserves_frozen_weights_after_lora_update(
+    single_rank_gloo, request, monkeypatch
+):
+    from test_cosmos3_wovr_lora import TinyGenerator
+
+    from rlinf.models.embodiment.cosmos3.wovr_policy import _configure_wovr_lora
+
+    actor = request.getfixturevalue("wovr_recipe")(
+        "actor.model.wovr.lora_enabled=true",
+        "actor.model.wovr.lora_rank=2",
+        "actor.fsdp_config.mixed_precision.param_dtype=fp32",
+        config_name="libero_spatial_grpo_cosmos3",
+    ).actor
+
+    def wrap_on_cpu(**kwargs):
+        kwargs.update(device_id=torch.device("cpu"), sync_module_states=False)
+        return FullyShardedDataParallel(**kwargs)
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr("rlinf.hybrid_engines.fsdp.strategy.fsdp.FSDP", wrap_on_cpu)
+    net = TinyGenerator()
+    _configure_wovr_lora(net, actor.model.wovr)
+    before = {name: p.detach().clone() for name, p in net.named_parameters()}
+    strategy = FSDPStrategy(actor, world_size=1)
+    model = strategy.wrap_model(net, init_device_mesh("cpu", (1,)))
+    assert sum(isinstance(m, FullyShardedDataParallel) for m in model.modules()) >= 2
+    optimizer = torch.optim.SGD(
+        (p for p in model.parameters() if p.requires_grad), lr=0.1
+    )
+    model(torch.ones(4)).sum().backward()
+    optimizer.step()
+
+    # This is the same state dict the actor publishes to rollout.
+    after = strategy.get_model_state_dict(
+        model, cpu_offload=False, full_state_dict=False
+    )
+    assert after.keys() == before.keys()
+    for name, original in before.items():
+        if name.endswith("lora_B.weight"):
+            assert not torch.equal(after[name], original)
+        else:
+            torch.testing.assert_close(after[name], original, rtol=0, atol=0)
 
 
 def test_world_model_rollout_trains_standard_fsdp_actor(
