@@ -121,6 +121,7 @@ actor:
     action_dim: 10
     raw_action_dim: ${.action_dim}
     num_inference_steps: 4
+    rollout_batch_size: 16  # Observations per WAM forward on each rollout GPU.
     image_size: [192, 320]
     fps: 20
     guidance_scale: 1.0 # 1.5

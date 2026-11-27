@@ -19,7 +19,8 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +29,7 @@ import torch
 from torch import nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 
 _MODULE_TRAIN_FLAGS = {
     "action2llm": "train_action_input_projection",
@@ -90,6 +92,17 @@ def _configure_wovr_lora(net: nn.Module, wovr_cfg: Mapping[str, Any]) -> None:
                 setattr(attention, name, layer)
             layer.lora_A.requires_grad_(True)
             layer.lora_B.requires_grad_(True)
+
+
+def _embed_distinct_timesteps(
+    embed: Callable[[torch.Tensor], torch.Tensor], times: torch.Tensor
+) -> torch.Tensor:
+    """Use the SDK's single-timestep MLP for each distinct WAM noise level."""
+    if times.numel() <= 1:
+        return embed(times)
+    unique, inverse = torch.unique(times, return_inverse=True)
+    values = torch.cat([embed(t.reshape(1)) for t in unique.unbind()])
+    return values[inverse]
 
 
 def _enable_policy_gradients(net: nn.Module, model_cfg: Mapping[str, Any]) -> None:
@@ -164,6 +177,7 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         num_action_chunks: int = 16,
         action_horizon: int | None = None,
         num_inference_steps: int = 30,
+        rollout_batch_size: int = 1,
         raw_action_dim: int = 10,
         fps: int = 20,
         action_fps: float = 20.0,
@@ -183,6 +197,7 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
             ("num_action_chunks", num_action_chunks),
             ("action_horizon", action_horizon),
             ("num_inference_steps", num_inference_steps),
+            ("rollout_batch_size", rollout_batch_size),
             ("fps", fps),
             ("max_prompt_bytes", max_prompt_bytes),
         ):
@@ -248,6 +263,7 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         self.action_horizon = action_horizon
         self.num_action_chunks = num_action_chunks
         self.num_inference_steps = num_inference_steps
+        self.rollout_batch_size = rollout_batch_size
         self.raw_action_dim = raw_action_dim
         self.fps = fps
         self.action_fps = action_fps
@@ -379,12 +395,22 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
             _configure_wovr_lora(omni.net, wovr_cfg)
         elif not for_simulation:
             _enable_policy_gradients(omni.net, model_cfg)
+        if not for_simulation:
+            # Uniform rollout timesteps use a one-row MLP in the native SDK.
+            # Apply the same kernel to mixed actor timesteps, with gradients and
+            # original parameter names preserved for FSDP and weight sync.
+            time_embedder = getattr(omni.net, "time_embedder", None)
+            if time_embedder is not None:
+                time_embedder.forward = partial(
+                    _embed_distinct_timesteps, time_embedder.forward
+                )
         options = {
             key: model_cfg[key]
             for key in (
                 "num_action_chunks",
                 "action_horizon",
                 "num_inference_steps",
+                "rollout_batch_size",
                 "raw_action_dim",
                 "fps",
                 "action_fps",
@@ -487,28 +513,37 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         }
 
     @torch.no_grad()
-    def _prepare(self, image: np.ndarray, prompt: str, seed: int) -> tuple:
+    def _prepare(
+        self, images: np.ndarray, prompts: list[str], seeds: list[int]
+    ) -> tuple:
         if self.for_simulation:
             raise ValueError(
                 "A simulator-only Cosmos model cannot sample or score policy actions"
             )
+        samples = [
+            self._build_batch(image, prompt)
+            for image, prompt in zip(images, prompts, strict=True)
+        ]
+        # Concatenate the outer batch axis, preserving each sample's list of streams.
+        batch = samples[0] if len(samples) == 1 else cat_list_of_dict_tensor(samples)
         with self._device_context():
             prepared = self.omni._prepare_inference_data(
-                self._build_batch(image, prompt), seed=[seed], has_negative_prompt=False
+                batch, seed=seeds, has_negative_prompt=False
             )
         plans, clean, _, _, noise, _, masks, has_actions = prepared
-        if len(plans) != 1 or not has_actions or len(noise) != 1:
-            raise ValueError("Expected a single action-policy sample from Cosmos")
-        if clean.x0_tokens_action is None or len(clean.x0_tokens_action) != 1:
+        if len(plans) != len(seeds) or not has_actions or len(noise) != len(seeds):
+            raise ValueError("Expected one Cosmos action-policy sample per observation")
+        if clean.x0_tokens_action is None or len(clean.x0_tokens_action) != len(seeds):
             raise ValueError("Cosmos policy sample is missing action tokens")
-        shape = tuple(clean.x0_tokens_action[0].shape)
-        if shape != (self.action_horizon, self.omni.config.max_action_dim):
-            raise ValueError(f"Unexpected Cosmos action token shape {shape}")
-        action_size = clean.x0_tokens_action[0].numel()
-        vision_mask, action_mask = masks[0].split(
-            [noise[0].numel() - action_size, action_size]
+        shape = (self.action_horizon, self.omni.config.max_action_dim)
+        for tokens in clean.x0_tokens_action:
+            if tokens.shape != shape:
+                raise ValueError(f"Unexpected Cosmos action token shape {tokens.shape}")
+        action_size = math.prod(shape)
+        vision_mask, action_mask = torch.stack(masks).split(
+            [noise[0].numel() - action_size, action_size], dim=-1
         )
-        if not (torch.any(vision_mask == 1) and torch.any(vision_mask == 0)):
+        if not ((vision_mask == 1).any(dim=1) & (vision_mask == 0).any(dim=1)).all():
             raise ValueError(
                 "Cosmos WAM requires both observed and future vision tokens"
             )
@@ -519,8 +554,9 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
     def _action_view(self, state: torch.Tensor) -> torch.Tensor:
         """Native LIBERO channels in a packed Cosmos [vision | padded action] state."""
         width = self.omni.config.max_action_dim
-        return state[-self.action_horizon * width :].view(self.action_horizon, width)[
-            :, : self.raw_action_dim
+        actions = state[..., -self.action_horizon * width :]
+        return actions.unflatten(-1, (self.action_horizon, width))[
+            ..., : self.raw_action_dim
         ]
 
     def _schedule(self) -> torch.Tensor:
@@ -528,32 +564,39 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         return self.shift * time / (1 + (self.shift - 1) * time)
 
     def _velocity(
-        self, prepared: tuple, state: torch.Tensor, sigma: float
+        self,
+        prepared: tuple,
+        states: torch.Tensor,
+        sigma: float | torch.Tensor,
     ) -> torch.Tensor:
         plans, clean, tokens, uncond_tokens, _, _, _, has_actions = prepared
-        timestep = torch.tensor(
-            [
-                [
-                    sigma
-                    * self.omni.config.rectified_flow_inference_config.num_train_timesteps
-                ]
-            ],
-            dtype=torch.float32,
-            device=self.device,
+        batch_size = len(plans)
+        # Native BF16 kernels can round a singleton differently from a packed
+        # sequence. A second independent attention segment keeps tail batches
+        # on the multi-sample path. Only the real row contributes to the loss.
+        if batch_size == 1 and hasattr(self.omni, "_duplicate_gen_data_clean"):
+            clean = self.omni._duplicate_gen_data_clean(clean)
+            plans, tokens, uncond_tokens = plans * 2, tokens * 2, uncond_tokens * 2
+            states = states.expand(2, -1)
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.device)
+        timestep = sigma.expand(len(plans)).reshape(-1, 1) * (
+            self.omni.config.rectified_flow_inference_config.num_train_timesteps
         )
 
         def predict(text: list[list[int]]) -> torch.Tensor:
             with self._device_context():
                 result = self.omni._get_velocity(
                     net=self.omni.net,
-                    noise_x=[state],
+                    noise_x=list(states.unbind()),
                     timestep=timestep,
                     text_tokens=text,
                     sequence_plans=plans,
                     gen_data_clean=clean,
                     has_noisy_actions=has_actions,
-                )[0]
-            return result.float()
+                )
+            if batch_size == 1:
+                return result[0].float().unsqueeze(0)
+            return torch.stack(result).float()
 
         conditional = predict(tokens)
         if self.guidance_scale == 1:
@@ -562,42 +605,67 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         return unconditional + self.guidance_scale * (conditional - unconditional)
 
     @torch.no_grad()
-    def _sample_transition(
-        self, image: np.ndarray, prompt: str, seed: int, selected_step: int
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Jointly denoise video and actions, retaining one transition for PPO."""
-        self.eval()
-        prepared = self._prepare(image, prompt, seed)
-        state = prepared[4][0]
-        # An independent stream avoids reusing the initial state's Gaussian draw.
-        generator = torch.Generator(device=self.device).manual_seed(seed + 1)
+    def _sample_transitions(
+        self,
+        images: np.ndarray,
+        prompts: list[str],
+        seeds: list[int],
+        selected_steps: list[int],
+    ) -> dict[str, torch.Tensor]:
+        """Run each WAM step for the batch and retain one transition per sample."""
+        prepared = self._prepare(images, prompts, seeds)
+        state = torch.stack(prepared[4])
+        # Each sample retains its exploration stream when the rollout batch size changes.
+        generators = [
+            torch.Generator(device=self.device).manual_seed(seed + 1) for seed in seeds
+        ]
         schedule = self._schedule().tolist()
-        transition = {}
+        before = torch.empty_like(state)
+        after = state.new_empty(
+            (len(seeds), self.num_action_chunks, self.raw_action_dim)
+        )
+        logprobs = torch.empty_like(after)
         for step, (sigma, next_sigma) in enumerate(
             zip(schedule[:-1], schedule[1:], strict=True)
         ):
-            if step == selected_step:
-                transition["state_before"] = state.to(device="cpu", copy=True)
+            rows = [
+                row for row, selected in enumerate(selected_steps) if selected == step
+            ]
+            if rows:
+                before[rows] = state[rows]
             dt = sigma - next_sigma
             # The SDK zeros velocities for the observed frame and action padding.
-            state = state - dt * self._velocity(prepared, state, sigma)
+            velocity = self._velocity(prepared, state, sigma)
+            state = state - dt * velocity
             mean = self._action_view(state)
             std = self.noise_std * math.sqrt(dt)
-            action = mean + std * torch.randn(
-                mean.shape, device=self.device, dtype=torch.float32, generator=generator
+            noise = torch.stack(
+                [
+                    torch.randn(
+                        mean.shape[1:],
+                        device=self.device,
+                        dtype=torch.float32,
+                        generator=generator,
+                    )
+                    for generator in generators
+                ]
             )
-            if step == selected_step:
-                executed = action[: self.num_action_chunks]
-                transition["state_after"] = executed.to(device="cpu", copy=True)
-                transition["logprobs"] = (
-                    torch.distributions.Normal(mean[: self.num_action_chunks], std)
-                    .log_prob(executed)
-                    .cpu()
-                )
+            action = mean + std * noise
+            if rows:
+                executed = action[rows, : self.num_action_chunks]
+                after[rows] = executed
+                logprobs[rows] = torch.distributions.Normal(
+                    mean[rows, : self.num_action_chunks], std
+                ).log_prob(executed)
             mean.copy_(action)
         if not torch.isfinite(state).all():
             raise FloatingPointError("Cosmos WAM generated nonfinite video or actions")
-        return self._action_view(state).cpu().contiguous(), transition
+        return {
+            "actions": self._action_view(state).cpu().contiguous(),
+            "state_before": before.cpu(),
+            "state_after": after.cpu(),
+            "prev_logprobs": logprobs.cpu(),
+        }
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         return BasePolicy.forward(self, forward_type=forward_type, **kwargs)
@@ -656,52 +724,44 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
                 )
         if forward_inputs["prompt_bytes"].shape != (batch_size, self.max_prompt_bytes):
             raise ValueError("Cosmos prompt byte width differs from max_prompt_bytes")
-        schedule = self._schedule().tolist()
-        logprobs, entropies = [], []
-        for row in range(batch_size):
-            step = int(forward_inputs["denoise_index"][row].item())
-            if not 0 <= step < self.num_inference_steps:
-                raise ValueError("denoise_index must address a stored transition")
-            length = int(forward_inputs["prompt_length"][row].item())
-            if not 0 < length <= self.max_prompt_bytes:
-                raise ValueError("Invalid Cosmos prompt length")
-            dt = schedule[step] - schedule[step + 1]
-            std = self.noise_std * math.sqrt(dt)
-            if compute_logprobs:
-                prompt = bytes(
-                    forward_inputs["prompt_bytes"][row, :length].cpu().tolist()
-                ).decode("utf-8")
-                prepared = self._prepare(
-                    forward_inputs["image"][row].detach().cpu().numpy(),
-                    prompt,
-                    int(forward_inputs["seed"][row].item()),
-                )
-                before = forward_inputs["state_before"][row].detach().to(self.device)
-                after = forward_inputs["state_after"][row].detach().to(self.device)
-                if before.shape != prepared[4][0].shape:
-                    raise ValueError(
-                        "Stored WAM state shape differs from the prepared sample"
-                    )
-                velocity = self._velocity(prepared, before, schedule[step])
-                mean = self._action_view(before) - dt * self._action_view(velocity)
-                logprobs.append(
-                    torch.distributions.Normal(
-                        mean[: self.num_action_chunks], std
-                    ).log_prob(after)
-                )
-            if compute_entropy:
-                entropies.append(
-                    torch.full(
-                        expected[1:],
-                        float(torch.distributions.Normal(0.0, std).entropy()),
-                        device=self.device,
-                    )
-                )
+        steps = forward_inputs["denoise_index"].reshape(batch_size).to(self.device)
+        if ((steps < 0) | (steps >= self.num_inference_steps)).any():
+            raise ValueError("denoise_index must address a stored transition")
+        # Match the sampler's Python-float interval and scale before FP32 arithmetic.
+        schedule = self._schedule().to(device=self.device, dtype=torch.float64)
+        sigma = schedule[steps]
+        dt = (sigma - schedule[steps + 1]).view(-1, 1, 1)
+        std = (self.noise_std * dt.sqrt()).float()
         result = {}
         if compute_logprobs:
-            result["logprobs"] = torch.stack(logprobs)
+            lengths = forward_inputs["prompt_length"].reshape(batch_size).tolist()
+            if not all(0 < length <= self.max_prompt_bytes for length in lengths):
+                raise ValueError("Invalid Cosmos prompt length")
+            encoded = forward_inputs["prompt_bytes"].detach().cpu().numpy()
+            prompts = [
+                row[:length].tobytes().decode("utf-8")
+                for row, length in zip(encoded, lengths, strict=True)
+            ]
+            prepared = self._prepare(
+                forward_inputs["image"].detach().cpu().numpy(),
+                prompts,
+                forward_inputs["seed"].reshape(batch_size).tolist(),
+            )
+            before = forward_inputs["state_before"].detach().to(self.device)
+            after = forward_inputs["state_after"].detach().to(self.device)
+            if any(state.numel() != before.shape[1] for state in prepared[4]):
+                raise ValueError(
+                    "Stored WAM state shape differs from the prepared sample"
+                )
+            velocity = self._velocity(prepared, before, sigma.float())
+            mean = self._action_view(before) - dt.float() * self._action_view(velocity)
+            result["logprobs"] = torch.distributions.Normal(
+                mean[:, : self.num_action_chunks], std
+            ).log_prob(after)
         if compute_entropy:
-            result["entropy"] = torch.stack(entropies)
+            result["entropy"] = (
+                torch.distributions.Normal(0.0, std).entropy().expand(expected)
+            )
         return result
 
     @torch.no_grad()
@@ -765,20 +825,23 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
         indices = torch.randint(
             self.num_inference_steps, (batch_size,), dtype=torch.long
         )
-        actions, before, after, logprobs = [], [], [], []
-        for row in range(batch_size):
-            step = int(indices[row])
-            action, transition = self._sample_transition(
-                images[row].numpy(), prompts[row], int(seeds[row]), step
+        batches = []
+        self.eval()
+        for start in range(0, batch_size, self.rollout_batch_size):
+            rows = slice(start, start + self.rollout_batch_size)
+            batches.append(
+                self._sample_transitions(
+                    images[rows].numpy(),
+                    prompts[rows],
+                    seeds[rows].tolist(),
+                    indices[rows].tolist(),
+                )
             )
-            actions.append(action)
-            before.append(transition["state_before"])
-            after.append(transition["state_after"])
-            logprobs.append(transition["logprobs"])
-        actions = torch.stack(actions)
+        rollout = batches[0] if len(batches) == 1 else cat_list_of_dict_tensor(batches)
+        actions = rollout["actions"]
         executed = actions[:, : self.num_action_chunks].contiguous()
         return actions if return_full_horizon else executed, {
-            "prev_logprobs": torch.stack(logprobs),
+            "prev_logprobs": rollout["prev_logprobs"],
             "prev_values": None,
             "forward_inputs": {
                 "image": images.clone(),
@@ -786,8 +849,8 @@ class Cosmos3WoVRPolicy(nn.Module, BasePolicy):
                 "prompt_length": prompt_length,
                 "seed": seeds,
                 "denoise_index": indices,
-                "state_before": torch.stack(before),
-                "state_after": torch.stack(after),
+                "state_before": rollout["state_before"],
+                "state_after": rollout["state_after"],
                 "action": executed.flatten(1),
             },
         }

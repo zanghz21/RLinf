@@ -47,34 +47,47 @@ class TinyOmni(nn.Module):
         self.input_video_key = "video"
         self.input_caption_key = "ai_caption"
         self.batches = []
+        self.velocity_batch_sizes = []
+        self.prompt_ids = {}
 
     def _prepare_inference_data(self, data_batch, seed, has_negative_prompt):
         self.batches.append(data_batch)
         assert not has_negative_prompt
-        video = data_batch["video"][0][0]
-        actions = data_batch["action"][0][0]
-        plan = data_batch["sequence_plan"][0]
-        assert data_batch["mode"] == [plan.mode] == ["wam"]
-        assert plan.video_length == video.shape[1] == actions.shape[0] + 1
-        assert plan.action_length == actions.shape[0]
-        # Two channels, each with a conditioned observation and a future latent.
-        vision = torch.tensor([video[:, 0].float().mean(), 0.0, 0.25, 0.0])
-        vision_mask = torch.tensor([1.0, 0.0, 1.0, 0.0])
-        generator = torch.Generator().manual_seed(seed[0])
-        initial_vision = vision + (1 - vision_mask) * torch.randn(
-            4, generator=generator
+        plans = data_batch["sequence_plan"]
+        assert (
+            data_batch["mode"] == [plan.mode for plan in plans] == ["wam"] * len(seed)
         )
-        initial_action = torch.randn(actions.shape, generator=generator)
-        initial_action[:, 10:] = 0
-        initial = torch.cat([initial_vision, initial_action.flatten()])
+        assert data_batch["image_size"].shape == (len(seed), 4)
+        actions = [action for [action] in data_batch["action"]]
+        initial, clean, masks = [], [], []
+        vision_mask = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        for [video], action, plan, row_seed in zip(
+            data_batch["video"], actions, plans, seed, strict=True
+        ):
+            assert plan.video_length == video.shape[1] == action.shape[0] + 1
+            assert plan.action_length == action.shape[0]
+            # Two channels, each with a conditioned observation and a future latent.
+            vision = torch.tensor([video[:, 0].float().mean(), 0.0, 0.25, 0.0])
+            generator = torch.Generator().manual_seed(row_seed)
+            initial_vision = vision + (1 - vision_mask) * torch.randn(
+                4, generator=generator
+            )
+            initial_action = torch.randn(action.shape, generator=generator)
+            initial_action[:, 10:] = 0
+            initial.append(torch.cat([initial_vision, initial_action.flatten()]))
+            clean.append(torch.cat([vision, torch.zeros(action.numel())]))
+            masks.append(torch.cat([vision_mask, torch.zeros(action.numel())]))
         return (
-            data_batch["sequence_plan"],
-            SimpleNamespace(x0_tokens_action=[actions]),
-            [[1]],
-            [[0]],
-            [initial],
-            [torch.cat([vision, torch.zeros(actions.numel())])],
-            [torch.cat([vision_mask, torch.zeros(actions.numel())])],
+            plans,
+            SimpleNamespace(x0_tokens_action=actions),
+            [
+                [self.prompt_ids.setdefault(prompt, len(self.prompt_ids) + 1)]
+                for prompt in data_batch["prompt"]
+            ],
+            [[0] for _ in seed],
+            initial,
+            clean,
+            masks,
             True,
         )
 
@@ -90,20 +103,26 @@ class TinyOmni(nn.Module):
         has_noisy_actions,
     ):
         assert has_noisy_actions
-        assert timestep.shape == (1, 1)
-        assert sequence_plans[0].mode == "wam"
-        vision = noise_x[0][:4].reshape(2, 2)
-        action = noise_x[0][4:].reshape_as(gen_data_clean.x0_tokens_action[0])
-        assert torch.count_nonzero(action[:, 10:]) == 0
-        velocity = (
-            net(action[:, :10].to(net.weight.dtype))
-            + vision[:, 1].mean() * 0.3
-            + text_tokens[0][0] * 0.03
-        )
-        padded = torch.nn.functional.pad(velocity, (0, 2))
-        video_velocity = torch.zeros_like(vision)
-        video_velocity[:, 1] = vision[:, 1] + action[:, :10].mean()
-        return [torch.cat([video_velocity.flatten(), padded.flatten()])]
+        batch_size = len(noise_x)
+        assert timestep.numel() == batch_size
+        assert [plan.mode for plan in sequence_plans] == ["wam"] * batch_size
+        self.velocity_batch_sizes.append(batch_size)
+        state = torch.stack(noise_x)
+        visions = state[:, :4].reshape(batch_size, 2, 2)
+        actions = state[:, 4:].reshape_as(torch.stack(gen_data_clean.x0_tokens_action))
+        assert torch.count_nonzero(actions[:, :, 10:]) == 0
+        native_actions = actions[:, :, :10]
+        predictions = net(native_actions.to(net.weight.dtype))
+        velocities = []
+        for prediction, vision, action, tokens in zip(
+            predictions, visions, native_actions, text_tokens, strict=True
+        ):
+            velocity = prediction + vision[:, 1].mean() * 0.3 + tokens[0] * 0.03
+            padded = torch.nn.functional.pad(velocity, (0, 2))
+            video_velocity = torch.zeros_like(vision)
+            video_velocity[:, 1] = vision[:, 1] + action.mean()
+            velocities.append(torch.cat([video_velocity.flatten(), padded.flatten()]))
+        return velocities
 
     def generate_samples_from_batch(self, batch, **kwargs):
         self.batches.append(batch)
@@ -179,6 +198,15 @@ def observations(image, batch_size=2):
     }
 
 
+@pytest.fixture
+def distinct_observations(image):
+    obs = observations(image, batch_size=5)
+    for row, frame in enumerate(obs["main_images"]):
+        frame.fill_(row * 10)
+        obs["task_descriptions"][row] = f"move object {row}"
+    return obs
+
+
 def test_rollout_tensor_records_replay_with_live_gradients(policy, image):
     from rlinf.models.embodiment.base_policy import BasePolicy
     from rlinf.models.embodiment.cosmos3.closed_loop_io import augment_prompt
@@ -202,7 +230,7 @@ def test_rollout_tensor_records_replay_with_live_gradients(policy, image):
     assert policy.omni.net.weight.grad.abs().sum() > 0
     assert torch.isfinite(policy.omni.net.weight.grad).all()
     assert policy.omni.batches[-1]["prompt"] == [
-        augment_prompt(obs["task_descriptions"][1])
+        augment_prompt(task) for task in obs["task_descriptions"]
     ]
     obs["main_images"].fill_(255)
     assert torch.all(inputs["image"] == 120)
@@ -224,8 +252,9 @@ def test_libero_both_cameras_are_used_for_sampling_and_replay(native_sdk):
     _, result = policy.predict_action_batch(obs)
     inputs = result["forward_inputs"]
     torch.testing.assert_close(inputs["image"], expected)
-    for batch, canvas in zip(policy.omni.batches, expected, strict=True):
-        torch.testing.assert_close(batch["video"][0][0][:, 0], canvas.permute(2, 0, 1))
+    videos = [video for batch in policy.omni.batches for [video] in batch["video"]]
+    for video, canvas in zip(videos, expected, strict=True):
+        torch.testing.assert_close(video[:, 0], canvas.permute(2, 0, 1))
 
     main.zero_()
     wrist.zero_()
@@ -267,6 +296,149 @@ def test_execution_prefix_matches_full_plan_and_replays(prefix_policy, image):
     )
     torch.testing.assert_close(replay["logprobs"], record["prev_logprobs"])
     assert replay["entropy"].shape == (1, 5, 10)
+
+
+@pytest.mark.parametrize("guidance_scale", [1.0, 1.5])
+def test_actor_replays_mixed_timesteps_in_one_batch(
+    prefix_policy, distinct_observations, monkeypatch, guidance_scale
+):
+    prefix_policy.guidance_scale = guidance_scale
+    calls = []
+    original_velocity = prefix_policy.omni._get_velocity
+    train_steps = (
+        prefix_policy.omni.config.rectified_flow_inference_config.num_train_timesteps
+    )
+
+    def time_dependent_velocity(*, timestep, **kwargs):
+        calls.append(timestep.flatten().clone())
+        return [
+            velocity * (1 + t / train_steps)
+            for velocity, t in zip(
+                original_velocity(timestep=timestep, **kwargs),
+                timestep.flatten(),
+                strict=True,
+            )
+        ]
+
+    monkeypatch.setattr(prefix_policy.omni, "_get_velocity", time_dependent_velocity)
+    torch.manual_seed(1140)
+    _, rollout = prefix_policy.predict_action_batch(distinct_observations)
+    order = torch.tensor([4, 2, 0, 3, 1])
+    inputs = {key: value[order] for key, value in rollout["forward_inputs"].items()}
+    steps = inputs["denoise_index"]
+    assert steps.unique().numel() == prefix_policy.num_inference_steps
+    calls.clear()
+    # Replay with updated weights, as happens after the first optimizer step.
+    with torch.no_grad():
+        prefix_policy.omni.net.bias.add_(0.02)
+    batched = prefix_policy(forward_inputs=inputs, compute_entropy=True)
+    assert len(calls) == (1 if guidance_scale == 1 else 2)
+    for times in calls:
+        torch.testing.assert_close(
+            times, prefix_policy._schedule()[steps] * train_steps
+        )
+    assert not torch.allclose(batched["logprobs"], rollout["prev_logprobs"][order])
+    calls.clear()
+    entropy_only = prefix_policy(
+        forward_inputs=inputs, compute_entropy=True, compute_logprobs=False
+    )
+    assert not calls
+    torch.testing.assert_close(entropy_only, {"entropy": batched["entropy"]})
+    parameters = tuple(prefix_policy.omni.net.parameters())
+    gradients = torch.autograd.grad(batched["logprobs"].mean(), parameters)
+
+    singletons = [
+        prefix_policy(
+            forward_inputs={key: value[i : i + 1] for key, value in inputs.items()},
+            compute_entropy=True,
+        )
+        for i in range(len(order))
+    ]
+    for key in ("logprobs", "entropy"):
+        torch.testing.assert_close(
+            batched[key], torch.cat([row[key] for row in singletons])
+        )
+    reference = torch.cat([row["logprobs"] for row in singletons]).mean()
+    for gradient, expected in zip(
+        gradients, torch.autograd.grad(reference, parameters), strict=True
+    ):
+        assert gradient.abs().sum() > 0
+        torch.testing.assert_close(gradient, expected)
+
+
+@pytest.mark.parametrize(
+    ("rollout_batch_size", "guidance_scale", "return_full_horizon"),
+    [(2, 1.0, False), (4, 1.5, True)],
+)
+def test_batched_rollout_matches_serial_and_replays(
+    prefix_policy,
+    distinct_observations,
+    rollout_batch_size,
+    guidance_scale,
+    return_full_horizon,
+):
+    prefix_policy.guidance_scale = guidance_scale
+    prefix_policy.rollout_batch_size = 1
+    torch.manual_seed(1140)
+    serial_actions, serial = prefix_policy.predict_action_batch(
+        distinct_observations, return_full_horizon=return_full_horizon
+    )
+
+    prefix_policy.rollout_batch_size = rollout_batch_size
+    prefix_policy.omni.velocity_batch_sizes.clear()
+    torch.manual_seed(1140)
+    actions, batched = prefix_policy.predict_action_batch(
+        distinct_observations, return_full_horizon=return_full_horizon
+    )
+    inputs = batched["forward_inputs"]
+    branches = 1 if guidance_scale == 1 else 2
+    assert prefix_policy.omni.velocity_batch_sizes == [
+        len(indices)
+        for indices in inputs["denoise_index"].split(rollout_batch_size)
+        for _ in range(prefix_policy.num_inference_steps * branches)
+    ]
+    torch.testing.assert_close(actions, serial_actions)
+    torch.testing.assert_close(batched["prev_logprobs"], serial["prev_logprobs"])
+    assert inputs["seed"].unique().numel() == 5
+    assert inputs["denoise_index"].unique().numel() == prefix_policy.num_inference_steps
+    torch.testing.assert_close(inputs, serial["forward_inputs"])
+    replay = prefix_policy(forward_inputs=inputs)
+    torch.testing.assert_close(replay["logprobs"], batched["prev_logprobs"])
+
+
+def test_singleton_sdk_padding_contributes_only_the_real_row(
+    prefix_policy, image, monkeypatch
+):
+    prefix_policy.guidance_scale = 1
+    _, rollout = prefix_policy.predict_action_batch(observations(image, batch_size=1))
+    inputs = rollout["forward_inputs"]
+    params = tuple(prefix_policy.omni.net.parameters())
+    baseline = prefix_policy(forward_inputs=inputs)["logprobs"]
+    expected_grads = torch.autograd.grad(baseline.sum(), params)
+    sdk_velocity = prefix_policy.omni._get_velocity
+    padding = torch.tensor(9.0, requires_grad=True)
+
+    def duplicate(clean):
+        assert len(clean.x0_tokens_action) == 1
+        return SimpleNamespace(x0_tokens_action=clean.x0_tokens_action * 2)
+
+    def padded_velocity(**kwargs):
+        real, extra = sdk_velocity(**kwargs)
+        torch.testing.assert_close(kwargs["noise_x"][0], kwargs["noise_x"][1])
+        return [real, extra * padding]
+
+    monkeypatch.setattr(
+        prefix_policy.omni, "_duplicate_gen_data_clean", duplicate, raising=False
+    )
+    monkeypatch.setattr(prefix_policy.omni, "_get_velocity", padded_velocity)
+    actual = prefix_policy(forward_inputs=inputs)["logprobs"]
+    torch.testing.assert_close(actual, baseline)
+    torch.testing.assert_close(actual, rollout["prev_logprobs"])
+    *param_grads, padding_grad = torch.autograd.grad(
+        actual.sum(), (*params, padding), allow_unused=True
+    )
+    torch.testing.assert_close(param_grads, list(expected_grads))
+    assert padding_grad is None
 
 
 def test_wam_denoises_future_video_and_replays_its_selected_state(
@@ -418,7 +590,13 @@ def test_to_device_moves_native_unregistered_vae(policy):
 
 
 @pytest.mark.parametrize(
-    "field,value", [("noise_std", 0), ("shift", -1), ("num_inference_steps", 0)]
+    "field,value",
+    [
+        ("noise_std", 0),
+        ("shift", -1),
+        ("num_inference_steps", 0),
+        ("rollout_batch_size", 0),
+    ],
 )
 def test_invalid_sampling_config(field, value):
     with pytest.raises(ValueError, match=field):
@@ -521,9 +699,11 @@ def test_loader_preserves_weights_and_selects_trainable_heads(
             "model_path": str(tmp_path),
             "keys_to_select": ["weight"],
             "train_dit_backbone": False,
+            "rollout_batch_size": 3,
         }
     )
     policy = get_model(model_cfg)
+    assert policy.rollout_batch_size == 3
     assert policy.omni.net.weight.requires_grad
     assert not policy.omni.net.bias.requires_grad
     assert torch.all(policy.omni.net.weight == 0.4)
@@ -661,6 +841,48 @@ def test_loader_rejects_empty_actor_selection_but_freezes_simulator(
         for_simulation=True,
     )
     assert all(not p.requires_grad for p in simulator.parameters())
+
+
+def test_native_time_embedder_keeps_scalar_values_and_trainable_parameters(
+    native_parameter_groups, native_loader, tmp_path, monkeypatch
+):
+    omni, _, _ = native_loader
+    embedder = omni.net.time_embedder
+    original_parameters = dict(omni.named_parameters())
+    linear = embedder.forward
+    calls = []
+
+    def native_embed(times):
+        calls.append(times.tolist())
+        return linear(times[:, None])
+
+    monkeypatch.setattr(embedder, "forward", native_embed)
+    policy = Cosmos3WoVRPolicy.from_pretrained(
+        {
+            "model_path": str(tmp_path),
+            "train_dit_backbone": False,
+            "train_time_embedder": True,
+        }
+    )
+    parameters = dict(policy.omni.named_parameters())
+    assert parameters.keys() == original_parameters.keys()
+    assert all(param is original_parameters[name] for name, param in parameters.items())
+    assert {
+        name for name, param in parameters.items() if param.requires_grad
+    } == native_parameter_groups["time"]
+
+    times = torch.tensor([850.0, 245.0, 850.0, 0.0, 245.0])
+    actual = policy.omni.net.time_embedder(times)
+    assert sorted(calls) == [[0.0], [245.0], [850.0]]
+    expected = torch.cat([linear(time.reshape(1, 1)) for time in times])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    weights = torch.arange(actual.numel(), dtype=actual.dtype).reshape_as(actual)
+    grads = torch.autograd.grad((actual * weights).sum(), tuple(embedder.parameters()))
+    reference = torch.autograd.grad(
+        (expected * weights).sum(), tuple(embedder.parameters())
+    )
+    torch.testing.assert_close(grads, reference)
+    assert all(torch.count_nonzero(grad) for grad in grads)
 
 
 def test_loader_rejects_missing_requested_action_projection(

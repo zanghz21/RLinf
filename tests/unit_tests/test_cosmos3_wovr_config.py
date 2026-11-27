@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
 
@@ -99,6 +100,7 @@ def test_native_libero_grpo_recipe(wovr_recipe):
             "runner.val_check_interval=1",
             "actor.model.wovr.lora_enabled=false",
             "actor.model.train_action_output_projection=true",
+            "actor.model.rollout_batch_size=3",
             config_name="libero_spatial_grpo_cosmos3",
         )
     )
@@ -107,6 +109,7 @@ def test_native_libero_grpo_recipe(wovr_recipe):
     assert cfg.actor.model.train_dit_backbone is True
     assert cfg.actor.model.train_action_output_projection is True
     assert cfg.rollout.model.model_path == "policy"
+    assert OmegaConf.merge(cfg.actor.model, cfg.rollout.model).rollout_batch_size == 3
     assert cfg.algorithm.adv_type == "grpo"
     assert cfg.env.train.use_fixed_reset_state_ids
     assert cfg.env.train.group_size == cfg.algorithm.group_size > 1

@@ -349,6 +349,12 @@ Cosmos LIBERO policy server, the native policy uses ``wam`` to jointly denoise
 future video latents and actions, conditioning on the current two-camera image.
 Set ``actor.model.action_horizon=16 actor.model.num_action_chunks=5`` to predict
 16 actions, execute the first five, and replan from the new observation.
+Each rollout GPU processes up to ``actor.model.rollout_batch_size`` observations
+per WAM forward (default 16 in this recipe). Set it to 1 for single-observation sampling.
+The actor replays one selected transition per observation, packing the whole microbatch
+(``actor.micro_batch_size``) into one DiT forward per guidance branch. Each observation
+retains its own timestep. Rollout and replay embed each distinct timestep with the same
+kernel so that shuffled BF16 batches produce consistent action logprobs.
 The prediction horizon must be divisible by the video VAE's temporal compression factor.
 With the Cosmos simulator, forward dynamics receives the full plan and the environment
 advances to the last executed frame. GRPO adds exploration noise to the ten action
